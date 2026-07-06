@@ -13,10 +13,19 @@ Public surface (E7.0):
 - :func:`health` — status counts for the fleet health ring.
 """
 
-from .readmodel import BLOCKED, SUSPENDED, fleet, health, project_view
+from .readmodel import (
+    BLOCKED,
+    SUSPENDED,
+    event_stream,
+    fleet,
+    health,
+    project_detail,
+    project_view,
+)
 from .server import DEFAULT_HOST, DEFAULT_PORT, handle, make_server, serve
 
 __all__ = [
-    "fleet", "project_view", "health", "BLOCKED", "SUSPENDED",
+    "fleet", "project_view", "project_detail", "event_stream", "health",
+    "BLOCKED", "SUSPENDED",
     "serve", "make_server", "handle", "DEFAULT_HOST", "DEFAULT_PORT",
 ]

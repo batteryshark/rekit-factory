@@ -26,7 +26,7 @@ from typing import Any
 
 from ..ledger import runlog as _runlog
 from ..ledger.home import projects_root
-from ..ledger.ledger import LEDGER_FILENAME, load as _load_ledger
+from ..ledger.ledger import LEDGER_FILENAME, load as _load_ledger, read_events as _read_events
 from ..human import inbox as _inbox
 
 #: Derived statuses (not written by any single log — see module docstring).
@@ -88,6 +88,82 @@ def project_view(project_dir: str | Path) -> dict[str, Any]:
         "ledger": _ledger_summary(d),
         "pending": pending,
     }
+
+
+def _ledger_msg(t: str, p: dict[str, Any]) -> str:
+    """Render one ledger event to a compact activity line."""
+    if t == "artifact_added":
+        a = p.get("artifact", {})
+        who = a.get("path") or (a.get("contentHash") or "")[:12]
+        return f"+ {a.get('kind', 'artifact')} {who}"
+    if t == "derivation_recorded":
+        return f"{p.get('transform', '?')} → {len(p.get('outputs', []))} output(s)"
+    if t == "lead_recorded":
+        return f"want {p.get('capability', '?')} for {p.get('kind', '?')}"
+    if t == "finding_recorded":
+        fin = p.get("finding", {})
+        return fin.get("note") or fin.get("text") or fin.get("summary") or "finding"
+    if t == "artifact_analyzed":
+        return f"analyzed {(p.get('artifactHash') or '')[:12]}"
+    return t
+
+
+def _run_msg(t: str, p: dict[str, Any]) -> str:
+    """Render one run event to a compact activity line."""
+    if t == "run_started":
+        return f"goal: {(p.get('goal') or '')[:80]} · {p.get('harness', '?')} · {p.get('tier', '?')}"
+    if t == "round_started":
+        return f"round {p.get('index', '?')} · tier {p.get('tier', '?')}"
+    if t == "round_ended":
+        return (f"round {p.get('index', '?')} +{p.get('findings', 0)}f "
+                f"+{p.get('leads', 0)}l +{p.get('derivations', 0)}d")
+    if t == "status_changed":
+        r = p.get("reason")
+        return f"→ {p.get('status', '?')}" + (f" · {r}" if r else "")
+    if t == "step":
+        return p.get("text", "")
+    if t == "run_ended":
+        return f"done={p.get('done')} · {p.get('reason', '')}"
+    return t
+
+
+def _event_row(source: str, ev: Any) -> dict[str, Any]:
+    msg = _run_msg(ev.type, ev.payload) if source == "run" else _ledger_msg(ev.type, ev.payload)
+    return {"source": source, "type": ev.type, "ts": ev.ts, "seq": ev.seq, "msg": msg}
+
+
+def event_stream(project_dir: str | Path, *, limit: int = 200) -> list[dict[str, Any]]:
+    """Merge ``ledger.jsonl`` + ``run.jsonl`` into one chronological activity feed
+    (the observability pane, E7.2). Oldest→newest, capped to the last ``limit``."""
+    d = Path(project_dir)
+    rows = [_event_row("ledger", ev) for ev in _read_events(d / LEDGER_FILENAME)]
+    rows += [_event_row("run", ev) for ev in _runlog.read_run_events(d / _runlog.RUN_LOG_FILENAME)]
+    # By timestamp; run events before ledger within the same second (deterministic).
+    rows.sort(key=lambda r: (r["ts"], 0 if r["source"] == "run" else 1, r["seq"]))
+    return rows[-limit:]
+
+
+def project_detail(project_dir: str | Path) -> dict[str, Any]:
+    """The full folded view for one project (E7.1 ledger browser + E7.2 activity):
+    everything :func:`project_view` returns, plus the findings, leads, artifacts,
+    derivations, and the merged event stream."""
+    d = Path(project_dir)
+    view = project_view(d)
+    ledger = _load_ledger(d / LEDGER_FILENAME)
+    view["findings"] = ledger.findings()
+    view["leads"] = [dict(v) for v in ledger.leads.values()]
+    view["artifacts"] = [
+        {"id": e.artifact.id, "kind": e.artifact.kind, "path": e.artifact.path,
+         "isTree": e.is_tree, "analyzed": e.analyzed, "findings": len(e.findings)}
+        for e in ledger.entries.values()
+    ]
+    view["derivations"] = [
+        {"transform": dv.transform, "capability": dv.capability, "inputHash": ih,
+         "outputs": [{"id": o.id, "kind": o.kind, "path": o.path} for o in dv.outputs]}
+        for (_t, ih), dv in ledger.derivations.items()
+    ]
+    view["events"] = event_stream(d)
+    return view
 
 
 def fleet(root: str | Path | None = None) -> list[dict[str, Any]]:

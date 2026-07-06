@@ -82,6 +82,15 @@ def test_project_route():
         assert status == 200 and data["id"] == p.id
 
 
+def test_project_route_is_detailed():
+    with _temp_home():
+        p = _project("firmware.bin")
+        _status, data = _body(handle("GET", f"/api/project?id={p.id}", root=projects_root()))
+        # the single-project endpoint returns the full detail, not just the summary
+        for key in ("events", "findings", "leads", "artifacts", "derivations"):
+            assert key in data, key
+
+
 def test_project_route_404():
     with _temp_home():
         status, data = _body(handle("GET", "/api/project?id=nope", root=projects_root()))

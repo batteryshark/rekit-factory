@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..human import inbox as _inbox
 from ..ledger.home import projects_root
-from .readmodel import fleet, health, project_view
+from .readmodel import fleet, health, project_detail
 
 #: Default port — 7358 is "REKT" on a phone keypad, and chosen to avoid clashing
 #: with common local dashboards (e.g. opencode-ensemble on 4747). Override with --port.
@@ -74,7 +74,7 @@ def handle(method: str, path: str, body: bytes = b"", *,
         d = base / pid
         if not pid or not (d / "project.json").exists():
             return _json(404, {"error": "no such project"})
-        return _json(200, project_view(d))
+        return _json(200, project_detail(d))
 
     if method == "POST" and route == "/api/answer":
         try:
@@ -271,6 +271,30 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .src b{color:var(--ink2)}
 .empty{color:var(--ink3);font-family:var(--mono);font-size:13px;padding:40px 0;text-align:center}
 .ask{width:100%;background:var(--bg);border:1px solid var(--line2);border-radius:8px;color:var(--ink);font-family:var(--sans);padding:10px;margin-bottom:8px}
+.card.clk{cursor:pointer;transition:.15s}.card.clk:hover{border-color:var(--line2);transform:translateY(-2px)}
+.detail-head{display:flex;align-items:center;gap:12px;margin:4px 0 4px;flex-wrap:wrap}
+.back{font-family:var(--mono);font-size:12px;color:var(--ink2);border:1px solid var(--line2);border-radius:7px;padding:7px 12px;background:var(--panel2)}
+.back:hover{color:var(--ink)}
+.dtitle{font-family:var(--mono);font-weight:600;font-size:18px}
+.dgoal{color:var(--ink2);font-size:13px;margin:0 0 14px;line-height:1.4}
+.kv{display:flex;gap:14px;font-family:var(--mono);font-size:12px;color:var(--ink3);flex-wrap:wrap;margin-bottom:16px}
+.kv b{color:var(--ink)}.kv .teal{color:var(--teal)}
+.tabs{display:flex;gap:3px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:4px;margin-bottom:16px;width:fit-content}
+.tab{font-family:var(--mono);font-size:12px;color:var(--ink3);padding:7px 14px;border-radius:6px;background:none;display:flex;gap:6px;align-items:center}
+.tab.on{background:#17233b;color:var(--green)}.tab .n{background:var(--bg);border-radius:99px;padding:0 6px;font-size:10px;color:var(--ink3)}
+.panel{background:linear-gradient(180deg,var(--panel),#0a1120);border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:14px}
+.panel h3{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.13em;color:var(--ink3);margin:0 0 12px}
+.find{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}.find:last-child{border-bottom:0}
+.find .sev{width:5px;border-radius:3px;background:var(--violet);flex-shrink:0}
+.find .ft{color:var(--ink);font-size:13px;line-height:1.4}.find .fp{font-family:var(--mono);font-size:10.5px;color:var(--ink3);margin-top:3px}
+.lead{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--line);font-size:12.5px}.lead:last-child{border-bottom:0}
+.lead .lc{font-family:var(--mono);color:var(--amber)}.lead .lr{font-family:var(--mono);font-size:11px;color:var(--ink3);margin-left:auto}
+.art{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12px;padding:4px 0;color:var(--ink2)}.art .k{color:var(--ink3);font-size:10px;margin-left:auto;text-transform:uppercase}
+.stream{background:var(--bg);border:1px solid var(--line);border-radius:10px;font-family:var(--mono);font-size:12px;max-height:540px;overflow:auto;padding:6px 0}
+.ev{display:flex;gap:11px;padding:4px 13px;border-left:2px solid transparent}.ev:hover{background:var(--panel)}
+.ev .ts{color:#43536f;flex-shrink:0}.ev .ty{flex-shrink:0;width:104px;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ev .m{color:var(--ink2);min-width:0}
+.ev.run{border-left-color:var(--green)}.ev.run .ty{color:var(--green)}.ev.ledger .ty{color:var(--teal)}
+.empty2{color:var(--ink3);font-size:12.5px;padding:8px 0}
 </style></head>
 <body>
 <header>
@@ -281,9 +305,12 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
   <div class="live"><i></i><span id="tick">live</span></div>
 </header>
 <main>
-  <div id="decisions"></div>
-  <h2>Fleet</h2>
-  <div class="grid" id="fleet"><div class="empty">connecting…</div></div>
+  <div id="fleet-view">
+    <div id="decisions"></div>
+    <h2>Fleet</h2>
+    <div class="grid" id="fleet"><div class="empty">connecting…</div></div>
+  </div>
+  <div id="detail-view" style="display:none"></div>
 </main>
 <script>
 const $=id=>document.getElementById(id);
@@ -292,7 +319,7 @@ function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<
 async function answer(pid,qid,val){
   await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({projectId:pid,questionId:qid,value:val})});
-  poll();
+  refresh();
 }
 function decisionControls(pid,q){
   const k=q.kind;
@@ -319,7 +346,7 @@ function renderDecisions(fleet){
 }
 function card(v){
   const r=v.run||{},c=r.counters||{},cost=r.cost||{};
-  return `<div class="card s-${v.status}"><span class="stripe"></span>
+  return `<div class="card clk s-${v.status}" onclick="openProject('${v.id}')"><span class="stripe"></span>
     <div class="ct"><div class="nm">${esc(v.id)}</div><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span></div>
     <div class="goal">${esc(r.goal||'—')}</div>
     <div class="meta"><span class="tag"><span class="k">R</span> ${r.round||0}/${r.maxRounds||0}</span>
@@ -340,12 +367,54 @@ function render(data){
   renderDecisions(f);
   $('fleet').innerHTML=f.length?f.map(card).join(''):'<div class="empty">no projects yet — start a run from the CLI</div>';
 }
-async function poll(){
-  try{const r=await fetch('/api/fleet');render(await r.json());
-    $('tick').textContent='live · '+new Date().toLocaleTimeString();
-  }catch(e){$('tick').textContent='reconnecting…';}
+let view='fleet',currentId=null,currentTab='overview',lastDetail=null;
+function tick(){$('tick').textContent='live · '+new Date().toLocaleTimeString();}
+function fail(){$('tick').textContent='reconnecting…';}
+function refresh(){return view==='detail'?pollDetail():pollFleet();}
+function openProject(id){view='detail';currentId=id;currentTab='overview';lastDetail=null;
+  $('fleet-view').style.display='none';const dv=$('detail-view');dv.style.display='';dv.innerHTML='<div class="empty">loading…</div>';pollDetail();}
+function showFleet(){view='fleet';currentId=null;$('detail-view').style.display='none';$('fleet-view').style.display='';pollFleet();}
+function setTab(t){currentTab=t;if(lastDetail)renderDetail(lastDetail);}
+async function pollFleet(){try{const r=await fetch('/api/fleet');render(await r.json());tick();}catch(e){fail();}}
+async function pollDetail(){if(!currentId)return;try{
+    const r=await fetch('/api/project?id='+encodeURIComponent(currentId));const v=await r.json();
+    if(v.error){showFleet();return;}renderDetail(v);tick();
+  }catch(e){fail();}}
+function counter(v,color,label){return `<div class="c"><div class="v" style="color:${color}">${v}</div><div class="l">${label}</div></div>`;}
+function renderDetail(v){
+  lastDetail=v;
+  const r=v.run||{},c=r.counters||{},cost=r.cost||{};
+  const pend=v.pending||[],find=v.findings||[],leads=v.leads||[],arts=v.artifacts||[],evs=v.events||[];
+  const tabBtn=(id,label,n)=>`<button class="tab ${currentTab===id?'on':''}" onclick="setTab('${id}')">${label}${n!=null?`<span class="n">${n}</span>`:''}</button>`;
+  let pane='';
+  if(currentTab==='overview'){
+    pane=`<div class="counters" style="max-width:660px">`+
+      counter(c.findings||0,'var(--violet)','findings')+counter(c.leads||0,'var(--amber)','leads')+
+      counter(c.derivations||0,'var(--teal)','derived')+counter(c.skillRuns||0,'var(--green)','skills')+
+      counter('$'+(cost.usd||0).toFixed(2),'var(--blue)','spend')+`</div>`;
+    if(pend.length) pane+=`<div class="panel"><h3>Decisions — ${pend.length} awaiting you</h3>`+
+      pend.map(q=>`<div style="margin-bottom:12px"><div class="dq">${esc(q.question)}</div>${decisionControls(v.id,q)}</div>`).join('')+`</div>`;
+  } else if(currentTab==='ledger'){
+    pane=`<div class="panel"><h3>Findings · ${find.length}</h3>`+
+      (find.length?find.map(f=>`<div class="find"><div class="sev"></div><div><div class="ft">${esc(f.note||f.text||f.summary||'finding')}</div>${(f.artifactPath||f.artifact)?`<div class="fp">${esc(f.artifactPath||f.artifact)}</div>`:''}</div></div>`).join(''):'<div class="empty2">no findings yet</div>')+`</div>`;
+    pane+=`<div class="panel"><h3>Install leads · ${leads.length}</h3>`+
+      (leads.length?leads.map(l=>`<div class="lead"><span class="lc">${esc(l.capability)}</span><span style="color:var(--ink3)">for ${esc(l.kind)}</span>${(l.requires&&l.requires.length)?`<span class="lr">needs ${esc(l.requires.join(', '))}</span>`:''}</div>`).join(''):'<div class="empty2">none</div>')+`</div>`;
+    pane+=`<div class="panel"><h3>Artifacts · ${arts.length}</h3>`+
+      (arts.length?arts.map(a=>`<div class="art">${a.isTree?'▸':'◦'} ${esc(a.path||a.id)}${a.analyzed?' <span style="color:var(--green)">✓</span>':''}<span class="k">${esc(a.kind)}</span></div>`).join(''):'<div class="empty2">none</div>')+`</div>`;
+  } else {
+    pane=`<div class="stream">`+
+      (evs.length?evs.map(e=>`<div class="ev ${e.source}"><span class="ts">${(e.ts||'').slice(11,19)}</span><span class="ty">${esc(e.type)}</span><span class="m">${esc(e.msg)}</span></div>`).join(''):'<div class="empty2" style="padding:14px">no events yet</div>')+`</div>`;
+  }
+  $('detail-view').innerHTML=`
+    <div class="detail-head"><button class="back" onclick="showFleet()">← Fleet</button>
+      <span class="dtitle">${esc(v.id)}</span><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span></div>
+    <div class="dgoal">${esc(r.goal||'—')}</div>
+    <div class="kv"><span>R <b>${r.round||0}/${r.maxRounds||0}</b></span><span>tier <b>${esc(r.tier||'—')}</b></span>
+      <span>${esc(r.harness||'—')} <b class="teal">${esc(r.model||'')}</b></span><span>spend <b>$${(cost.usd||0).toFixed(2)}</b></span></div>
+    <div class="tabs">${tabBtn('overview','Overview')}${tabBtn('ledger','Ledger',find.length)}${tabBtn('activity','Activity',evs.length)}</div>
+    <div class="pane">${pane}</div>`;
 }
-poll();setInterval(poll,1500);
+refresh();setInterval(refresh,1500);
 </script>
 </body></html>
 """

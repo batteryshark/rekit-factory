@@ -21,10 +21,12 @@ from pathlib import Path
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 
+from rekit.harness import MockAdapter, MockTurn  # noqa: E402
 from rekit.human import post_question  # noqa: E402
-from rekit.lab import BLOCKED, SUSPENDED, fleet, health, project_view  # noqa: E402
+from rekit.lab import BLOCKED, SUSPENDED, fleet, health, project_detail, project_view  # noqa: E402
 from rekit.ledger import open_project  # noqa: E402
 from rekit.ledger.runlog import RunLog  # noqa: E402
+from rekit.loop import run  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -104,6 +106,28 @@ def test_fleet_orders_needs_you_first():
         statuses = [v["status"] for v in fleet()]
         assert statuses[0] == BLOCKED
         assert statuses.index("running") < statuses.index("done")
+
+
+def test_project_detail_has_ledger_and_events():
+    with _temp_home():
+        ws = tempfile.mkdtemp(prefix="rekit-target-")
+        target = Path(ws) / "app.bin"
+        target.write_bytes(b"\x7fELF fake")
+        project = open_project(str(target))
+        rl = RunLog(project.dir)
+        adapter = MockAdapter([MockTurn(
+            text="FINDING: a shell sink\nLEAD: decompile for binary/native\nDONE\n")])
+        run(project, "understand it", adapter, max_rounds=3, runlog=rl)
+
+        d = project_detail(project.dir)
+        # full ledger contents, not just the summary
+        assert len(d["findings"]) >= 1 and d["findings"][0].get("note") == "a shell sink"
+        assert len(d["leads"]) >= 1 and d["leads"][0]["capability"] == "decompile"
+        assert len(d["artifacts"]) >= 1                     # root artifact seeded
+        # merged activity feed spans both logs
+        assert d["events"]
+        assert any(e["source"] == "run" for e in d["events"])
+        assert any(e["source"] == "ledger" for e in d["events"])
 
 
 def test_health_counts():
