@@ -1,9 +1,15 @@
-# rekit
+<div align="center">
+  <img src="rekit-logo.png" alt="rekit — Reverse Engineering System" width="380">
+</div>
 
-A **harness-agnostic orchestration runtime** for goal-driven analysis of a
-target. rekit is the kernel: the ralph loop, the persistent project **ledger**,
-discovery and artifact tracking, skill loading/scoping, the human channel, and
-goalpacks (goals you run against a target).
+# rekit — Reverse Engineering System
+
+**A harness-agnostic reverse-engineering runtime.** Point it at a target, pick a
+goal, and agents work it: **load · analyze · understand · adapt · wreck it.**
+
+rekit is the kernel: the ralph loop, the persistent project **ledger**, discovery
+and artifact tracking, skill loading/scoping, the human channel, and goalpacks
+(goals you run against a target).
 
 ## Scope
 
