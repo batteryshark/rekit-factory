@@ -35,6 +35,17 @@ from .model import (
     normalize_tier,
 )
 from .registry import Registry, ScoredSkill, discover_skills
+from .runner import (
+    DEFAULT_RUN,
+    STATUS_ERROR,
+    STATUS_NO_RUN,
+    STATUS_OK,
+    STATUS_SKIPPED,
+    STATUS_UNAVAILABLE,
+    RunResult,
+    declared_run,
+    run_skill,
+)
 from .scoping import Policy, ScopedSkill, scope_scoped_skills, scope_skills
 
 __all__ = [
@@ -59,4 +70,14 @@ __all__ = [
     "ScopedSkill",
     "scope_skills",
     "scope_scoped_skills",
+    # runner (E5)
+    "run_skill",
+    "RunResult",
+    "declared_run",
+    "DEFAULT_RUN",
+    "STATUS_OK",
+    "STATUS_UNAVAILABLE",
+    "STATUS_SKIPPED",
+    "STATUS_NO_RUN",
+    "STATUS_ERROR",
 ]
