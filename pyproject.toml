@@ -21,3 +21,10 @@ rekit = "rekit.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["rekit*"]
+
+# Ship the builtin goalpacks (GOALPACK.md + system-prompt.md + renderer.py) as
+# package data so `rekit.goalpacks.discover_goalpacks()` finds them from an install.
+# The goalpack folders carry no __init__.py (renderers are imported by path, not as
+# submodules), so they are data, not packages — hence an explicit glob here.
+[tool.setuptools.package-data]
+rekit = ["goalpacks/**/GOALPACK.md", "goalpacks/**/system-prompt.md", "goalpacks/**/renderer.py"]
