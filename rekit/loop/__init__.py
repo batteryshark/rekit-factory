@@ -11,8 +11,17 @@ Public surface (E2 first slice)
 - :func:`run` — drive a goal to termination via a harness adapter over the ledger.
 - :class:`LoopSummary` / :class:`RoundResult` — the coverage-aware outcome.
 - :func:`build_context` — render the ledger snapshot into brain context.
+- :func:`fan_out` — orchestrator-level parallelism: run N brain invocations
+  concurrently and converge their results losslessly on one ledger.
+- :class:`FanoutSummary` / :class:`ItemResult` — the fan-out outcome.
 """
 
+from .fanout import (
+    FanoutSummary,
+    ItemResult,
+    default_fold,
+    fan_out,
+)
 from .loop import (
     LoopSummary,
     RoundResult,
@@ -25,4 +34,8 @@ __all__ = [
     "LoopSummary",
     "RoundResult",
     "build_context",
+    "fan_out",
+    "FanoutSummary",
+    "ItemResult",
+    "default_fold",
 ]

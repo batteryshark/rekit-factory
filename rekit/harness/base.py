@@ -22,6 +22,7 @@ knows which brain answered.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -114,14 +115,56 @@ class HarnessAdapter(ABC):
         context: str | None = None,
         tier: str = "cheap",
     ) -> HarnessResult:
-        """Fan a scoped unit of work out to a subagent (E2.3 — FOLLOW-UP).
+        """Run one scoped unit of fanned-out work and return its result (E2.3).
 
-        The default is a same-process, single-turn delegation to :meth:`invoke`,
-        which keeps the seam honest (the loop can call it and converge results on
-        the ledger) without yet wiring real parallel fan-out. The pi adapter will
-        override this to drive the ``pi-subagents`` extension for true parallel
-        subagents that inherit the same scoped skill set.
+        A same-process, single-turn delegation to :meth:`invoke` — a thin wrapper
+        thin enough to run inside a worker thread. This is the primitive the
+        orchestrator-level fan-out (:func:`rekit.loop.fanout.fan_out`) drives: it
+        calls ``spawn_subagent`` once per item across a thread pool, then folds the
+        returned :class:`HarnessResult`\\ s into the ledger sequentially in the
+        parent (invocations are concurrent; ledger writes are not).
+
+        Because it never touches the ledger and returns a plain value, it is safe
+        to call from many threads at once. The :meth:`submit_subagent` helper wraps
+        it in a :class:`~concurrent.futures.Future` for callers that want to manage
+        their own pool.
+
+        This is the *orchestrator-level* delegation path — rekit deciding to run N
+        pi processes over N trees. It coexists with the *brain-level* path: the
+        installed **pi-subagents** extension, which the brain itself can call via
+        ``--tools`` when the loop enables it. The pi adapter may override this to
+        drive that extension so fanned subagents inherit the same scoped skill set;
+        the base keeps the honest same-process default.
         """
         return self.invoke(
             system_prompt, user_input, tools=tools, context=context, tier=tier
+        )
+
+    def submit_subagent(
+        self,
+        executor: ThreadPoolExecutor,
+        system_prompt: str,
+        user_input: str,
+        *,
+        tools: list[str] | None = None,
+        context: str | None = None,
+        tier: str = "cheap",
+    ) -> "Future[HarnessResult]":
+        """Submit :meth:`spawn_subagent` onto ``executor`` — a concurrent,
+        non-blocking spawn.
+
+        Returns immediately with a :class:`~concurrent.futures.Future`; the child
+        invocation runs on a worker thread. This is what makes fan-out "genuinely
+        spawn a concurrent child invocation" while keeping :meth:`invoke`'s
+        contract (blocking, returns a :class:`HarnessResult`) unchanged. Callers
+        that want batching + bounded concurrency + sequential ledger folding should
+        use :func:`rekit.loop.fanout.fan_out` rather than driving futures directly.
+        """
+        return executor.submit(
+            self.spawn_subagent,
+            system_prompt,
+            user_input,
+            tools=tools,
+            context=context,
+            tier=tier,
         )
