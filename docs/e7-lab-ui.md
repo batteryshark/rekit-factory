@@ -342,11 +342,14 @@ Each phase ships something usable; observe lands before control.
   an SSE/websocket push is an optional upgrade.) *Acc met:* a running CLI job
   appears live on the board with correct status/round/counters; answering a
   decision in the browser unblocks the run.
-- **E7.1 · Mission Control + Project Detail (Ledger).** The fleet grid and the
-  ledger view (artifacts / findings / leads). *Acc:* browse any project's
-  findings and artifacts without touching the loop.
-- **E7.2 · Activity pane.** Live event stream + agent messages + skill I/O,
-  filterable. *Acc:* watch a run's events stream in real time; scrub history.
+- **E7.1 · Mission Control + Project Detail (Ledger).** ✅ *built* — fleet grid +
+  a clickable detail view with a **Ledger** tab (findings, install leads,
+  artifacts) via `readmodel.project_detail` and `GET /api/project?id=`. *Acc met:*
+  browse any project's findings and artifacts in the browser without touching the loop.
+- **E7.2 · Activity pane.** ✅ *built* — an **Activity** tab streaming
+  `readmodel.event_stream` (`ledger.jsonl` + `run.jsonl` merged chronologically),
+  colored by source. *Acc met:* watch a run's events in the browser (polled).
+  ⏳ *later:* per-type filtering, interleaved skill script I/O, live-tail scroll.
 - **E7.3 · Decision Inbox + `LedgerHumanChannel`.** ✅ *channel + fail-closed timer
   built with E7.0* (`human/inbox.py`: blocks on a posted question, resumes on
   `answer`, `confirm` fail-closes on timeout; missing-tool `request_tool` → suspend).
