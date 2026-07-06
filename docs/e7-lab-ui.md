@@ -356,11 +356,17 @@ Each phase ships something usable; observe lands before control.
   ⏳ *remaining:* the cross-project inbox UI wired to `pending_questions`, and
   desktop notifications on `question_posted`. *Acc:* a gated skill run blocks,
   notifies, and resumes on an answer from the browser; fail-closed matches the CLI.
-- **E7.4 · Full control + New Run.** Supervisor lifecycle (launch/stop/pause/
-  resume/retry) and the composer over `run_goal`/`run_goalpack`. *Acc:* start a
-  run from the UI with target + tools + goal; stop and resume it.
-- **E7.5 · Harness picker + sidecar.** Multi-harness selection and the ensemble
-  sidecar shape. *Acc:* switch the brain without changing goalpack or skills.
+- **E7.4 · Full control + New Run.** ✅ *built* — `lab/supervisor.py` launches
+  runs in background threads (open_project + RunLog + LedgerHumanChannel + registry
+  → `loop.run`) and **stops** them via `loop.run`'s cooperative `cancel` Event;
+  `POST /api/run` + `POST /api/stop`; the client's **New Run composer**
+  (target / goal / harness / tier / rack) and Stop buttons. *Acc met:* start a run
+  from the UI with target + goal; stop it. ⏳ *later:* pause/resume, retry, launch
+  a goalpack, wiring the composer's rack selection to `requested_capabilities`.
+- **E7.5 · Harness picker + sidecar.** ✅ *partial* — `lab/catalog.harnesses`
+  + a harness picker in the composer + a Skills/Harness screen (`GET /api/skills`,
+  `GET /api/harnesses`). *Acc met (picker):* choose pi vs mock at launch. ⏳ *later:*
+  the multi-harness ensemble sidecar shape.
 
 ## Risks / open questions
 
