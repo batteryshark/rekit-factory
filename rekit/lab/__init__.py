@@ -14,5 +14,9 @@ Public surface (E7.0):
 """
 
 from .readmodel import BLOCKED, SUSPENDED, fleet, health, project_view
+from .server import DEFAULT_HOST, DEFAULT_PORT, handle, make_server, serve
 
-__all__ = ["fleet", "project_view", "health", "BLOCKED", "SUSPENDED"]
+__all__ = [
+    "fleet", "project_view", "health", "BLOCKED", "SUSPENDED",
+    "serve", "make_server", "handle", "DEFAULT_HOST", "DEFAULT_PORT",
+]

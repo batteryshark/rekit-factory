@@ -1,8 +1,8 @@
 """rekit command-line entry point.
 
-Minimal by design: at E0 there is no orchestration yet, so the CLI only reports
-what rekit is and what version is installed. argparse only — the kernel stays
-dependency-free. Subcommands (run a goal, list/resume projects) arrive with E1+.
+argparse only — the kernel stays dependency-free. With no subcommand it identifies
+the runtime; ``rekit serve`` starts Mission Control (E7), the local read-model UI
+over ``$REKIT_HOME``.
 """
 
 import argparse
@@ -16,19 +16,26 @@ DESCRIPTION = (
 
 
 def main(argv=None):
-    """Parse args and print version + a one-line description.
-
-    Returns the process exit code so callers (and tests) can assert on it.
-    """
+    """Parse args and dispatch. Returns the process exit code."""
     parser = argparse.ArgumentParser(prog="rekit", description=DESCRIPTION)
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"rekit {__version__}",
-    )
-    parser.parse_args(argv)
+    parser.add_argument("--version", action="version", version=f"rekit {__version__}")
+    sub = parser.add_subparsers(dest="command")
 
-    # Default action (no subcommands yet): identify the runtime.
+    serve_p = sub.add_parser(
+        "serve", help="start Mission Control — the local lab UI over $REKIT_HOME")
+    serve_p.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
+    serve_p.add_argument("--port", type=int, default=4747, help="bind port (default 4747)")
+    serve_p.add_argument("--no-notify", action="store_true",
+                         help="disable desktop notifications on new decisions")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "serve":
+        # Imported lazily so the default CLI path stays import-cheap.
+        from rekit.lab import serve
+        return serve(args.host, args.port, notify=not args.no_notify)
+
+    # Default action: identify the runtime.
     print(f"rekit {__version__}")
     print(DESCRIPTION)
     return 0
