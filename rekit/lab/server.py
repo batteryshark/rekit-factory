@@ -50,6 +50,19 @@ def _projects_base(root: str | Path | None) -> Path:
     return Path(root) if root is not None else projects_root()
 
 
+_SUPERVISOR = None
+
+
+def _supervisor():
+    """The process-wide run supervisor (E7.4) — lazily built so importing the
+    server never hard-depends on the launch machinery."""
+    global _SUPERVISOR
+    if _SUPERVISOR is None:
+        from .supervisor import Supervisor
+        _SUPERVISOR = Supervisor()
+    return _SUPERVISOR
+
+
 def handle(method: str, path: str, body: bytes = b"", *,
            root: str | Path | None = None) -> tuple[int, str, bytes]:
     """Route one request to ``(status, content_type, payload)`` — pure and testable.
@@ -90,6 +103,44 @@ def handle(method: str, path: str, body: bytes = b"", *,
             return _json(404, {"error": "no such project"})
         _inbox.answer(d, qid, data.get("value"))
         return _json(200, {"ok": True})
+
+    if method == "POST" and route == "/api/run":
+        try:
+            data = json.loads(body or b"{}")
+        except (ValueError, TypeError):
+            return _json(400, {"error": "invalid JSON body"})
+        target, goal = data.get("target"), data.get("goal")
+        if not target or not goal:
+            return _json(400, {"error": "target and goal are required"})
+        try:
+            pid = _supervisor().launch(
+                target, goal,
+                harness=data.get("harness", "mock"),
+                tier=data.get("tier", "cheap"),
+                max_rounds=int(data.get("maxRounds", 8)),
+                tools=data.get("tools") or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface a clean error to the UI.
+            return _json(500, {"error": f"launch failed: {exc}"})
+        return _json(200, {"ok": True, "id": pid})
+
+    if method == "POST" and route == "/api/stop":
+        try:
+            data = json.loads(body or b"{}")
+        except (ValueError, TypeError):
+            return _json(400, {"error": "invalid JSON body"})
+        pid = data.get("projectId")
+        if not pid:
+            return _json(400, {"error": "projectId is required"})
+        return _json(200, {"ok": _supervisor().stop(pid)})
+
+    if method == "GET" and route == "/api/skills":
+        from .catalog import skills_catalog
+        return _json(200, skills_catalog())
+
+    if method == "GET" and route == "/api/harnesses":
+        from .catalog import harnesses
+        return _json(200, {"harnesses": harnesses()})
 
     return _json(404, {"error": "not found"})
 
@@ -295,13 +346,50 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .ev .ts{color:#43536f;flex-shrink:0}.ev .ty{flex-shrink:0;width:104px;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ev .m{color:var(--ink2);min-width:0}
 .ev.run{border-left-color:var(--green)}.ev.run .ty{color:var(--green)}.ev.ledger .ty{color:var(--teal)}
 .empty2{color:var(--ink3);font-size:12.5px;padding:8px 0}
+.nav{font-family:var(--mono);font-size:12px;color:var(--ink3);background:none;border:0;padding:6px 11px;border-radius:6px;cursor:pointer}
+.nav:hover{color:var(--ink)}.nav.on{color:var(--green);background:#17233b}
+.newrun-btn{font-family:var(--sans);font-weight:600;font-size:13px;background:linear-gradient(180deg,#4fe895,#31c274);color:#04160c;border:0;border-radius:8px;padding:8px 14px;cursor:pointer}
+.newrun-btn:hover{filter:brightness(1.06)}
+.stop-btn{font-family:var(--mono);font-size:11px;color:#f5868f;background:rgba(242,85,99,.08);border:1px solid rgba(242,85,99,.35);border-radius:6px;padding:4px 9px;cursor:pointer}
+.stop-btn:hover{background:rgba(242,85,99,.16)}
+.form{max-width:720px;display:flex;flex-direction:column;gap:18px;margin-top:6px}
+.field label{display:block;font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink3);margin-bottom:8px}
+.field .hint{text-transform:none;letter-spacing:0;color:#43536f;font-size:11px;margin-left:8px}
+.field input,.field textarea{width:100%;background:var(--bg);border:1px solid var(--line2);border-radius:8px;color:var(--ink);font-family:var(--sans);font-size:14px;padding:11px 13px;outline:0}
+.field textarea{min-height:70px;resize:vertical;line-height:1.5}
+.field input:focus,.field textarea:focus{border-color:var(--green)}
+.field input.mono{font-family:var(--mono);font-size:13px}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>.field{flex:1;min-width:150px}
+.seg{display:flex;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:3px;width:fit-content;flex-wrap:wrap}
+.seg button{font-family:var(--mono);font-size:12px;color:var(--ink3);background:none;border:0;padding:7px 13px;border-radius:6px;cursor:pointer}
+.seg button.on{background:#17233b;color:var(--green)}
+.expl{font-size:12px;color:var(--ink3);margin:6px 0 0;line-height:1.5}
+.capgrp{border:1px solid var(--line);border-radius:9px;background:var(--bg);margin-bottom:8px;overflow:hidden}
+.capgrp .h{display:flex;align-items:center;gap:9px;padding:10px 12px;cursor:pointer}.capgrp .h:hover{background:var(--panel2)}
+.capgrp .cn{font-family:var(--mono);font-size:12.5px;color:var(--ink);font-weight:600}.capgrp .cc{font-family:var(--mono);font-size:11px;color:var(--ink3);margin-left:auto}
+.capgrp .b{display:none;padding:4px 12px 10px;flex-direction:column;gap:6px}.capgrp.open .b{display:flex}
+.skrow{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;font-family:var(--mono);font-size:12px;cursor:pointer}
+.skrow.on{border-color:#2ea86a;background:rgba(70,224,138,.05)}
+.skrow .chk{width:16px;height:16px;border-radius:4px;border:1.5px solid var(--line2);flex-shrink:0;display:grid;place-items:center;color:transparent}.skrow.on .chk{background:var(--green);border-color:var(--green);color:#04160c}
+.skrow .sn{color:var(--ink)}.skrow .meta{margin-left:auto;display:flex;gap:7px;align-items:center}
+.ttier{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;padding:2px 7px;border-radius:5px}
+.ttier.ro{background:rgba(70,224,138,.14);color:var(--green)}.ttier.gated{background:rgba(245,177,61,.14);color:var(--amber)}.ttier.na{background:rgba(242,85,99,.1);color:var(--red)}
+.launch{align-self:flex-start;font-family:var(--sans);font-weight:700;font-size:14px;background:linear-gradient(180deg,#4fe895,#31c274);color:#04160c;border:0;border-radius:9px;padding:12px 22px;cursor:pointer}
+.launch:hover{filter:brightness(1.06)}
+.fbtn{font-family:var(--mono);font-size:10.5px;color:var(--ink3);border:1px solid var(--line);border-radius:6px;padding:3px 9px;background:none;cursor:pointer;margin-right:6px}.fbtn.on{color:var(--green);border-color:#2ea86a}
+.hrow{display:flex;align-items:center;gap:11px;padding:11px 13px;border:1px solid var(--line);border-radius:8px;background:var(--bg);margin-bottom:8px}
+.hrow .hn{font-family:var(--mono);font-size:13px;color:var(--ink)}.hrow .hd{font-size:12px;color:var(--ink3);margin-top:2px}
+.hrow .hs{margin-left:auto;font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.06em;padding:3px 8px;border-radius:5px}
+.hs.available{background:rgba(70,224,138,.14);color:var(--green)}.hs.unconfigured{background:rgba(245,177,61,.14);color:var(--amber)}.hs.planned{background:var(--panel2);color:var(--ink3)}
 </style></head>
 <body>
 <header>
   <span class="wm">RE<span class="k">KIT</span></span>
-  <span style="font-family:var(--mono);font-size:11px;color:var(--ink3)">MISSION CONTROL</span>
+  <button class="nav" id="nav-fleet" onclick="showFleet()">Fleet</button>
+  <button class="nav" id="nav-skills" onclick="showSkills()">Skills</button>
   <div class="sp"></div>
   <div class="legend" id="legend"></div>
+  <button class="newrun-btn" onclick="showNewRun()">+ New Run</button>
   <div class="live"><i></i><span id="tick">live</span></div>
 </header>
 <main>
@@ -311,6 +399,8 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
     <div class="grid" id="fleet"><div class="empty">connecting…</div></div>
   </div>
   <div id="detail-view" style="display:none"></div>
+  <div id="newrun-view" style="display:none"></div>
+  <div id="skills-view" style="display:none"></div>
 </main>
 <script>
 const $=id=>document.getElementById(id);
@@ -347,7 +437,7 @@ function renderDecisions(fleet){
 function card(v){
   const r=v.run||{},c=r.counters||{},cost=r.cost||{};
   return `<div class="card clk s-${v.status}" onclick="openProject('${v.id}')"><span class="stripe"></span>
-    <div class="ct"><div class="nm">${esc(v.id)}</div><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span></div>
+    <div class="ct"><div class="nm">${esc(v.id)}</div>${v.status==='running'?`<button class="stop-btn" onclick="event.stopPropagation();stopRun('${v.id}')">stop</button>`:''}<span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span></div>
     <div class="goal">${esc(r.goal||'—')}</div>
     <div class="meta"><span class="tag"><span class="k">R</span> ${r.round||0}/${r.maxRounds||0}</span>
       <span class="tag">${esc(r.tier||'—')}</span>
@@ -367,14 +457,22 @@ function render(data){
   renderDecisions(f);
   $('fleet').innerHTML=f.length?f.map(card).join(''):'<div class="empty">no projects yet — start a run from the CLI</div>';
 }
-let view='fleet',currentId=null,currentTab='overview',lastDetail=null;
+let view='fleet',currentId=null,currentTab='overview',lastDetail=null,actFilter='all';
+let nr={harness:'mock',tier:'cheap',rounds:8,openCaps:new Set(),target:'',goal:''};
 function tick(){$('tick').textContent='live · '+new Date().toLocaleTimeString();}
 function fail(){$('tick').textContent='reconnecting…';}
-function refresh(){return view==='detail'?pollDetail():pollFleet();}
-function openProject(id){view='detail';currentId=id;currentTab='overview';lastDetail=null;
-  $('fleet-view').style.display='none';const dv=$('detail-view');dv.style.display='';dv.innerHTML='<div class="empty">loading…</div>';pollDetail();}
-function showFleet(){view='fleet';currentId=null;$('detail-view').style.display='none';$('fleet-view').style.display='';pollFleet();}
+function refresh(){if(view==='detail')return pollDetail();if(view==='fleet')return pollFleet();}
+const VIEWS=['fleet-view','detail-view','newrun-view','skills-view'];
+function hideAll(){VIEWS.forEach(id=>$(id).style.display='none');}
+function navHL(){['fleet','skills'].forEach(n=>{const b=$('nav-'+n);if(b)b.classList.toggle('on',view===n);});}
+function openProject(id){view='detail';currentId=id;currentTab='overview';actFilter='all';lastDetail=null;
+  hideAll();const dv=$('detail-view');dv.style.display='';dv.innerHTML='<div class="empty">loading…</div>';navHL();pollDetail();}
+function showFleet(){view='fleet';currentId=null;hideAll();$('fleet-view').style.display='';navHL();pollFleet();}
+function showSkills(){view='skills';hideAll();$('skills-view').style.display='';navHL();renderSkills();}
+function showNewRun(){view='newrun';hideAll();$('newrun-view').style.display='';navHL();renderNewRun();}
 function setTab(t){currentTab=t;if(lastDetail)renderDetail(lastDetail);}
+function setActFilter(f){actFilter=f;if(lastDetail)renderDetail(lastDetail);}
+async function stopRun(id){try{await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({projectId:id})});}catch(e){}refresh();}
 async function pollFleet(){try{const r=await fetch('/api/fleet');render(await r.json());tick();}catch(e){fail();}}
 async function pollDetail(){if(!currentId)return;try{
     const r=await fetch('/api/project?id='+encodeURIComponent(currentId));const v=await r.json();
@@ -402,17 +500,71 @@ function renderDetail(v){
     pane+=`<div class="panel"><h3>Artifacts · ${arts.length}</h3>`+
       (arts.length?arts.map(a=>`<div class="art">${a.isTree?'▸':'◦'} ${esc(a.path||a.id)}${a.analyzed?' <span style="color:var(--green)">✓</span>':''}<span class="k">${esc(a.kind)}</span></div>`).join(''):'<div class="empty2">none</div>')+`</div>`;
   } else {
-    pane=`<div class="stream">`+
-      (evs.length?evs.map(e=>`<div class="ev ${e.source}"><span class="ts">${(e.ts||'').slice(11,19)}</span><span class="ty">${esc(e.type)}</span><span class="m">${esc(e.msg)}</span></div>`).join(''):'<div class="empty2" style="padding:14px">no events yet</div>')+`</div>`;
+    const filtered=evs.filter(e=>actFilter==='all'?true:actFilter==='findings'?e.type==='finding_recorded':e.source===actFilter);
+    pane=`<div style="margin-bottom:10px">${['all','run','ledger','findings'].map(f=>`<button class="fbtn ${actFilter===f?'on':''}" onclick="setActFilter('${f}')">${f}</button>`).join('')}</div>
+      <div class="stream">`+
+      (filtered.length?filtered.map(e=>`<div class="ev ${e.source}"><span class="ts">${(e.ts||'').slice(11,19)}</span><span class="ty">${esc(e.type)}</span><span class="m">${esc(e.msg)}</span></div>`).join(''):'<div class="empty2" style="padding:14px">no events</div>')+`</div>`;
   }
   $('detail-view').innerHTML=`
     <div class="detail-head"><button class="back" onclick="showFleet()">← Fleet</button>
-      <span class="dtitle">${esc(v.id)}</span><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span></div>
+      <span class="dtitle">${esc(v.id)}</span><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span>${v.status==='running'?`<button class="stop-btn" onclick="stopRun('${v.id}')">stop</button>`:''}</div>
     <div class="dgoal">${esc(r.goal||'—')}</div>
     <div class="kv"><span>R <b>${r.round||0}/${r.maxRounds||0}</b></span><span>tier <b>${esc(r.tier||'—')}</b></span>
       <span>${esc(r.harness||'—')} <b class="teal">${esc(r.model||'')}</b></span><span>spend <b>$${(cost.usd||0).toFixed(2)}</b></span></div>
     <div class="tabs">${tabBtn('overview','Overview')}${tabBtn('ledger','Ledger',find.length)}${tabBtn('activity','Activity',evs.length)}</div>
     <div class="pane">${pane}</div>`;
+}
+async function renderNewRun(){
+  let harn=[],cat={capabilities:[]};
+  try{harn=(await (await fetch('/api/harnesses')).json()).harnesses||[];}catch(e){}
+  try{cat=await (await fetch('/api/skills')).json();}catch(e){}
+  const harnOpts=harn.filter(h=>h.status!=='planned').map(h=>`<button class="${nr.harness===h.name?'on':''}" onclick="setHarness('${h.name}')">${esc(h.name)}${h.status==='unconfigured'?' ·cfg?':''}</button>`).join('');
+  const caps=(cat.capabilities||[]).map(c=>{
+    const open=nr.openCaps.has(c.capability);
+    return `<div class="capgrp ${open?'open':''}"><div class="h" onclick="toggleCap('${c.capability}')"><span class="cn">${esc(c.capability)}</span><span class="cc">${c.skills.length}</span></div>
+      <div class="b">${c.skills.map(s=>`<div class="skrow"><span class="sn">${esc(s.name)}</span><div class="meta"><span class="ttier ${s.available?(s.tier==='read-only'?'ro':'gated'):'na'}">${s.available?esc(s.tier):'not installed'}</span></div></div>`).join('')}</div></div>`;
+  }).join('');
+  $('newrun-view').innerHTML=`
+    <div class="detail-head"><button class="back" onclick="showFleet()">← Fleet</button><span class="dtitle">New Run</span></div>
+    <div class="dgoal">point rekit at a target, hand it a goal — it forages under a gate</div>
+    <div class="form">
+      <div class="field"><label>Target <span class="hint">a path on this machine</span></label><input class="mono" id="nr-target" placeholder="~/targets/renderer.dll" value="${esc(nr.target)}"></div>
+      <div class="field"><label>Goal</label><textarea id="nr-goal" placeholder="Explain the graphics pipeline and write a patch to force windowed mode.">${esc(nr.goal)}</textarea></div>
+      <div class="row">
+        <div class="field"><label>Harness</label><div class="seg">${harnOpts||'<button class="on">mock</button>'}</div></div>
+        <div class="field"><label>Tier floor</label><div class="seg">${['cheap','beefy'].map(t=>`<button class="${nr.tier===t?'on':''}" onclick="setTier('${t}')">${t}</button>`).join('')}</div></div>
+        <div class="field"><label>Max rounds</label><input class="mono" id="nr-rounds" style="max-width:100px" value="${nr.rounds}"></div>
+      </div>
+      <div class="field"><label>Your rack <span class="hint">rekit auto-scopes these per round from the target's kinds — no need to pre-pick</span></label>${caps||'<div class="empty2">no skills discovered</div>'}</div>
+      <button class="launch" onclick="submitRun()">▸ Launch run</button>
+    </div>`;
+}
+function nrCapture(){const t=$('nr-target'),g=$('nr-goal'),r=$('nr-rounds');if(t)nr.target=t.value;if(g)nr.goal=g.value;if(r)nr.rounds=r.value;}
+function toggleCap(c){nrCapture();nr.openCaps.has(c)?nr.openCaps.delete(c):nr.openCaps.add(c);renderNewRun();}
+function setHarness(h){nrCapture();nr.harness=h;renderNewRun();}
+function setTier(t){nrCapture();nr.tier=t;renderNewRun();}
+async function submitRun(){
+  nrCapture();
+  const target=(nr.target||'').trim(),goal=(nr.goal||'').trim();
+  if(!target||!goal){alert('Target and goal are both required.');return;}
+  try{
+    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({target,goal,harness:nr.harness,tier:nr.tier,maxRounds:parseInt(nr.rounds)||8})});
+    const d=await r.json();
+    if(d.error){alert('Launch failed: '+d.error);return;}
+    nr={harness:nr.harness,tier:nr.tier,rounds:8,openCaps:new Set(),target:'',goal:''};
+    showFleet();
+  }catch(e){alert('Launch failed.');}
+}
+async function renderSkills(){
+  let cat={capabilities:[],total:0},harn=[];
+  try{cat=await (await fetch('/api/skills')).json();}catch(e){}
+  try{harn=(await (await fetch('/api/harnesses')).json()).harnesses||[];}catch(e){}
+  const caps=(cat.capabilities||[]).map(c=>`<div class="capgrp open"><div class="h"><span class="cn">${esc(c.capability)}</span><span class="cc">${c.skills.length}</span></div>
+    <div class="b">${c.skills.map(s=>`<div class="skrow"><span class="sn">${esc(s.name)}</span><div class="meta"><span style="color:var(--ink3);font-size:11px">accepts ${esc((s.accepts||[]).join(', ')||'any')}</span><span class="ttier ${s.available?(s.tier==='read-only'?'ro':'gated'):'na'}">${s.available?esc(s.tier):'not installed'}</span></div></div>`).join('')}</div></div>`).join('');
+  const hs=harn.map(h=>`<div class="hrow"><div><div class="hn">${esc(h.name)}</div><div class="hd">${esc(h.description)}</div></div><span class="hs ${h.status}">${esc(h.status)}</span></div>`).join('');
+  $('skills-view').innerHTML=`<h2>Skills · ${cat.total||0} in the rack</h2>${caps||'<div class="empty2">none discovered</div>'}
+    <h2 style="margin-top:26px">Harnesses</h2>${hs}`;
 }
 refresh();setInterval(refresh,1500);
 </script>

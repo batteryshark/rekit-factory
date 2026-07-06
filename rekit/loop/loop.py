@@ -32,6 +32,7 @@ Termination is guaranteed: the loop always stops at ``max_rounds`` even if no
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -387,6 +388,7 @@ def run(
     policy: Policy | None = None,
     requested_capabilities: list[str] | None = None,
     runlog: RunLog | None = None,
+    cancel: threading.Event | None = None,
 ) -> LoopSummary:
     """Run the ralph loop for ``goal`` against ``project`` via ``adapter``.
 
@@ -445,6 +447,11 @@ def run(
     discovered_caps: set[str] = set()
 
     for i in range(max_rounds):
+        # Cooperative cancellation between rounds (the UI's Stop button, E7.4).
+        if cancel is not None and cancel.is_set():
+            summary.reason = "stopped by operator"
+            break
+
         # Scope the skill set from the *current* ledger kinds ∩ requested caps,
         # filtered by policy — recomputed each round because a prior run may have
         # revealed new kinds (a fresh tree re-entering the ledger) or the brain may

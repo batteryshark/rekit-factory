@@ -26,6 +26,7 @@ HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 
 from rekit.human import pending_questions, post_question  # noqa: E402
+from rekit.lab import fleet  # noqa: E402
 from rekit.lab.server import (  # noqa: E402
     handle,
     make_server,
@@ -151,6 +152,46 @@ def test_live_server_serves_and_answers():
             httpd.shutdown()
             httpd.server_close()
             t.join(3)
+
+
+# -- launch / stop / catalog routes (E7.4) ----------------------------------
+
+def test_run_route_launches_and_appears_in_fleet():
+    with _temp_home():
+        ws = tempfile.mkdtemp(prefix="rekit-target-")
+        target = Path(ws) / "demo.bin"
+        target.write_bytes(b"\x7fELF demo")
+        body = json.dumps({"target": str(target), "goal": "understand it",
+                           "harness": "mock", "maxRounds": 3}).encode()
+        status, data = _body(handle("POST", "/api/run", body, root=projects_root()))
+        assert status == 200 and data["ok"] is True and data["id"]
+        # open_project runs synchronously inside launch, so the project is on the
+        # board immediately (no need to wait on the background loop).
+        assert any(v["id"] == data["id"] for v in fleet(projects_root()))
+
+
+def test_run_route_requires_target_and_goal():
+    status, _ = _body(handle("POST", "/api/run", b'{"goal": "x"}'))
+    assert status == 400
+
+
+def test_stop_route_unknown_id():
+    with _temp_home():
+        status, data = _body(handle("POST", "/api/stop",
+                                    b'{"projectId": "nope"}', root=projects_root()))
+        assert status == 200 and data["ok"] is False
+
+
+def test_skills_route():
+    status, data = _body(handle("GET", "/api/skills"))
+    assert status == 200 and "capabilities" in data and "total" in data
+
+
+def test_harnesses_route():
+    status, data = _body(handle("GET", "/api/harnesses"))
+    assert status == 200
+    names = {h["name"] for h in data["harnesses"]}
+    assert "mock" in names and "pi" in names
 
 
 # -- notifier core ----------------------------------------------------------
