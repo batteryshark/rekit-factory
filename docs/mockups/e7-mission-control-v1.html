@@ -1,0 +1,1054 @@
+<title>rekit · Mission Control</title>
+<style>
+  :root{
+    /* ground + panels */
+    --bg:#080d17; --bg-2:#0a1120; --grid:#0e1628;
+    --panel:#0e1626; --panel-2:#121d31; --panel-3:#17233b;
+    --line:#1d2a44; --line-2:#2a3b5c;
+    /* ink */
+    --ink:#d8e2f2; --ink-2:#9fb0cc; --ink-3:#647694; --ink-4:#43536f;
+    /* brand + semantic */
+    --green:#46e08a; --green-dim:#2ea86a; --green-glow:rgba(70,224,138,.14);
+    --teal:#35d6c3; --violet:#a78bfa; --violet-dim:#6c5cc0;
+    --amber:#f5b13d; --amber-glow:rgba(245,177,61,.14);
+    --red:#f25563; --blue:#5aa8f2;
+    /* type */
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --rail:60px; --topbar:56px;
+    --r:10px; --r-sm:7px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); font-size:14px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      linear-gradient(var(--grid) 1px,transparent 1px),
+      linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+    background-size:44px 44px;
+    background-position:center top;
+  }
+  ::selection{background:var(--green-glow);color:var(--green)}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:10px;border:2px solid transparent;background-clip:padding-box}
+  ::-webkit-scrollbar-thumb:hover{background:#38507c}
+  a{color:inherit;text-decoration:none}
+  button{font-family:inherit;cursor:pointer;border:0;background:none;color:inherit}
+  button:focus-visible,[tabindex]:focus-visible,.card:focus-visible{outline:2px solid var(--green);outline-offset:2px;border-radius:var(--r-sm)}
+
+  .mono{font-family:var(--mono)}
+  .tnum{font-variant-numeric:tabular-nums}
+  .label{font-family:var(--mono);text-transform:uppercase;letter-spacing:.14em;font-size:10.5px;color:var(--ink-3)}
+
+  /* ---------- app shell ---------- */
+  .app{display:grid;grid-template-columns:var(--rail) 1fr;grid-template-rows:var(--topbar) 1fr;height:100vh;min-height:0}
+  .rail{grid-row:1/3;grid-column:1;background:linear-gradient(180deg,var(--bg-2),var(--bg));border-right:1px solid var(--line);
+        display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px 0;z-index:5}
+  .brandmark{width:38px;height:38px;border-radius:9px;display:grid;place-items:center;margin-bottom:8px;
+        background:radial-gradient(120% 120% at 30% 20%,#123a2a,#0c1a2e);border:1px solid #1c3b34;
+        box-shadow:0 0 0 1px #0a1420,0 6px 16px rgba(0,0,0,.5)}
+  .brandmark b{font-family:var(--mono);font-weight:700;color:var(--green);font-size:15px;letter-spacing:-.02em;text-shadow:0 0 12px var(--green-glow)}
+  .nav-btn{width:42px;height:42px;border-radius:9px;display:grid;place-items:center;color:var(--ink-3);position:relative;transition:.15s}
+  .nav-btn svg{width:20px;height:20px;display:block}
+  .nav-btn:hover{color:var(--ink);background:var(--panel-2)}
+  .nav-btn.active{color:var(--green);background:var(--panel-3)}
+  .nav-btn.active::before{content:"";position:absolute;left:-10px;top:9px;bottom:9px;width:3px;border-radius:3px;background:var(--green);box-shadow:0 0 10px var(--green)}
+  .nav-btn .dot{position:absolute;top:6px;right:6px;width:8px;height:8px;border-radius:50%;background:var(--amber);box-shadow:0 0 0 2px var(--bg-2)}
+  .nav-sp{flex:1}
+  .nav-tip{position:absolute;left:52px;white-space:nowrap;background:var(--panel-3);border:1px solid var(--line-2);color:var(--ink);
+        padding:4px 9px;border-radius:6px;font-size:12px;opacity:0;pointer-events:none;transform:translateX(-4px);transition:.14s;z-index:20;box-shadow:0 8px 20px rgba(0,0,0,.5)}
+  .nav-btn:hover .nav-tip{opacity:1;transform:translateX(0)}
+
+  /* ---------- top bar ---------- */
+  .topbar{grid-row:1;grid-column:2;display:flex;align-items:center;gap:16px;padding:0 20px;border-bottom:1px solid var(--line);
+        background:linear-gradient(180deg,rgba(12,20,36,.9),rgba(8,13,23,.75));backdrop-filter:blur(6px);z-index:4}
+  .wordmark{font-family:var(--mono);font-weight:700;letter-spacing:.02em;font-size:15px;color:var(--ink)}
+  .wordmark .k{color:var(--green);text-shadow:0 0 14px var(--green-glow)}
+  .wordmark small{display:block;font-weight:400;letter-spacing:.34em;font-size:8px;color:var(--ink-3);margin-top:-2px}
+  .crumb{display:flex;align-items:center;gap:9px;color:var(--ink-3);font-family:var(--mono);font-size:12px}
+  .crumb b{color:var(--ink)}
+  .topbar .sp{flex:1}
+  .search{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 11px;min-width:230px;color:var(--ink-3)}
+  .search input{background:none;border:0;outline:0;color:var(--ink);font-family:var(--mono);font-size:12px;width:100%}
+  .search kbd{font-family:var(--mono);font-size:10px;background:var(--panel-3);border:1px solid var(--line-2);border-radius:4px;padding:1px 5px;color:var(--ink-3)}
+  .health{display:flex;align-items:center;gap:10px;padding:5px 12px 5px 8px;border:1px solid var(--line);border-radius:999px;background:var(--panel)}
+  .health .legend{display:flex;gap:12px}
+  .health .lg{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+  .health .lg i{width:8px;height:8px;border-radius:50%;display:inline-block}
+  .iconbtn{width:38px;height:38px;border-radius:9px;display:grid;place-items:center;color:var(--ink-2);border:1px solid var(--line);background:var(--panel);position:relative;transition:.15s}
+  .iconbtn:hover{color:var(--ink);border-color:var(--line-2);background:var(--panel-2)}
+  .iconbtn svg{width:18px;height:18px}
+  .iconbtn .badge{position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--amber);color:#20160a;
+        font-family:var(--mono);font-weight:700;font-size:11px;display:grid;place-items:center;box-shadow:0 0 0 2px var(--bg-2),0 0 12px var(--amber-glow)}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:9px 15px;border-radius:9px;font-weight:600;font-size:13px;transition:.15s;border:1px solid transparent;white-space:nowrap}
+  .btn svg{width:16px;height:16px}
+  .btn-primary{background:linear-gradient(180deg,#4fe895,#31c274);color:#04160c;box-shadow:0 0 0 1px #2c8b58 inset,0 6px 18px rgba(70,224,138,.22)}
+  .btn-primary:hover{filter:brightness(1.06)}
+  .btn-ghost{border-color:var(--line-2);color:var(--ink-2);background:var(--panel)}
+  .btn-ghost:hover{color:var(--ink);border-color:#3a527c;background:var(--panel-2)}
+  .btn-sm{padding:6px 11px;font-size:12px;border-radius:7px}
+  .op{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#243b5e,#16233b);border:1px solid var(--line-2);
+        display:grid;place-items:center;font-family:var(--mono);font-size:12px;font-weight:700;color:var(--ink-2)}
+
+  /* ---------- main canvas ---------- */
+  .main{grid-row:2;grid-column:2;overflow:auto;min-height:0}
+  .view{display:none;padding:22px 26px 60px;max-width:1500px}
+  .view.active{display:block;animation:fade .22s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  .view-head{display:flex;align-items:flex-end;gap:16px;margin-bottom:18px}
+  .view-head h1{margin:0;font-size:22px;letter-spacing:-.01em;font-weight:700;text-wrap:balance}
+  .view-head .sub{color:var(--ink-3);font-family:var(--mono);font-size:12px;margin-top:3px}
+  .view-head .sp{flex:1}
+
+  /* filter chips */
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+  .chip{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel);
+        font-family:var(--mono);font-size:11.5px;color:var(--ink-2);transition:.14s;letter-spacing:.02em}
+  .chip:hover{border-color:var(--line-2);color:var(--ink)}
+  .chip.on{border-color:var(--green-dim);color:var(--green);background:var(--green-glow)}
+  .chip .n{color:var(--ink-3)}
+  .chip.on .n{color:var(--green)}
+  .chip i{width:7px;height:7px;border-radius:50%}
+
+  /* ---------- fleet grid ---------- */
+  .fleet{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+  .card{position:relative;background:linear-gradient(180deg,var(--panel),var(--bg-2));border:1px solid var(--line);border-radius:var(--r);
+        padding:15px 16px 14px;overflow:hidden;transition:.16s;text-align:left;width:100%;display:block}
+  .card:hover{border-color:var(--line-2);transform:translateY(-2px);box-shadow:0 12px 30px rgba(0,0,0,.4)}
+  .card .stripe{position:absolute;left:0;top:0;bottom:0;width:3px}
+  .card.s-running .stripe{background:var(--green);box-shadow:0 0 14px var(--green)}
+  .card.s-needs .stripe{background:var(--amber);box-shadow:0 0 14px var(--amber)}
+  .card.s-done .stripe{background:var(--blue)}
+  .card.s-idle .stripe{background:var(--ink-4)}
+  .card.s-failed .stripe{background:var(--red)}
+  .card-top{display:flex;align-items:flex-start;gap:11px;margin-bottom:11px}
+  .kind{width:38px;height:38px;border-radius:9px;flex-shrink:0;display:grid;place-items:center;background:var(--panel-3);border:1px solid var(--line-2);color:var(--ink-2)}
+  .kind svg{width:19px;height:19px}
+  .card-id{min-width:0;flex:1}
+  .card-id .nm{font-family:var(--mono);font-weight:600;font-size:14px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .card-id .gl{color:var(--ink-2);font-size:12.5px;margin-top:2px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.35}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:600;flex-shrink:0;white-space:nowrap}
+  .pill i{width:6px;height:6px;border-radius:50%}
+  .p-running{background:var(--green-glow);color:var(--green);border:1px solid rgba(70,224,138,.28)}
+  .p-running i{background:var(--green);animation:pulse 1.6s infinite}
+  .p-needs{background:var(--amber-glow);color:var(--amber);border:1px solid rgba(245,177,61,.3)}
+  .p-needs i{background:var(--amber);animation:pulse 1.1s infinite}
+  .p-done{background:rgba(90,168,242,.12);color:var(--blue);border:1px solid rgba(90,168,242,.28)}
+  .p-done i{background:var(--blue)}
+  .p-idle{background:var(--panel-3);color:var(--ink-3);border:1px solid var(--line-2)}
+  .p-idle i{background:var(--ink-3)}
+  .p-failed{background:rgba(242,85,99,.12);color:var(--red);border:1px solid rgba(242,85,99,.3)}
+  .p-failed i{background:var(--red)}
+  @keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 currentColor}50%{opacity:.55;box-shadow:0 0 0 4px transparent}}
+
+  .activity{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);display:flex;align-items:center;gap:8px;
+        background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:7px 10px;margin-bottom:11px}
+  .activity .cursor{color:var(--green)}
+  .activity.needs{color:var(--amber);border-color:rgba(245,177,61,.25)}
+  .activity .tx{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  .metaline{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  .tag{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10.5px;color:var(--ink-2);
+        border:1px solid var(--line);border-radius:6px;padding:3px 7px;background:var(--bg)}
+  .tag .k{color:var(--ink-3)}
+  .tier-cheap{color:var(--green)} .tier-beefy{color:var(--teal)}
+  .tag.harness i{width:6px;height:6px;border-radius:2px;background:var(--violet)}
+
+  /* counters */
+  .counters{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+  .ct{background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:7px 9px;text-align:left}
+  .ct .v{font-family:var(--mono);font-weight:700;font-size:17px;line-height:1;letter-spacing:-.02em}
+  .ct .l{font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-3);margin-top:5px}
+  .ct.find .v{color:var(--violet)} .ct.lead .v{color:var(--amber)} .ct.der .v{color:var(--teal)} .ct.skill .v{color:var(--green)}
+
+  /* round pips + spark */
+  .card-foot{display:flex;align-items:center;gap:12px;margin-top:2px}
+  .pips{display:flex;gap:3px;align-items:center}
+  .pip{width:7px;height:7px;border-radius:2px;background:var(--line-2)}
+  .pip.cheap{background:var(--green-dim)} .pip.beefy{background:var(--teal)}
+  .pip.cur{box-shadow:0 0 8px currentColor;animation:pulse 1.4s infinite}
+  .pip.cur.cheap{color:var(--green)} .pip.cur.beefy{color:var(--teal)}
+  .foot-sp{flex:1}
+  .spark{opacity:.9}
+  .elapsed{font-family:var(--mono);font-size:10.5px;color:var(--ink-3)}
+
+  .answer-cta{margin-top:11px;display:flex;gap:8px}
+  .answer-cta .btn{flex:1;justify-content:center}
+  .btn-amber{background:linear-gradient(180deg,#f8bd55,#e79a26);color:#20160a;font-weight:700;box-shadow:0 6px 16px var(--amber-glow)}
+  .btn-amber:hover{filter:brightness(1.05)}
+
+  /* ---------- inbox ---------- */
+  .inbox-wrap{display:grid;grid-template-columns:1fr;gap:14px;max-width:860px}
+  .dcard{background:linear-gradient(180deg,var(--panel),var(--bg-2));border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .dcard.urgent{border-color:rgba(245,177,61,.4);box-shadow:0 0 0 1px rgba(245,177,61,.12),0 10px 30px rgba(0,0,0,.35)}
+  .dcard-head{display:flex;align-items:center;gap:11px;padding:13px 16px;border-bottom:1px solid var(--line);background:var(--bg)}
+  .dkind{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.12em;padding:3px 8px;border-radius:5px;font-weight:700}
+  .dkind.gate{background:rgba(242,85,99,.14);color:var(--red);border:1px solid rgba(242,85,99,.3)}
+  .dkind.fork{background:rgba(90,168,242,.14);color:var(--blue);border:1px solid rgba(90,168,242,.3)}
+  .dkind.ask{background:var(--green-glow);color:var(--green);border:1px solid rgba(70,224,138,.3)}
+  .dcard-head .src{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
+  .dcard-head .src b{color:var(--ink)}
+  .dcard-head .sp{flex:1}
+  .waiting{font-family:var(--mono);font-size:11px;color:var(--amber);display:flex;align-items:center;gap:6px}
+  .waiting i{width:7px;height:7px;border-radius:50%;background:var(--amber);animation:pulse 1.1s infinite}
+  .dcard-body{padding:16px}
+  .dq{font-size:15px;color:var(--ink);margin:0 0 13px;line-height:1.45;text-wrap:pretty}
+  .risk{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;padding:5px 10px;border-radius:7px;margin-bottom:13px;
+        background:rgba(242,85,99,.08);border:1px solid rgba(242,85,99,.22);color:#f5868f}
+  .risk svg{width:14px;height:14px}
+  .dctx{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:11px 13px;margin-bottom:14px;font-family:var(--mono);font-size:11.5px;color:var(--ink-3);line-height:1.6}
+  .dctx b{color:var(--ink-2)}
+  .choices{display:flex;flex-direction:column;gap:8px}
+  .choice{display:flex;align-items:center;gap:10px;padding:11px 13px;border:1px solid var(--line-2);border-radius:8px;background:var(--panel-2);
+        text-align:left;transition:.14s;width:100%}
+  .choice:hover{border-color:var(--blue);background:var(--panel-3)}
+  .choice .n{font-family:var(--mono);font-size:11px;color:var(--blue);border:1px solid var(--line-2);border-radius:5px;padding:2px 7px;flex-shrink:0}
+  .choice .tx{color:var(--ink);font-size:13.5px}
+  .gate-row{display:flex;gap:10px}
+  .gate-row .btn{flex:1;justify-content:center;padding:12px}
+  .btn-allow{background:linear-gradient(180deg,#4fe895,#31c274);color:#04160c;font-weight:700}
+  .btn-deny{border:1px solid rgba(242,85,99,.4);color:#f5868f;background:rgba(242,85,99,.06)}
+  .btn-deny:hover{background:rgba(242,85,99,.12)}
+  .askbox{display:flex;flex-direction:column;gap:10px}
+  .askbox textarea{background:var(--bg);border:1px solid var(--line-2);border-radius:8px;color:var(--ink);font-family:var(--sans);font-size:13.5px;padding:11px 13px;resize:vertical;min-height:64px;outline:0}
+  .askbox textarea:focus{border-color:var(--green-dim)}
+  .suggests{display:flex;gap:7px;flex-wrap:wrap}
+  .sugg{font-family:var(--mono);font-size:11px;padding:5px 10px;border-radius:6px;border:1px dashed var(--line-2);color:var(--ink-2);background:var(--bg)}
+  .sugg:hover{border-style:solid;border-color:var(--green-dim);color:var(--green)}
+  .askbox .send{align-self:flex-end}
+  .empty{display:flex;flex-direction:column;align-items:center;gap:14px;padding:70px 20px;color:var(--ink-3);text-align:center}
+  .empty .bot{width:88px;height:88px;opacity:.85}
+  .empty h3{margin:0;color:var(--ink-2);font-weight:600}
+
+  /* ---------- project detail ---------- */
+  .detail{display:grid;grid-template-columns:288px 1fr;gap:20px;align-items:start}
+  .dside{position:sticky;top:0;display:flex;flex-direction:column;gap:14px}
+  .panel{background:linear-gradient(180deg,var(--panel),var(--bg-2));border:1px solid var(--line);border-radius:var(--r);padding:15px}
+  .panel h4{margin:0 0 12px;font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.14em;color:var(--ink-3);font-weight:600}
+  .kv{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+  .kv:last-child{border-bottom:0}
+  .kv .k{font-family:var(--mono);color:var(--ink-3);font-size:11.5px}
+  .kv .v{font-family:var(--mono);color:var(--ink);text-align:right}
+  .ctrls{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .ctrls .btn{justify-content:center;padding:9px}
+  .ctrls .full{grid-column:1/3}
+  .timeline{position:relative;padding-left:18px}
+  .timeline::before{content:"";position:absolute;left:5px;top:4px;bottom:4px;width:2px;background:var(--line)}
+  .tl{position:relative;padding:0 0 15px}
+  .tl:last-child{padding-bottom:0}
+  .tl .dot{position:absolute;left:-16px;top:3px;width:11px;height:11px;border-radius:50%;border:2px solid var(--bg);background:var(--line-2)}
+  .tl.green .dot{background:var(--green)} .tl.teal .dot{background:var(--teal)} .tl.amber .dot{background:var(--amber)} .tl.blue .dot{background:var(--blue)}
+  .tl .tt{font-family:var(--mono);font-size:12px;color:var(--ink)}
+  .tl .td{font-size:11.5px;color:var(--ink-3);margin-top:2px}
+  .tl .tm{font-family:var(--mono);font-size:10px;color:var(--ink-4);margin-top:3px}
+
+  .tabs{display:flex;gap:3px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:4px;margin-bottom:16px;width:fit-content}
+  .tab{padding:7px 15px;border-radius:6px;font-family:var(--mono);font-size:12px;color:var(--ink-3);transition:.14s;display:flex;align-items:center;gap:7px}
+  .tab:hover{color:var(--ink-2)}
+  .tab.on{background:var(--panel-3);color:var(--green)}
+  .tab .c{background:var(--bg);border-radius:999px;padding:0 6px;font-size:10px;color:var(--ink-3)}
+  .tabpane{display:none} .tabpane.on{display:block;animation:fade .2s ease}
+
+  /* ledger tree */
+  .ledger-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .tree{font-family:var(--mono);font-size:12.5px;line-height:1.9}
+  .tnode{display:flex;align-items:center;gap:8px;padding:2px 6px;border-radius:5px;color:var(--ink-2)}
+  .tnode:hover{background:var(--panel-2)}
+  .tnode .ic{width:15px;height:15px;color:var(--ink-3);flex-shrink:0}
+  .tnode .kd{margin-left:auto;font-size:10px;color:var(--ink-4);text-transform:uppercase;letter-spacing:.08em}
+  .tnode.root{color:var(--green)} .tnode.root .ic{color:var(--green)}
+  .tnode.tree-n .ic{color:var(--teal)}
+  .indent{padding-left:20px;border-left:1px solid var(--line);margin-left:13px}
+  .finding{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+  .finding:last-child{border-bottom:0}
+  .finding .sev{width:6px;border-radius:3px;flex-shrink:0}
+  .finding.hi .sev{background:var(--red)} .finding.md .sev{background:var(--amber)} .finding.lo .sev{background:var(--blue)}
+  .finding .fx .atom{font-family:var(--mono);font-size:10.5px;color:var(--teal);letter-spacing:.03em}
+  .finding .fx .ft{font-size:13px;color:var(--ink);margin-top:2px;line-height:1.4}
+  .finding .fx .fp{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:3px}
+  .lead-item{display:flex;align-items:center;gap:11px;padding:11px;border:1px solid var(--line);border-radius:8px;margin-bottom:9px;background:var(--bg)}
+  .lead-item .ic{width:20px;height:20px;color:var(--amber);flex-shrink:0}
+  .lead-item .lt{font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+  .lead-item .ld{font-size:11.5px;color:var(--ink-3);margin-top:2px}
+  .lead-item .btn{margin-left:auto}
+
+  /* event stream */
+  .stream{background:var(--bg);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .stream-bar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .stream-bar .sp{flex:1}
+  .live{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--green)}
+  .live i{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 1.4s infinite}
+  .fbtn{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+  .fbtn.on{color:var(--green);border-color:var(--green-dim)}
+  .stream-body{max-height:520px;overflow:auto;padding:8px 0;font-family:var(--mono);font-size:12px}
+  .ev{display:flex;gap:12px;padding:4px 14px;align-items:flex-start;border-left:2px solid transparent}
+  .ev:hover{background:var(--panel);border-left-color:var(--line-2)}
+  .ev .ts{color:var(--ink-4);flex-shrink:0;font-size:11px;padding-top:1px}
+  .ev .ty{flex-shrink:0;width:130px;text-transform:uppercase;letter-spacing:.05em;font-size:10px;padding-top:2px}
+  .ev .msg{color:var(--ink-2);min-width:0;flex:1}
+  .ev .msg .hl{color:var(--ink)}
+  .ev.round{background:var(--panel-2);border-left-color:var(--green)}
+  .ty.artifact_added{color:var(--green)} .ty.derivation_recorded{color:var(--teal)}
+  .ty.lead_recorded{color:var(--amber)} .ty.finding_recorded{color:var(--violet)}
+  .ty.artifact_analyzed{color:var(--ink-3)} .ty.agent{color:var(--violet)}
+  .ty.skill_io{color:var(--ink-3)} .ty.tool_call{color:var(--blue)}
+  .ty.round_started{color:var(--green)} .ty.decision{color:var(--amber)} .ty.answer{color:var(--green)}
+
+  /* conversation */
+  .convo{max-width:760px}
+  .msg-row{display:flex;gap:12px;margin-bottom:16px}
+  .msg-row.me{flex-direction:row-reverse}
+  .avatar{width:34px;height:34px;border-radius:9px;flex-shrink:0;display:grid;place-items:center;font-family:var(--mono);font-size:12px;font-weight:700}
+  .avatar.orch{background:linear-gradient(135deg,#2a1c4d,#16233b);border:1px solid var(--violet-dim);color:var(--violet)}
+  .avatar.me{background:linear-gradient(135deg,#243b5e,#16233b);border:1px solid var(--line-2);color:var(--ink-2)}
+  .bubble{max-width:78%;padding:11px 14px;border-radius:12px;font-size:13.5px;line-height:1.5}
+  .bubble.orch{background:var(--panel-2);border:1px solid var(--line);border-top-left-radius:4px}
+  .bubble.me{background:var(--green-glow);border:1px solid rgba(70,224,138,.25);color:var(--ink);border-top-right-radius:4px}
+  .bubble .who{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-3);margin-bottom:5px}
+  .bubble.me .who{color:var(--green-dim);text-align:right}
+  .bubble .decided{font-family:var(--mono);font-size:11px;color:var(--green);margin-top:7px;display:flex;align-items:center;gap:6px}
+  .convo-input{position:sticky;bottom:0;display:flex;gap:10px;padding:14px 0 0;margin-top:6px}
+  .convo-input input{flex:1;background:var(--panel);border:1px solid var(--line-2);border-radius:9px;color:var(--ink);font-family:var(--sans);font-size:13.5px;padding:11px 14px;outline:0}
+  .convo-input input:focus{border-color:var(--green-dim)}
+
+  /* ---------- new run ---------- */
+  .composer{display:grid;grid-template-columns:1fr 340px;gap:20px;align-items:start;max-width:1180px}
+  .form-panel{background:linear-gradient(180deg,var(--panel),var(--bg-2));border:1px solid var(--line);border-radius:var(--r);padding:20px;display:flex;flex-direction:column;gap:20px}
+  .field label{display:block;font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-3);margin-bottom:8px}
+  .field .hint{font-family:var(--sans);text-transform:none;letter-spacing:0;color:var(--ink-4);font-size:11.5px;margin-left:8px}
+  .drop{border:1.5px dashed var(--line-2);border-radius:9px;padding:16px;display:flex;align-items:center;gap:13px;background:var(--bg);transition:.15s}
+  .drop:hover{border-color:var(--green-dim)}
+  .drop .ic{width:40px;height:40px;border-radius:9px;background:var(--panel-3);display:grid;place-items:center;color:var(--green)}
+  .drop .path{font-family:var(--mono);font-size:13px;color:var(--ink)}
+  .drop .det{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px}
+  .drop .kindtag{margin-left:auto;font-family:var(--mono);font-size:10px;padding:4px 9px;border-radius:6px;background:var(--panel-3);border:1px solid var(--line-2);color:var(--teal);text-transform:uppercase;letter-spacing:.08em}
+  .seg{display:flex;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:3px;width:fit-content;margin-bottom:12px}
+  .seg button{padding:7px 15px;border-radius:6px;font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+  .seg button.on{background:var(--panel-3);color:var(--green)}
+  textarea.goal{width:100%;background:var(--bg);border:1px solid var(--line-2);border-radius:9px;color:var(--ink);font-family:var(--sans);font-size:14px;padding:13px;min-height:80px;resize:vertical;outline:0;line-height:1.5}
+  textarea.goal:focus{border-color:var(--green-dim)}
+  .gp-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .gp{border:1px solid var(--line);border-radius:9px;padding:13px;background:var(--bg);text-align:left;transition:.14s}
+  .gp:hover{border-color:var(--line-2)}
+  .gp.on{border-color:var(--green-dim);background:var(--green-glow)}
+  .gp .nm{font-family:var(--mono);font-weight:600;font-size:13px;color:var(--ink)}
+  .gp.on .nm{color:var(--green)}
+  .gp .ds{font-size:11.5px;color:var(--ink-3);margin-top:4px;line-height:1.4}
+  .gp .mt{font-family:var(--mono);font-size:10px;color:var(--ink-4);margin-top:8px;display:flex;gap:9px}
+  .rack{display:flex;flex-direction:column;gap:8px}
+  .rack-grp .rl{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-4);margin:6px 0 6px}
+  .skill{display:flex;align-items:center;gap:11px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);transition:.14s}
+  .skill.on{border-color:var(--green-dim);background:rgba(70,224,138,.05)}
+  .skill .chk{width:18px;height:18px;border-radius:5px;border:1.5px solid var(--line-2);flex-shrink:0;display:grid;place-items:center;color:transparent;transition:.14s}
+  .skill.on .chk{background:var(--green);border-color:var(--green);color:#04160c}
+  .skill .chk svg{width:12px;height:12px}
+  .skill .sn{font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+  .skill .sc{font-size:11px;color:var(--ink-3);margin-top:1px}
+  .skill .meta{margin-left:auto;display:flex;align-items:center;gap:8px}
+  .ttier{font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;padding:2px 7px;border-radius:5px}
+  .ttier.ro{background:var(--green-glow);color:var(--green)}
+  .ttier.gated{background:var(--amber-glow);color:var(--amber)}
+  .ttier.unavail{background:rgba(242,85,99,.1);color:var(--red)}
+  .stack{background:var(--bg);border:1px solid var(--line);border-radius:var(--r);padding:15px;display:flex;flex-direction:column-reverse;gap:5px}
+  .layer{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:7px;font-family:var(--mono);font-size:11.5px;border:1px solid var(--line)}
+  .layer .lc{width:8px;height:8px;border-radius:2px}
+  .layer .ln{color:var(--ink-2)} .layer .lm{margin-left:auto;color:var(--ink-4);font-size:10px}
+  .config-panel{background:linear-gradient(180deg,var(--panel),var(--bg-2));border:1px solid var(--line);border-radius:var(--r);padding:18px;position:sticky;top:0;display:flex;flex-direction:column;gap:16px}
+  .cfg-row{display:flex;flex-direction:column;gap:7px}
+  .selectlike{display:flex;align-items:center;gap:9px;background:var(--bg);border:1px solid var(--line-2);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:12.5px;color:var(--ink)}
+  .selectlike .g{color:var(--ink-3)} .selectlike svg{margin-left:auto;width:15px;height:15px;color:var(--ink-3)}
+  .tierpick{display:flex;gap:8px}
+  .tierpick .tp{flex:1;border:1px solid var(--line-2);border-radius:8px;padding:10px;background:var(--bg);text-align:left}
+  .tierpick .tp .tn{font-family:var(--mono);font-size:11px;font-weight:600}
+  .tierpick .tp .tm{font-family:var(--mono);font-size:10.5px;color:var(--ink-3);margin-top:3px}
+  .tierpick .tp.cheap .tn{color:var(--green)} .tierpick .tp.beefy .tn{color:var(--teal)}
+  .launch{width:100%;justify-content:center;padding:13px;font-size:14px}
+  .stepper{display:flex;align-items:center;gap:9px;background:var(--bg);border:1px solid var(--line-2);border-radius:8px;padding:7px 12px;justify-content:space-between}
+  .stepper button{width:26px;height:26px;border-radius:6px;background:var(--panel-3);color:var(--ink-2);font-family:var(--mono);font-size:15px;display:grid;place-items:center}
+  .stepper .val{font-family:var(--mono);font-weight:600;color:var(--ink)}
+
+  /* skills view */
+  .rack-view{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+  .skcard{background:linear-gradient(180deg,var(--panel),var(--bg-2));border:1px solid var(--line);border-radius:var(--r);padding:15px}
+  .skcard .sh{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+  .skcard .si{width:34px;height:34px;border-radius:8px;background:var(--panel-3);border:1px solid var(--line-2);display:grid;place-items:center;color:var(--green)}
+  .skcard .snm{font-family:var(--mono);font-weight:600;font-size:14px}
+  .skcard .scap{font-family:var(--mono);font-size:11px;color:var(--teal);margin-top:1px}
+  .skcard .sd{font-size:12.5px;color:var(--ink-2);line-height:1.45;margin-bottom:11px}
+  .skcard .sf{display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--ink-3);border-top:1px solid var(--line);padding-top:10px}
+
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--panel-3);border:1px solid var(--line-2);
+        border-radius:10px;padding:12px 18px;display:flex;align-items:center;gap:11px;box-shadow:0 14px 40px rgba(0,0,0,.5);z-index:50;opacity:0;transition:.3s;font-size:13px}
+  .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+  .toast .ic{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;background:var(--green-glow);color:var(--green)}
+  .toast.amber .ic{background:var(--amber-glow);color:var(--amber)}
+
+  .notif{position:fixed;top:66px;right:22px;width:320px;background:linear-gradient(180deg,var(--panel-3),var(--panel-2));border:1px solid var(--line-2);
+        border-left:3px solid var(--amber);border-radius:11px;padding:14px;box-shadow:0 16px 44px rgba(0,0,0,.55);z-index:49;transform:translateX(360px);transition:.35s cubic-bezier(.2,.8,.2,1)}
+  .notif.show{transform:translateX(0)}
+  .notif .nh{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+  .notif .nh .ni{width:26px;height:26px;border-radius:7px;background:var(--amber-glow);color:var(--amber);display:grid;place-items:center}
+  .notif .nh .nt{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--amber)}
+  .notif .nh .x{margin-left:auto;color:var(--ink-3);font-size:16px}
+  .notif .nb{font-size:13px;color:var(--ink);line-height:1.4}
+  .notif .nb b{font-family:var(--mono)}
+  .notif .na{margin-top:11px;display:flex;gap:8px}
+  .notif .na .btn{flex:1;justify-content:center}
+
+  @media (max-width:1080px){
+    .detail{grid-template-columns:1fr} .dside{position:static}
+    .composer{grid-template-columns:1fr} .config-panel{position:static}
+    .ledger-grid{grid-template-columns:1fr}
+  }
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+
+<div class="app">
+  <!-- rail -->
+  <nav class="rail">
+    <div class="brandmark" title="rekit"><b>R</b></div>
+    <button class="nav-btn active" data-nav="fleet" aria-label="Mission Control">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <span class="nav-tip">Mission Control</span>
+    </button>
+    <button class="nav-btn" data-nav="inbox" aria-label="Decision Inbox">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h16v11H8l-4 3z"/><path d="M8 10h8M8 13h5"/></svg>
+      <span class="dot" id="railDot"></span>
+      <span class="nav-tip">Decision Inbox</span>
+    </button>
+    <button class="nav-btn" data-nav="skills" aria-label="Skills & Tools">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.3 2.3-2-2z"/></svg>
+      <span class="nav-tip">Skills &amp; Tools</span>
+    </button>
+    <button class="nav-btn" data-nav="harness" aria-label="Harnesses">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M9 8V5a3 3 0 0 1 6 0v3"/><circle cx="9" cy="14" r="1.2" fill="currentColor"/><circle cx="15" cy="14" r="1.2" fill="currentColor"/></svg>
+      <span class="nav-tip">Harnesses</span>
+    </button>
+    <div class="nav-sp"></div>
+    <button class="nav-btn" data-nav="history" aria-label="History">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 4v4h4"/><path d="M12 8v4l3 2"/></svg>
+      <span class="nav-tip">Project History</span>
+    </button>
+    <button class="nav-btn" data-nav="settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>
+      <span class="nav-tip">Settings</span>
+    </button>
+  </nav>
+
+  <!-- top bar -->
+  <header class="topbar">
+    <div class="wordmark">RE<span class="k">KIT</span><small>MISSION CONTROL</small></div>
+    <div class="crumb" id="crumb"><span>load · analyze · understand · adapt · <b style="color:var(--green)">wreck it</b></span></div>
+    <div class="sp"></div>
+    <div class="search"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input placeholder="jump to project, artifact, skill…"><kbd>⌘K</kbd></div>
+    <div class="health" title="Fleet health">
+      <svg width="34" height="34" viewBox="0 0 36 36" id="ring"></svg>
+      <div class="legend">
+        <span class="lg"><i style="background:var(--green)"></i><span id="hRun">3</span> run</span>
+        <span class="lg"><i style="background:var(--amber)"></i><span id="hNeed">2</span> wait</span>
+        <span class="lg"><i style="background:var(--blue)"></i><span id="hDone">1</span> done</span>
+      </div>
+    </div>
+    <button class="iconbtn" data-nav="inbox" aria-label="Decisions">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+      <span class="badge" id="bellBadge">2</span>
+    </button>
+    <button class="btn btn-primary" id="newRunBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>New Run</button>
+    <div class="op" title="operator">MM</div>
+  </header>
+
+  <!-- main -->
+  <main class="main" id="main">
+    <!-- ===== FLEET ===== -->
+    <section class="view active" id="v-fleet">
+      <div class="view-head">
+        <div>
+          <h1>Mission Control</h1>
+          <div class="sub" id="fleetSub">7 projects · 3 running · 2 awaiting your call</div>
+        </div>
+      </div>
+      <div class="chips" id="fleetChips"></div>
+      <div class="fleet" id="fleetGrid"></div>
+    </section>
+
+    <!-- ===== INBOX ===== -->
+    <section class="view" id="v-inbox">
+      <div class="view-head">
+        <div>
+          <h1>Decision Inbox</h1>
+          <div class="sub" id="inboxSub">runs pause here and wait for your call — you're pinged when one lands</div>
+        </div>
+      </div>
+      <div class="inbox-wrap" id="inboxList"></div>
+    </section>
+
+    <!-- ===== DETAIL ===== -->
+    <section class="view" id="v-detail"></section>
+
+    <!-- ===== NEW RUN ===== -->
+    <section class="view" id="v-newrun">
+      <div class="view-head">
+        <div>
+          <h1>New Run</h1>
+          <div class="sub">point rekit at a target, hand it tools, give the orchestrator a goal</div>
+        </div>
+      </div>
+      <div class="composer">
+        <div class="form-panel">
+          <div class="field">
+            <label>Target</label>
+            <div class="drop">
+              <div class="ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7l8-4 8 4v10l-8 4-8-4z"/><path d="M4 7l8 4 8-4M12 11v10"/></svg></div>
+              <div>
+                <div class="path">~/targets/renderer.dll</div>
+                <div class="det">drag a file or folder, or paste a path · sha256:9f4c…e2a1</div>
+              </div>
+              <div class="kindtag">PE · .NET</div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Goal <span class="hint">ad-hoc, or load a goalpack</span></label>
+            <div class="seg" id="goalSeg">
+              <button class="on" data-goal="adhoc">Ad-hoc goal</button>
+              <button data-goal="pack">Goalpack</button>
+            </div>
+            <div id="goalAdhoc">
+              <textarea class="goal">Explain the graphics pipeline and write a patch to force windowed mode.</textarea>
+            </div>
+            <div id="goalPack" style="display:none">
+              <div class="gp-grid">
+                <button class="gp on"><div class="nm">understand</div><div class="ds">Map the target: entry points, capabilities, data flow — a legible narrative.</div><div class="mt"><span>◷ ~4 min</span><span>renders report</span></div></button>
+                <button class="gp"><div class="nm">mcd</div><div class="ds">Malicious-capability disclosure — flag risky syscalls, network, persistence.</div><div class="mt"><span>◷ ~6 min</span><span>renders report</span></div></button>
+                <button class="gp"><div class="nm">agent-risk</div><div class="ds">Assess an agent/MCP surface for injection &amp; over-broad tool scope.</div><div class="mt"><span>◷ ~5 min</span><span>renders report</span></div></button>
+                <button class="gp"><div class="nm">+ install pack</div><div class="ds" style="color:var(--ink-4)">Drop a goalpack folder into REKIT_HOME/goalpacks.</div></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Tools <span class="hint">builtin skills + any dirs you attach</span></label>
+            <div class="rack" id="skillRack"></div>
+          </div>
+        </div>
+
+        <!-- config sidebar -->
+        <aside class="config-panel">
+          <div class="cfg-row">
+            <label class="label">Harness</label>
+            <div class="selectlike"><i style="width:7px;height:7px;border-radius:2px;background:var(--violet)"></i>pi <span class="g">· headless</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></div>
+          </div>
+          <div class="cfg-row">
+            <label class="label">Model tiers</label>
+            <div class="tierpick">
+              <div class="tp cheap"><div class="tn">CHEAP</div><div class="tm">minimax<br>MiniMax-M3</div></div>
+              <div class="tp beefy"><div class="tn">BEEFY</div><div class="tm">zai<br>glm-5.2</div></div>
+            </div>
+          </div>
+          <div class="cfg-row">
+            <label class="label">Max rounds</label>
+            <div class="stepper"><button>−</button><span class="val">8</span><button>+</button></div>
+          </div>
+          <div class="cfg-row">
+            <label class="label">Trust policy</label>
+            <div class="selectlike" style="font-size:11.5px;line-height:1.5">read-only <span style="color:var(--green)">auto</span> · gated tiers <span style="color:var(--amber)">ask</span></div>
+          </div>
+          <div class="cfg-row">
+            <label class="label">The rekit stack</label>
+            <div class="stack">
+              <div class="layer" style="border-color:rgba(70,224,138,.3)"><i class="lc" style="background:var(--green)"></i><span class="ln">Target binary</span><span class="lm">libgraphics.so</span></div>
+              <div class="layer"><i class="lc" style="background:var(--teal)"></i><span class="ln">Ledger / knowledge</span><span class="lm">content-addressed</span></div>
+              <div class="layer"><i class="lc" style="background:var(--green)"></i><span class="ln">Agent skills</span><span class="lm" id="stackSkills">3 scoped</span></div>
+              <div class="layer"><i class="lc" style="background:var(--violet)"></i><span class="ln">Subagents</span><span class="lm">fan-out ≤4</span></div>
+              <div class="layer"><i class="lc" style="background:var(--amber)"></i><span class="ln">Harness brain</span><span class="lm">pi</span></div>
+            </div>
+          </div>
+          <button class="btn btn-primary launch" id="launchBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>Launch run</button>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ===== SKILLS ===== -->
+    <section class="view" id="v-skills">
+      <div class="view-head">
+        <div><h1>Skills &amp; Tools</h1><div class="sub">the rack — builtin + REKIT_HOME/skills, gated by trust tier and host availability</div></div>
+      </div>
+      <div class="chips"><span class="chip on">All <span class="n">6</span></span><span class="chip">unpack</span><span class="chip">decompile</span><span class="chip">code-understanding</span></div>
+      <div class="rack-view" id="skillCards"></div>
+    </section>
+
+    <!-- ===== HARNESS ===== -->
+    <section class="view" id="v-harness">
+      <div class="view-head"><div><h1>Harnesses</h1><div class="sub">swap the brain without touching goalpacks or skills — E7.4</div></div></div>
+      <div class="rack-view" id="harnessCards"></div>
+    </section>
+
+    <!-- ===== HISTORY / SETTINGS placeholders ===== -->
+    <section class="view" id="v-history">
+      <div class="view-head"><div><h1>Project History</h1><div class="sub">every project under $REKIT_HOME/projects — replay a ledger, resume a run</div></div></div>
+      <div class="empty"><div class="label">Persistent &amp; revisitable</div><h3>Past projects live here</h3><p style="max-width:420px">Each target maps to a stable id; reopening replays its ledger. Resume, re-run a fresh goal (re-derive nothing), or archive.</p></div>
+    </section>
+    <section class="view" id="v-settings">
+      <div class="view-head"><div><h1>Settings</h1><div class="sub">REKIT_HOME · notifications · providers</div></div></div>
+      <div class="empty"><div class="label">One env var</div><h3>REKIT_HOME = ~/.rekit</h3><p style="max-width:420px">Holds skills/, goalpacks/, projects/, bin/. The UI is a read-model over this directory plus a supervisor that launches and steers runs.</p></div>
+    </section>
+  </main>
+</div>
+
+<div class="notif" id="notif">
+  <div class="nh"><div class="ni"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/></svg></div><div class="nt">Needs your call</div><button class="x" onclick="hideNotif()">×</button></div>
+  <div class="nb"><b>SwissBank.exe</b> found a license check and a telemetry beacon — which to pursue first?</div>
+  <div class="na"><button class="btn btn-amber btn-sm" onclick="goInbox()">Open Inbox</button><button class="btn btn-ghost btn-sm" onclick="hideNotif()">Later</button></div>
+</div>
+
+<div class="toast" id="toast"><div class="ic"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12l5 5L20 7"/></svg></div><span id="toastMsg">Done</span></div>
+
+<script>
+/* ---------------- seed data (mirrors real rekit shapes) ---------------- */
+const KINDS = {
+  tree:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7l2-3h5l2 3h9v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/></svg>',
+  elf:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h5M8 17h3"/></svg>',
+  apk:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M10 6h4"/></svg>',
+  pe:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18"/></svg>',
+  jar:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 4h10v3l-1 1v9a3 3 0 0 1-3 3h-2a3 3 0 0 1-3-3V8L7 7z"/></svg>',
+  bin:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" font-family="monospace"><rect x="4" y="4" width="16" height="16" rx="2"/><text x="12" y="15" font-size="7" fill="currentColor" text-anchor="middle" stroke="none">01</text></svg>'
+};
+const spark=(seed)=>{let s=seed*9301+49297;const r=()=>((s=(s*9301+49297)%233280)/233280);
+  let pts=[],y=8;for(let i=0;i<24;i++){y+=(r()-.45)*6;y=Math.max(2,Math.min(20,y));pts.push(y);}
+  const path=pts.map((v,i)=>`${i*(88/23)},${22-v}`).join(' ');
+  return {path,last:pts[pts.length-1]};};
+
+const P=[
+  {id:'atlassian-mcp-server',kind:'tree',status:'running',goal:'Assess this MCP server surface for prompt-injection sinks and over-broad tool scope.',
+   harness:'pi',model:'zai/glm-5.2',tier:'beefy',round:4,max:8,
+   ct:{findings:31,leads:2,derivations:6,skills:3},elapsed:'3m 24s',pack:'agent-risk',
+   pips:['cheap','cheap','beefy','beefy'],step:'synthesizing tool-scope findings over 6 derived trees',
+   seed:7},
+  {id:'libgraphics.so',kind:'elf',status:'needs',goal:'Explain the graphics pipeline and write a patch to force windowed mode.',
+   harness:'pi',model:'zai/glm-5.2',tier:'beefy',round:2,max:8,
+   ct:{findings:8,leads:1,derivations:1,skills:1},elapsed:'1m 47s',pack:null,
+   pips:['cheap','beefy'],step:'blocked — allow ghidra to decompile?',seed:3,inbox:'d-ghidra'},
+  {id:'app-release.apk',kind:'apk',status:'running',goal:'Understand the app: entry points, permissions actually used, and any obfuscated payload.',
+   harness:'pi',model:'minimax/MiniMax-M3',tier:'cheap',round:6,max:8,
+   ct:{findings:12,leads:0,derivations:4,skills:2},elapsed:'5m 02s',pack:'understand',
+   pips:['cheap','cheap','cheap','beefy','cheap','cheap'],step:'running dex2jar on classes.dex → jadx decompile',seed:12},
+  {id:'SwissBank.exe',kind:'pe',status:'needs',goal:'Find how the license check gates premium features; propose a clean bypass patch.',
+   harness:'pi',model:'zai/glm-5.2',tier:'beefy',round:3,max:8,
+   ct:{findings:15,leads:0,derivations:2,skills:1},elapsed:'2m 58s',pack:null,
+   pips:['cheap','beefy','beefy'],step:'blocked — direction fork: license check or telemetry?',seed:5,inbox:'d-fork'},
+  {id:'firmware.bin',kind:'bin',status:'done',goal:'Malicious-capability disclosure across the firmware image.',
+   harness:'pi',model:'zai/glm-5.2',tier:'beefy',round:8,max:8,
+   ct:{findings:47,leads:3,derivations:9,skills:4},elapsed:'8m 11s',pack:'mcd',
+   pips:['cheap','cheap','cheap','beefy','beefy','beefy','beefy','beefy'],step:'DONE · report rendered',seed:20},
+  {id:'vendor-sdk.jar',kind:'jar',status:'failed',goal:'Decompile and audit the licensing SDK for hardcoded secrets.',
+   harness:'pi',model:'minimax/MiniMax-M3',tier:'cheap',round:1,max:8,
+   ct:{findings:0,leads:1,derivations:0,skills:0},elapsed:'0m 22s',pack:null,
+   pips:['cheap'],step:'ilspy host tool not found → lead recorded',seed:2},
+  {id:'installer.msi',kind:'bin',status:'idle',goal:'Queued — unpack and classify embedded payloads.',
+   harness:'pi',model:'minimax/MiniMax-M3',tier:'cheap',round:0,max:8,
+   ct:{findings:0,leads:0,derivations:0,skills:0},elapsed:'queued',pack:'understand',
+   pips:[],step:'queued behind fleet capacity',seed:9}
+];
+
+const STATUS={running:{pill:'p-running',lbl:'Running'},needs:{pill:'p-needs',lbl:'Needs you'},done:{pill:'p-done',lbl:'Done'},idle:{pill:'p-idle',lbl:'Idle'},failed:{pill:'p-failed',lbl:'Failed'}};
+
+let INBOX=[
+  {id:'d-fork',proj:'SwissBank.exe',kind:'fork',urgent:true,waited:'2m 10s',
+   q:'The binary has two independent gates. Which should I pursue first for the bypass?',
+   ctx:'Round 3 · beefy · found: <b>license_check()</b> at 0x401f2a (CMP against a keyed hash) and a <b>telemetry beacon</b> POSTing to metrics.swissbank.io on launch.',
+   options:['License check — it gates the premium features you asked about','Telemetry beacon — map exfil first, then the check','Both in parallel — fan out two subagents']},
+  {id:'d-ghidra',proj:'libgraphics.so',kind:'gate',urgent:true,waited:'54s',
+   q:'Allow the executes-untrusted skill ghidra to decompile libgraphics.so?',
+   risk:'executes-untrusted · runs a headless Ghidra project on attacker-controlled bytes · sandboxed, no network',
+   ctx:'Round 2 · the brain needs a decompiled control-flow graph to trace the fullscreen path. Skill: <b>ghidra</b> · capability <b>decompile</b> · accepts <b>elf, pe</b>.'}
+];
+
+/* ---------------- render: fleet ---------------- */
+const el=(id)=>document.getElementById(id);
+let fleetFilter='all';
+
+function ringChart(){
+  const run=P.filter(p=>p.status==='running').length, need=P.filter(p=>p.status==='needs').length,
+        done=P.filter(p=>p.status==='done').length, other=P.length-run-need-done;
+  const total=P.length, C=2*Math.PI*15.5; let off=0;
+  const segs=[['#46e08a',run],['#f5b13d',need],['#5aa8f2',done],['#2a3b5c',other]];
+  let svg=`<circle cx="18" cy="18" r="15.5" fill="none" stroke="#121d31" stroke-width="4"/>`;
+  segs.forEach(([c,n])=>{if(!n)return;const len=C*n/total;
+    svg+=`<circle cx="18" cy="18" r="15.5" fill="none" stroke="${c}" stroke-width="4" stroke-dasharray="${len} ${C-len}" stroke-dashoffset="${-off}" transform="rotate(-90 18 18)" stroke-linecap="round"/>`;
+    off+=len;});
+  svg+=`<text x="18" y="20" text-anchor="middle" font-family="ui-monospace,monospace" font-size="9" font-weight="700" fill="#d8e2f2">${total}</text>`;
+  el('ring').innerHTML=svg;
+  el('hRun').textContent=run; el('hNeed').textContent=need; el('hDone').textContent=done;
+}
+
+function chips(){
+  const counts={all:P.length,running:0,needs:0,idle:0,done:0,failed:0};
+  P.forEach(p=>counts[p.status]++);
+  const defs=[['all','All',null],['needs','Needs you','var(--amber)'],['running','Running','var(--green)'],
+    ['idle','Idle','var(--ink-3)'],['done','Done','var(--blue)'],['failed','Failed','var(--red)']];
+  el('fleetChips').innerHTML=defs.map(([k,l,c])=>
+    `<button class="chip ${fleetFilter===k?'on':''}" data-filter="${k}">${c?`<i style="background:${c}"></i>`:''}${l} <span class="n">${counts[k]}</span></button>`).join('');
+}
+
+function fleet(){
+  const list=P.filter(p=>fleetFilter==='all'?true:p.status===fleetFilter)
+    .sort((a,b)=>({needs:0,running:1,idle:2,failed:3,done:4}[a.status])-({needs:0,running:1,idle:2,failed:3,done:4}[b.status]));
+  el('fleetGrid').innerHTML=list.map(p=>{
+    const s=STATUS[p.status]; const sp=spark(p.seed);
+    const pips=Array.from({length:p.max},(_,i)=>{
+      const t=p.pips[i]; if(t) return `<span class="pip ${t} ${i===p.pips.length-1&&p.status==='running'?'cur':''}"></span>`;
+      return `<span class="pip"></span>`;}).join('');
+    const cta = p.status==='needs'
+      ? `<div class="answer-cta"><button class="btn btn-amber btn-sm" data-answer="${p.inbox}">Answer decision</button></div>` : '';
+    return `<div class="card s-${p.status}" data-open="${p.id}" role="button" tabindex="0">
+      <span class="stripe"></span>
+      <div class="card-top">
+        <div class="kind">${KINDS[p.kind]}</div>
+        <div class="card-id"><div class="nm">${p.id}</div><div class="gl">${p.goal}</div></div>
+        <span class="pill ${s.pill}"><i></i>${s.lbl}</span>
+      </div>
+      <div class="activity ${p.status==='needs'?'needs':''}">
+        <span class="cursor">${p.status==='needs'?'▲':'❯'}</span><span class="tx">${p.step}</span>
+      </div>
+      <div class="metaline">
+        <span class="tag"><span class="k">R</span> ${p.round}/${p.max}</span>
+        <span class="tag tier-${p.tier}">${p.tier}</span>
+        <span class="tag harness"><i></i>${p.harness} · ${p.model}</span>
+        ${p.pack?`<span class="tag"><span class="k">pack</span> ${p.pack}</span>`:`<span class="tag"><span class="k">goal</span> ad-hoc</span>`}
+      </div>
+      <div class="counters">
+        <div class="ct find"><div class="v tnum">${p.ct.findings}</div><div class="l">findings</div></div>
+        <div class="ct lead"><div class="v tnum">${p.ct.leads}</div><div class="l">leads</div></div>
+        <div class="ct der"><div class="v tnum">${p.ct.derivations}</div><div class="l">derived</div></div>
+        <div class="ct skill"><div class="v tnum">${p.ct.skills}</div><div class="l">skill runs</div></div>
+      </div>
+      <div class="card-foot">
+        <div class="pips">${pips}</div>
+        <div class="foot-sp"></div>
+        <svg class="spark" width="88" height="24" viewBox="0 0 88 24"><defs><linearGradient id="g${p.seed}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${p.status==='needs'?'#f5b13d':'#46e08a'}" stop-opacity=".28"/><stop offset="1" stop-color="#46e08a" stop-opacity="0"/></linearGradient></defs>
+          <polyline points="${sp.path}" fill="none" stroke="${p.status==='needs'?'#f5b13d':'#46e08a'}" stroke-width="1.4" opacity=".9"/>
+          <polygon points="0,24 ${sp.path} 88,24" fill="url(#g${p.seed})"/>
+          <circle cx="88" cy="${22-sp.last}" r="2" fill="${p.status==='needs'?'#f5b13d':'#46e08a'}"/></svg>
+        <div class="elapsed">${p.elapsed}</div>
+      </div>
+      ${cta}
+    </div>`;
+  }).join('');
+  el('fleetSub').textContent=`${P.length} projects · ${P.filter(p=>p.status==='running').length} running · ${P.filter(p=>p.status==='needs').length} awaiting your call`;
+}
+
+/* ---------------- render: inbox ---------------- */
+function inbox(){
+  el('bellBadge').textContent=INBOX.length;
+  el('bellBadge').style.display=INBOX.length?'grid':'none';
+  el('railDot').style.display=INBOX.length?'block':'none';
+  if(!INBOX.length){
+    el('inboxList').innerHTML=`<div class="empty">
+      <svg class="bot" viewBox="0 0 64 64" fill="none" stroke="#46e08a" stroke-width="2"><rect x="16" y="22" width="32" height="26" rx="5"/><circle cx="26" cy="34" r="3" fill="#46e08a" stroke="none"/><circle cx="38" cy="34" r="3" fill="#46e08a" stroke="none"/><path d="M32 22v-6M28 16h8M24 48v6M40 48v6" stroke-linecap="round"/></svg>
+      <h3>All clear — nothing needs you</h3><p>Runs are working the ledger. You'll be pinged the moment one hits a decision.</p></div>`;
+    return;
+  }
+  el('inboxList').innerHTML=INBOX.map(d=>{
+    let body='';
+    if(d.kind==='gate'){
+      body=`<div class="risk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l9 5v5c0 5-4 8-9 8s-9-3-9-8V8z"/><path d="M12 8v5M12 16v.5"/></svg>${d.risk}</div>
+        <div class="dctx">${d.ctx}</div>
+        <div class="gate-row"><button class="btn btn-allow" data-resolve="${d.id}" data-verb="Allowed">Allow &amp; run</button>
+          <button class="btn btn-deny" data-resolve="${d.id}" data-verb="Denied">Deny — skip it</button></div>`;
+    } else if(d.kind==='fork'){
+      body=`<div class="dctx">${d.ctx}</div><div class="choices">${d.options.map((o,i)=>
+        `<button class="choice" data-resolve="${d.id}" data-verb="Chose ${i+1}"><span class="n">${i+1}</span><span class="tx">${o}</span></button>`).join('')}</div>`;
+    } else {
+      body=`<div class="dctx">${d.ctx}</div><div class="askbox"><textarea placeholder="type your answer…"></textarea>
+        <div class="suggests">${(d.suggest||[]).map(s=>`<button class="sugg">${s}</button>`).join('')}</div>
+        <button class="btn btn-primary btn-sm send" data-resolve="${d.id}" data-verb="Answered">Send answer</button></div>`;
+    }
+    const kindlabel=d.kind==='gate'?'confirm · gate':d.kind==='fork'?'present_choices':'ask';
+    return `<div class="dcard ${d.urgent?'urgent':''}">
+      <div class="dcard-head">
+        <span class="dkind ${d.kind}">${kindlabel}</span>
+        <span class="src">from <b>${d.proj}</b></span>
+        <span class="sp"></span>
+        <span class="waiting"><i></i>paused ${d.waited}</span>
+      </div>
+      <div class="dcard-body"><p class="dq">${d.q}</p>${body}</div></div>`;
+  }).join('');
+}
+
+/* ---------------- render: detail ---------------- */
+const LEDGER_EVENTS=[
+  ['round_started','00:00','round 0 · tier cheap · scoped: extract-archive, code-understanding'],
+  ['artifact_added','00:01','root <span class="hl">atlassian-mcp-server/</span> · kind tree · 214 files'],
+  ['tool_call','00:03','code-understanding.observe → 214 files, 61 modules'],
+  ['finding_recorded','00:08','<span class="hl">EXEC.SHELL</span> child_process.exec in src/tools/run.ts:42'],
+  ['finding_recorded','00:09','<span class="hl">NET.FETCH</span> unbounded fetch() to tool-supplied URL'],
+  ['derivation_recorded','00:11','code-understanding → analysis/observations.json'],
+  ['artifact_analyzed','00:12','tree atlassian-mcp-server marked analyzed'],
+  ['round_started','00:14','round 1 · tier cheap · 9 more findings folded'],
+  ['agent','00:22','I see 14 tool handlers; 3 pass user args into a shell or fetch without validation. Escalating to synthesis.'],
+  ['round_started','00:31','round 2 · <span class="hl">tier escalated → beefy</span> (findings present → judgment)'],
+  ['lead_recorded','00:38','wanted <span class="hl">taint-trace</span> for kind tree — no provider available'],
+  ['finding_recorded','00:44','TOOLSCOPE over-broad: `filesystem.write` exposed to untrusted planner'],
+  ['round_started','00:52','round 3 · tier beefy · adjudicating severity across 28 findings'],
+  ['agent','01:03','Grouping into 4 injection sinks + 2 scope escalations. Drafting the risk report.'],
+  ['round_started','01:20','round 4 · tier beefy · synthesizing report artifact']
+];
+const FINDINGS=[
+  ['hi','EXEC.SHELL','Tool `run_command` passes a model-supplied string into child_process.exec — direct command injection from any prompt reaching this tool.','src/tools/run.ts:42'],
+  ['hi','TOOLSCOPE','`filesystem.write` is exposed to the untrusted planner with no path allowlist — arbitrary file overwrite.','manifest.json · tools[]'],
+  ['md','NET.FETCH','Unbounded fetch() to a tool-supplied URL enables SSRF / exfiltration of the workspace.','src/tools/http.ts:19'],
+  ['md','INJECT.SINK','Tool result is concatenated into the next system prompt without delimiting — indirect prompt injection.','src/agent/loop.ts:88'],
+  ['lo','SECRET.ENV','ATLASSIAN_TOKEN read from env and echoed in a debug log path.','src/config.ts:12']
+];
+const CONVO=[
+  {who:'orch',t:'Two tools (`run_command`, `http.get`) forward model-supplied arguments into a shell / network call. Should I attempt a proof-of-concept injection for each, or just document the sinks?'},
+  {who:'me',t:'Document the sinks — no live PoC against a third-party server.'},
+  {who:'orch',t:'Understood. Documenting statically. I also found `filesystem.write` exposed to the untrusted planner — want me to treat over-broad tool scope as its own finding class?',decided:'awaiting you'}
+];
+
+function detail(p){
+  const s=STATUS[p.status];
+  el('v-detail').innerHTML=`
+    <div class="view-head">
+      <button class="btn btn-ghost btn-sm" data-nav="fleet"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>Fleet</button>
+      <div style="margin-left:6px"><h1 style="display:flex;align-items:center;gap:11px">${p.id}<span class="pill ${s.pill}"><i></i>${s.lbl}</span></h1>
+      <div class="sub">${p.goal}</div></div>
+      <div class="sp"></div>
+      <div class="ctrls" style="grid-template-columns:repeat(3,auto)">
+        ${p.status==='running'?'<button class="btn btn-ghost btn-sm">❚❚ Pause</button><button class="btn btn-ghost btn-sm">■ Stop</button>':''}
+        ${p.status==='done'?'<button class="btn btn-ghost btn-sm">↻ Re-run</button><button class="btn btn-ghost btn-sm">View report</button>':''}
+        ${p.status==='failed'?'<button class="btn btn-ghost btn-sm">↻ Retry</button>':''}
+        ${p.status==='needs'?'<button class="btn btn-amber btn-sm" data-answer="'+p.inbox+'">Answer decision</button>':''}
+      </div>
+    </div>
+    <div class="detail">
+      <div class="dside">
+        <div class="panel">
+          <h4>Run</h4>
+          <div class="kv"><span class="k">target</span><span class="v">${p.id}</span></div>
+          <div class="kv"><span class="k">kind</span><span class="v">${p.kind.toUpperCase()}</span></div>
+          <div class="kv"><span class="k">harness</span><span class="v">${p.harness}</span></div>
+          <div class="kv"><span class="k">model</span><span class="v" style="color:var(--teal)">${p.model}</span></div>
+          <div class="kv"><span class="k">round</span><span class="v">${p.round} / ${p.max}</span></div>
+          <div class="kv"><span class="k">${p.pack?'goalpack':'goal'}</span><span class="v">${p.pack||'ad-hoc'}</span></div>
+          <div class="kv"><span class="k">elapsed</span><span class="v">${p.elapsed}</span></div>
+        </div>
+        <div class="panel">
+          <h4>Round timeline</h4>
+          <div class="timeline">
+            <div class="tl green"><div class="dot"></div><div class="tt">Run started</div><div class="td">seeded root artifact · scoped 3 skills</div><div class="tm">00:00 · cheap</div></div>
+            <div class="tl green"><div class="dot"></div><div class="tt">Rounds 0–1 · triage</div><div class="td">21 findings folded, tree analyzed</div><div class="tm">cheap floor</div></div>
+            <div class="tl teal"><div class="dot"></div><div class="tt">Round 2 · escalated</div><div class="td">tier → beefy (findings present)</div><div class="tm">00:31 · beefy</div></div>
+            <div class="tl amber"><div class="dot"></div><div class="tt">Round 3 · consulted you</div><div class="td">PoC vs document? → documented</div><div class="tm">00:52</div></div>
+            <div class="tl teal"><div class="dot"></div><div class="tt">Round 4 · synthesizing</div><div class="td">drafting risk report artifact</div><div class="tm">now</div></div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="tabs" id="detailTabs">
+          <button class="tab on" data-tab="overview">◆ Overview</button>
+          <button class="tab" data-tab="ledger">▤ Ledger <span class="c">${p.ct.findings}</span></button>
+          <button class="tab" data-tab="activity">❯ Activity</button>
+          <button class="tab" data-tab="convo">◗ Conversation <span class="c">1</span></button>
+        </div>
+
+        <div class="tabpane on" data-pane="overview">
+          <div class="counters" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
+            <div class="ct find"><div class="v tnum">${p.ct.findings}</div><div class="l">findings</div></div>
+            <div class="ct lead"><div class="v tnum">${p.ct.leads}</div><div class="l">install leads</div></div>
+            <div class="ct der"><div class="v tnum">${p.ct.derivations}</div><div class="l">derivations</div></div>
+            <div class="ct skill"><div class="v tnum">${p.ct.skills}</div><div class="l">skill runs</div></div>
+          </div>
+          <div class="panel">
+            <h4>Report draft — agent-risk</h4>
+            <div style="font-size:13.5px;line-height:1.6;color:var(--ink-2)">
+              <p style="margin:0 0 10px"><b style="color:var(--ink)">Verdict:</b> this MCP server exposes <b style="color:var(--red)">4 prompt-injection sinks</b> and <b style="color:var(--amber)">2 over-broad tool scopes</b>. Any prompt that reaches <span class="mono" style="color:var(--teal)">run_command</span> or <span class="mono" style="color:var(--teal)">http.get</span> can drive a shell or arbitrary fetch.</p>
+              <p style="margin:0;color:var(--ink-3)">Top fix: gate <span class="mono">filesystem.write</span> behind a path allowlist and delimit tool results before they re-enter the system prompt. Full findings in the Ledger tab.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="tabpane" data-pane="ledger">
+          <div class="ledger-grid">
+            <div class="panel">
+              <h4>Artifacts</h4>
+              <div class="tree">
+                <div class="tnode root">${KINDS.tree}<span>atlassian-mcp-server/</span><span class="kd">tree</span></div>
+                <div class="indent">
+                  <div class="tnode tree-n">${KINDS.tree}<span>src/</span><span class="kd">tree</span></div>
+                  <div class="tnode">◦ tools/run.ts<span class="kd">file</span></div>
+                  <div class="tnode">◦ tools/http.ts<span class="kd">file</span></div>
+                  <div class="tnode">◦ agent/loop.ts<span class="kd">file</span></div>
+                  <div class="tnode" style="color:var(--teal)">⇢ analysis/observations.json<span class="kd">derived</span></div>
+                </div>
+                <div class="tnode" style="color:var(--teal)">⇢ report/agent-risk.md<span class="kd">report</span></div>
+              </div>
+            </div>
+            <div class="panel">
+              <h4>Findings <span style="color:var(--ink-4)">· ${FINDINGS.length} of ${P[0].ct.findings}</span></h4>
+              ${FINDINGS.map(([sev,atom,txt,path])=>`<div class="finding ${sev}"><div class="sev"></div>
+                <div class="fx"><div class="atom">${atom}</div><div class="ft">${txt}</div><div class="fp">${path}</div></div></div>`).join('')}
+            </div>
+          </div>
+          <div class="panel" style="margin-top:16px">
+            <h4>Install leads · capabilities wanted but unavailable</h4>
+            <div class="lead-item"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 20h16"/></svg>
+              <div><div class="lt">taint-trace <span style="color:var(--ink-3)">for kind tree</span></div><div class="ld">no provider resolved — data-flow taint would confirm 2 suspected sinks</div></div>
+              <button class="btn btn-ghost btn-sm">Find skill</button></div>
+            <div class="lead-item"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 20h16"/></svg>
+              <div><div class="lt">semgrep <span style="color:var(--ink-3)">for kind file</span></div><div class="ld">rule-based scan requested by the brain in round 2</div></div>
+              <button class="btn btn-ghost btn-sm">Find skill</button></div>
+          </div>
+        </div>
+
+        <div class="tabpane" data-pane="activity">
+          <div class="stream">
+            <div class="stream-bar">
+              <span class="live"><i></i>live-tailing ledger.jsonl</span>
+              <span class="sp"></span>
+              <button class="fbtn on">all</button><button class="fbtn">findings</button><button class="fbtn">agent</button><button class="fbtn">skills</button>
+            </div>
+            <div class="stream-body">
+              ${LEDGER_EVENTS.map(([ty,ts,msg])=>{
+                const isRound=ty==='round_started';
+                const label={round_started:'round',artifact_added:'artifact',derivation_recorded:'derived',lead_recorded:'lead',finding_recorded:'finding',artifact_analyzed:'analyzed',agent:'brain',tool_call:'tool',skill_io:'skill·io'}[ty]||ty;
+                return `<div class="ev ${isRound?'round':''}"><span class="ts">${ts}</span><span class="ty ${ty}">${label}</span><span class="msg">${msg}</span></div>`;
+              }).join('')}
+            </div>
+          </div>
+        </div>
+
+        <div class="tabpane" data-pane="convo">
+          <div class="convo">
+            ${CONVO.map(m=>`<div class="msg-row ${m.who==='me'?'me':''}">
+              <div class="avatar ${m.who==='me'?'me':'orch'}">${m.who==='me'?'MM':'❯_'}</div>
+              <div class="bubble ${m.who==='me'?'me':'orch'}"><div class="who">${m.who==='me'?'you':'orchestrator · pi'}</div>${m.t}
+              ${m.decided?`<div class="decided"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 6v6l4 2"/><circle cx="12" cy="12" r="9"/></svg>${m.decided}</div>`:''}</div>
+            </div>`).join('')}
+            <div class="convo-input"><input placeholder="reply to the orchestrator…"><button class="btn btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12h15M13 6l6 6-6 6"/></svg></button></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  bindTabs();
+}
+
+/* ---------------- skills + harness cards ---------------- */
+const SKILLS=[
+  {n:'unpack-asar',cap:'unpack',tier:'ro',d:'Unpack an Electron .asar archive into its file tree. Pure stdlib, no host tool.',accepts:'asar',host:'builtin'},
+  {n:'extract-archive',cap:'unpack',tier:'ro',d:'Extract zip / tar / gzip archives to a tree. Pure stdlib.',accepts:'archive',host:'builtin'},
+  {n:'code-understanding',cap:'code-understanding',tier:'ro',d:'Tree-sitter observation → parallax atoms (EXEC.SHELL, NET.FETCH, …). Emits observations.',accepts:'tree, file',host:'REKIT_HOME/skills'},
+  {n:'jadx',cap:'decompile',tier:'gated',d:'Decompile Android APK/DEX to readable Java. Runs untrusted bytes — sandboxed.',accepts:'apk, dex',host:'jadx @ /opt'},
+  {n:'ghidra',cap:'decompile',tier:'gated',d:'Headless Ghidra decompile of native binaries to C + CFG. Sandboxed.',accepts:'elf, pe',host:'ghidra @ /opt'},
+  {n:'ilspy',cap:'decompile',tier:'unavail',d:'Decompile .NET assemblies to C#. Host tool not found on PATH.',accepts:'dll, exe',host:'not installed'}
+];
+function skills(){
+  el('skillRack').innerHTML=SKILLS.slice(0,5).map((s,i)=>`
+    <div class="skill ${i<3?'on':''}" data-skill="${s.n}">
+      <div class="chk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5L20 7"/></svg></div>
+      <div><div class="sn">${s.n}</div><div class="sc">${s.cap} · accepts ${s.accepts}</div></div>
+      <div class="meta"><span class="ttier ${s.tier}">${s.tier==='ro'?'read-only auto':s.tier==='gated'?'gated · asks':'unavailable'}</span></div>
+    </div>`).join('');
+  el('skillCards').innerHTML=SKILLS.map(s=>`
+    <div class="skcard">
+      <div class="sh"><div class="si"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.3 2.3-2-2z"/></svg></div>
+        <div><div class="snm">${s.n}</div><div class="scap">${s.cap}</div></div>
+        <span class="ttier ${s.tier}" style="margin-left:auto">${s.tier==='ro'?'read-only':s.tier==='gated'?'gated':'unavailable'}</span></div>
+      <div class="sd">${s.d}</div>
+      <div class="sf"><span>accepts ${s.accepts}</span><span style="color:${s.tier==='unavail'?'var(--red)':'var(--ink-3)'}">${s.host}</span></div>
+    </div>`).join('');
+}
+const HARNESSES=[
+  {n:'pi',st:'active',d:'earendil-works/pi — headless JSON event stream. Two-tier routing: MiniMax-M3 (cheap) · GLM-5.2 (beefy).',c:'var(--violet)'},
+  {n:'mock',st:'test',d:'Scripted adapter for hermetic tests — replays tagged-line outcomes. Never hits a network.',c:'var(--ink-3)'},
+  {n:'claude-code',st:'available',d:'Drive Claude Code as the brain. Same scoped tool allowlist, same ledger fold.',c:'var(--green)'},
+  {n:'opencode',st:'available',d:'opencode session per run; sidecar shape for multi-harness ensembles.',c:'var(--teal)'}
+];
+function harness(){
+  el('harnessCards').innerHTML=HARNESSES.map(h=>`
+    <div class="skcard">
+      <div class="sh"><div class="si" style="color:${h.c}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M9 8V5a3 3 0 0 1 6 0v3"/><circle cx="9" cy="14" r="1.2" fill="currentColor"/><circle cx="15" cy="14" r="1.2" fill="currentColor"/></svg></div>
+        <div><div class="snm">${h.n}</div><div class="scap" style="color:${h.c}">${h.st}</div></div>
+        ${h.st==='active'?'<span class="pill p-running" style="margin-left:auto"><i></i>in use</span>':`<button class="btn btn-ghost btn-sm" style="margin-left:auto">Select</button>`}</div>
+      <div class="sd">${h.d}</div>
+    </div>`).join('');
+}
+
+/* ---------------- interactions ---------------- */
+function show(view){
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  el('v-'+view).classList.add('active');
+  document.querySelectorAll('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.nav===view));
+  el('main').scrollTop=0;
+  const crumbs={fleet:'load · analyze · understand · adapt · <b style="color:var(--green)">wreck it</b>',
+    inbox:'decisions routed here · you are pinged when one lands',skills:'the skill rack',harness:'pluggable brains',
+    newrun:'compose a run',history:'persistent projects',settings:'REKIT_HOME'};
+  el('crumb').innerHTML='<span>'+(crumbs[view]||'')+'</span>';
+}
+
+document.addEventListener('click',(e)=>{
+  const nav=e.target.closest('[data-nav]'); if(nav){show(nav.dataset.nav);return;}
+  const filt=e.target.closest('[data-filter]'); if(filt){fleetFilter=filt.dataset.filter;chips();fleet();return;}
+  const res=e.target.closest('[data-resolve]'); if(res){resolveDecision(res.dataset.resolve,res.dataset.verb);return;}
+  const sk=e.target.closest('[data-skill]'); if(sk){sk.classList.toggle('on');updateStackSkills();return;}
+  const seg=e.target.closest('#goalSeg button'); if(seg){document.querySelectorAll('#goalSeg button').forEach(b=>b.classList.remove('on'));seg.classList.add('on');
+    el('goalAdhoc').style.display=seg.dataset.goal==='adhoc'?'block':'none';el('goalPack').style.display=seg.dataset.goal==='pack'?'block':'none';return;}
+  const gp=e.target.closest('.gp'); if(gp&&!gp.querySelector('.nm').textContent.includes('install')){document.querySelectorAll('.gp').forEach(b=>b.classList.remove('on'));gp.classList.add('on');return;}
+  // answer must beat open (both live on the card); check it first
+  const ans=e.target.closest('[data-answer]'); if(ans){goInbox();return;}
+  const open=e.target.closest('[data-open]'); if(open){const p=P.find(x=>x.id===open.dataset.open);if(p){detail(p);show('detail');}return;}
+});
+document.addEventListener('keydown',(e)=>{
+  if((e.key==='Enter'||e.key===' ')&&document.activeElement&&document.activeElement.matches('.card[data-open]')){
+    e.preventDefault();const p=P.find(x=>x.id===document.activeElement.dataset.open);if(p){detail(p);show('detail');}}
+});
+el('newRunBtn').addEventListener('click',()=>show('newrun'));
+el('launchBtn').addEventListener('click',launch);
+
+function goInbox(){hideNotif();show('inbox');}
+function bindTabs(){
+  const tabs=el('detailTabs'); if(!tabs)return;
+  tabs.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+    tabs.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));t.classList.add('on');
+    document.querySelectorAll('#v-detail .tabpane').forEach(p=>p.classList.toggle('on',p.dataset.pane===t.dataset.tab));
+  });
+}
+function updateStackSkills(){const n=document.querySelectorAll('#skillRack .skill.on').length;const t=el('stackSkills');if(t)t.textContent=n+' scoped';}
+
+function resolveDecision(id,verb){
+  const d=INBOX.find(x=>x.id===id); if(!d)return;
+  INBOX=INBOX.filter(x=>x.id!==id);
+  const p=P.find(x=>x.id===d.proj);
+  if(p){p.status='running';p.step='resumed — '+verb.toLowerCase()+', continuing the loop';p.inbox=null;}
+  inbox(); chips(); fleet(); ringChart();
+  toast(`${verb} · ${d.proj} resumed`,verb.startsWith('Den')?'amber':'');
+  if(el('v-inbox').classList.contains('active')&&!INBOX.length){/* stay, shows empty */}
+}
+function launch(){
+  const goalOn=document.querySelector('#goalSeg button.on').dataset.goal;
+  P.unshift({id:'renderer.dll',kind:'pe',status:'running',
+    goal:goalOn==='pack'?'understand — map the target and render a report.':'Explain the graphics pipeline and write a patch to force windowed mode.',
+    harness:'pi',model:'minimax/MiniMax-M3',tier:'cheap',round:0,max:8,
+    ct:{findings:0,leads:0,derivations:0,skills:0},elapsed:'just now',pack:goalOn==='pack'?'understand':null,
+    pips:['cheap'],step:'seeding root artifact · scoping skills',seed:11});
+  chips();fleet();ringChart();show('fleet');toast('Run launched · renderer.dll is live');
+}
+let toastTimer;
+function toast(msg,cls){const t=el('toast');el('toastMsg').textContent=msg;t.className='toast show '+(cls||'');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.className='toast '+(cls||''),2600);}
+function hideNotif(){el('notif').classList.remove('show');}
+
+/* ---------------- boot ---------------- */
+ringChart();chips();fleet();inbox();skills();harness();updateStackSkills();
+const reduce=window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+if(!reduce){
+  setTimeout(()=>el('notif').classList.add('show'),1400);
+  setTimeout(()=>el('notif').classList.remove('show'),9000);
+  // gentle live tick on the running hero project's finding counter
+  setInterval(()=>{
+    const hero=P.find(p=>p.id==='atlassian-mcp-server'&&p.status==='running'); if(!hero)return;
+    if(Math.random()>.5){hero.ct.findings++; if(el('v-fleet').classList.contains('active'))fleet();}
+  },3800);
+}
+</script>
