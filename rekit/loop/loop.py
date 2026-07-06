@@ -40,6 +40,7 @@ from ..harness.tiers import BEEFY, CHEAP
 from ..human.channel import CLIHumanChannel, HumanChannel
 from ..ledger.artifacts import Artifact, from_path
 from ..ledger.project import Project
+from ..ledger.runlog import RunLog
 from ..skills.runner import RunResult, run_skill
 from ..skills.scoping import Policy, ScopedSkill, scope_scoped_skills
 
@@ -315,6 +316,7 @@ def run(
     channel: HumanChannel | None = None,
     policy: Policy | None = None,
     requested_capabilities: list[str] | None = None,
+    runlog: RunLog | None = None,
 ) -> LoopSummary:
     """Run the ralph loop for ``goal`` against ``project`` via ``adapter``.
 
@@ -356,6 +358,14 @@ def run(
     policy = policy if policy is not None else Policy.default()
     summary = LoopSummary(project_id=project.id, goal=goal)
 
+    # Emit the run/liveness log (E7.0) if a RunLog was wired in. Optional and
+    # side-effect-only: with runlog=None the loop behaves exactly as before.
+    if runlog is not None:
+        runlog.run_started(
+            goal=goal, harness=getattr(adapter, "name", "harness"),
+            tier=tier, max_rounds=max_rounds,
+        )
+
     # A short digest of the previous round's skill runs, fed forward so the brain
     # can react to what a RUN_SKILL actually produced.
     run_feedback: str = ""
@@ -372,6 +382,9 @@ def run(
         context = build_context(project, goal, scoped=scoped, run_feedback=run_feedback)
         step_tier = _pick_tier(project, i, tier)
 
+        if runlog is not None:
+            runlog.round_started(i, step_tier, tools)
+
         result = adapter.invoke(
             sys_prompt,
             _round_ask(i, goal),
@@ -387,12 +400,22 @@ def run(
         summary.rounds.append(round_result)
         run_feedback = _run_feedback(round_result)
 
+        if runlog is not None:
+            runlog.round_ended(
+                i, findings=round_result.findings, leads=round_result.leads,
+                derivations=round_result.derivations, skill_runs=round_result.skills_run,
+                model=result.model, provider=result.provider,
+            )
+
         if round_result.done:
             summary.done = True
             summary.reason = "brain signaled DONE"
             break
     else:
         summary.reason = f"reached max_rounds ({max_rounds})"
+
+    if runlog is not None:
+        runlog.run_ended(done=summary.done, reason=summary.reason)
 
     return summary
 

@@ -27,10 +27,25 @@ from .channel import (
     ScriptedHumanChannel,
     gate_skill,
 )
+from .inbox import (
+    INBOX_FILENAME,
+    LedgerHumanChannel,
+    all_questions,
+    answer,
+    pending_questions,
+    post_question,
+)
 
 __all__ = [
     "HumanChannel",
     "CLIHumanChannel",
     "ScriptedHumanChannel",
     "gate_skill",
+    # file-backed inbox channel (E7.3)
+    "LedgerHumanChannel",
+    "post_question",
+    "answer",
+    "pending_questions",
+    "all_questions",
+    "INBOX_FILENAME",
 ]

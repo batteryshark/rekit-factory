@@ -42,6 +42,7 @@ from .project import (
     project_id,
     resume,
 )
+from .runlog import RUN_LOG_FILENAME, RunLog, RunState, load_run_state
 
 __all__ = [
     # lifecycle
@@ -72,4 +73,9 @@ __all__ = [
     "replay",
     "load",
     "read_events",
+    # run/liveness log (E7.0)
+    "RunLog",
+    "RunState",
+    "load_run_state",
+    "RUN_LOG_FILENAME",
 ]
