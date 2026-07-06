@@ -474,7 +474,14 @@ def run(
             tools=tools,
             context=context,
             tier=step_tier,
+            cancel=cancel,
         )
+
+        # Stop may have fired during a long brain call (pi); bail before folding
+        # the cancelled/partial result so the run ends promptly.
+        if cancel is not None and cancel.is_set():
+            summary.reason = "stopped by operator"
+            break
 
         round_result = _fold_result(
             project, result, index=i, tier=step_tier, tools=tools,

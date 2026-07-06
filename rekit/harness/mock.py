@@ -86,6 +86,7 @@ class MockAdapter(HarnessAdapter):
         tools: list[str] | None = None,
         context: str | None = None,
         tier: str = "cheap",
+        cancel=None,  # instant adapter — accepted for interface parity, ignored
     ) -> HarnessResult:
         invocation = MockInvocation(
             system_prompt=system_prompt,

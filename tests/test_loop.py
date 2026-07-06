@@ -19,12 +19,15 @@ import contextlib
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 
 from rekit.harness import MockAdapter, MockTurn  # noqa: E402
+from rekit.harness.base import HarnessAdapter, HarnessResult  # noqa: E402
 from rekit.harness.tiers import BEEFY, CHEAP  # noqa: E402
 from rekit.ledger import open_project  # noqa: E402
 from rekit.loop import run  # noqa: E402
@@ -163,9 +166,47 @@ def test_loop_escalates_tier_for_synthesis():
         assert summary.done
 
 
+class _CancellableSlowAdapter(HarnessAdapter):
+    """A brain whose turn blocks — but polls ``cancel`` like the pi adapter, so a
+    Stop interrupts it mid-turn. Never emits DONE, so only cancel ends the loop."""
+
+    name = "slow"
+
+    def invoke(self, system_prompt, user_input, *, tools=None, context=None,
+               tier="cheap", cancel=None):
+        for _ in range(500):
+            if cancel is not None and cancel.is_set():
+                return HarnessResult(text="", ok=False)   # soft cancel, like pi
+            time.sleep(0.01)
+        return HarnessResult(text="FINDING: still working\n")
+
+
+def test_loop_cancel_stops_a_blocked_turn_promptly():
+    """Stop fires during a long brain call: the adapter aborts and the loop ends
+    with reason 'stopped by operator', not by running out max_rounds."""
+    with temp_home() as (_home, work):
+        target = _make_target(work)
+        project = open_project(str(target))
+        adapter = _CancellableSlowAdapter()
+        cancel = threading.Event()
+        box: dict = {}
+
+        def go():
+            box["summary"] = run(project, "analyze", adapter, max_rounds=50, cancel=cancel)
+
+        t = threading.Thread(target=go)
+        t.start()
+        time.sleep(0.15)          # let it enter the (blocking) first turn
+        cancel.set()              # operator hits Stop
+        t.join(timeout=3)
+        assert not t.is_alive(), "loop did not stop after cancel"
+        assert box["summary"].reason == "stopped by operator"
+
+
 if __name__ == "__main__":
     test_loop_runs_to_termination_and_folds_outcomes()
     test_loop_is_bounded_when_no_done_signal()
     test_loop_context_reflects_ledger_and_tools_are_scoped_names()
     test_loop_escalates_tier_for_synthesis()
+    test_loop_cancel_stops_a_blocked_turn_promptly()
     print("rekit loop tests passed")

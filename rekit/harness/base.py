@@ -21,6 +21,7 @@ knows which brain answered.
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -96,6 +97,7 @@ class HarnessAdapter(ABC):
         tools: list[str] | None = None,
         context: str | None = None,
         tier: str = "cheap",
+        cancel: threading.Event | None = None,
     ) -> HarnessResult:
         """Run one turn of the brain and return a :class:`HarnessResult`.
 
@@ -103,6 +105,13 @@ class HarnessAdapter(ABC):
         scoped allowlist of tool names (None = harness default), ``context`` an
         optional ledger-derived string folded into the prompt, and ``tier`` the
         model tier the loop chose (see :mod:`rekit.harness.tiers`).
+
+        ``cancel`` is an optional :class:`threading.Event` the loop sets when an
+        operator stops the run (E7.4). An adapter whose turn is a long-running
+        subprocess (pi) SHOULD poll it and abort promptly — killing the child and
+        returning an unfinished :class:`HarnessResult` (``ok=False``) — so Stop
+        takes effect mid-turn rather than only at the next round boundary. An
+        instant adapter (mock) may ignore it.
         """
         raise NotImplementedError
 

@@ -33,8 +33,11 @@ returning junk.
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import signal
 import subprocess
+import time
 from typing import Any
 
 from .base import HarnessAdapter, HarnessError, HarnessResult, ToolCall
@@ -43,6 +46,10 @@ from .tiers import TierRoute, resolve_tier
 #: Default per-invocation wall-clock budget (seconds). A live model call can be
 #: slow; the loop can override per adapter.
 DEFAULT_TIMEOUT = 300
+
+#: Poll interval (seconds) while waiting on the pi child — small so an operator
+#: Stop kills the call within a fraction of a second.
+_CANCEL_POLL = 0.25
 
 
 class PiAdapter(HarnessAdapter):
@@ -138,6 +145,7 @@ class PiAdapter(HarnessAdapter):
         tools: list[str] | None = None,
         context: str | None = None,
         tier: str = "cheap",
+        cancel=None,
     ) -> HarnessResult:
         if shutil.which(self.binary) is None:
             raise HarnessError(
@@ -154,32 +162,53 @@ class PiAdapter(HarnessAdapter):
         argv = self.build_argv(system_prompt, prompt, tools=tools, tier=tier)
         route = resolve_tier(tier, self.tier_mapping)
 
+        # Run pi as a child we can *poll*, so an operator Stop (the ``cancel``
+        # event) kills the in-flight model call promptly instead of waiting out the
+        # whole turn (a live pi call can take minutes). ``start_new_session`` puts
+        # pi in its own process group so we can kill the *whole tree* — pi may
+        # spawn its own children (the model client), and killing only the leader
+        # would leave them holding the pipes open. We enforce the timeout ourselves.
         try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise HarnessError(
-                f"pi invocation timed out after {self.timeout}s (provider={route.provider}, model={route.model})"
-            ) from exc
         except OSError as exc:
             raise HarnessError(f"failed to launch pi: {exc}") from exc
 
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=_CANCEL_POLL)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel is not None and cancel.is_set():
+                    _kill_tree(proc)
+                    # Soft cancel: an unfinished turn. The loop sees the cancel
+                    # flag and stops without folding this (empty) result.
+                    return HarnessResult(
+                        text="", tier=tier, provider=route.provider,
+                        model=route.model, raw={"cancelled": True}, ok=False,
+                    )
+                if time.monotonic() >= deadline:
+                    _kill_tree(proc)
+                    raise HarnessError(
+                        f"pi invocation timed out after {self.timeout}s "
+                        f"(provider={route.provider}, model={route.model})"
+                    )
+
         if proc.returncode != 0:
-            stderr = (proc.stderr or "").strip()
+            stderr = (stderr or "").strip()
             raise HarnessError(
                 f"pi exited {proc.returncode} (provider={route.provider}, model={route.model}): "
                 f"{stderr[:500] or '<no stderr>'}"
             )
 
-        events = _parse_jsonl(proc.stdout)
+        events = _parse_jsonl(stdout)
         if not events:
             raise HarnessError(
                 f"pi produced no parseable JSON output (provider={route.provider}, model={route.model}); "
-                f"stdout head: {proc.stdout[:200]!r}"
+                f"stdout head: {(stdout or '')[:200]!r}"
             )
 
         text = _final_assistant_text(events)
@@ -195,6 +224,27 @@ class PiAdapter(HarnessAdapter):
             raw=events,
             ok=True,
         )
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """SIGKILL pi's whole process group, then reap. Best-effort, never raises.
+
+    pi may spawn its own children (the model client). Killing only the group
+    leader would leave them orphaned *and* holding the stdout/stderr pipes open,
+    so the reaping ``communicate()`` would block until they exit — defeating the
+    Stop. ``start_new_session=True`` put pi in its own group; kill the group.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        proc.communicate(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # -- JSONL parsing helpers (module-level, unit-testable) -----------------------
