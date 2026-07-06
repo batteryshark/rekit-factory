@@ -7,10 +7,8 @@ re-entrant "unpack this again" dedupes. ``kind`` is a coarse bucket
 (``archive/asar``, ``binary/native``, ``source/python``, ``tree``, …) that skills
 and transforms declare interest in.
 
-This is *rekit's own* artifact identification. Per the topology decision (see
-``parallax/docs/rekit-epic.md`` §E5.1), ``classify()`` — artifact identification —
-stays in rekit and is NOT taken from parallax: rekit depends on nothing. The
-model is re-derived cleanly here, not imported.
+This is *rekit's own* artifact identification: ``classify()`` lives here in the
+kernel, re-derived cleanly and imported from nothing — rekit depends on nothing.
 """
 
 from __future__ import annotations

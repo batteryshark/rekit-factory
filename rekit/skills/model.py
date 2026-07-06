@@ -22,8 +22,8 @@ The frontmatter schema (a superset of the transform-era dialect, plus the new
       Decompile an Android APK/DEX back to readable Java...
     ---
 
-Host-gating mirrors ``prlx_core.transforms.HostRequirement.satisfied`` — a skill
-is *available* when its host tool resolves via env var, a declared path, or PATH.
+Host-gating: a skill is *available* when its host tool resolves via env var, a
+declared path, or PATH.
 A missing tool means unavailable, which E4 degrades into an "install X" lead
 rather than a crash.
 """
@@ -64,8 +64,8 @@ class HostRequirement:
     """A declared dependency on a host tool.
 
     Resolves via (in order) an env var that points at the install, a declared
-    directory containing the binary, or the binary being on ``PATH``. Re-implements
-    ``prlx_core.transforms.HostRequirement.satisfied`` — no import from parallax.
+    directory containing the binary, or the binary being on ``PATH``. Self-contained
+    host-requirement resolution — no external imports.
     """
 
     name: str

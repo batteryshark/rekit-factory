@@ -30,6 +30,7 @@ from rekit.skills import (  # noqa: E402
     Registry,
     scope_scoped_skills,
     scope_skills,
+    skills_dir,
 )
 
 
@@ -116,7 +117,11 @@ def _build_home() -> str:
 
 
 def _registry(home: str) -> Registry:
-    return Registry.from_home(environ={"REKIT_HOME": home})
+    # Scan only this temp home's skills (explicit root) so scoping assertions stay
+    # exact. `Registry.from_home()` with no root also folds in the repo's builtin
+    # skills — that integration is covered by tests/test_builtin_skills.py.
+    environ = {"REKIT_HOME": home}
+    return Registry.from_home(root=skills_dir(environ), environ=environ)
 
 
 # --------------------------------------------------------------------------------
@@ -329,7 +334,7 @@ description: Needs an unresolved host tool.
 ---
 # needs-tool
 """)
-        reg = Registry.from_home(environ={"REKIT_HOME": tmp})
+        reg = Registry.from_home(root=skills_dir({"REKIT_HOME": tmp}), environ={"REKIT_HOME": tmp})
         no_path = lambda name: None  # noqa: E731
         scoped = scope_skills(
             reg,

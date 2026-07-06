@@ -1,7 +1,6 @@
 """REKIT_HOME resolution — where skills, shared bins, and projects live.
 
-``$REKIT_HOME`` is the root of the lab's on-disk state (see the REKIT_HOME layout
-in ``parallax/docs/rekit-epic.md``)::
+``$REKIT_HOME`` is the root of the lab's on-disk state::
 
     $REKIT_HOME/                 # ~/.rekit, configurable via $REKIT_HOME
       skills/<skill>/            # SKILL.md + scripts/ (own uv venv) — self-contained

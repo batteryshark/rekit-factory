@@ -135,7 +135,10 @@ def test_discovery_finds_dropped_folders():
     home = _build_home()
     try:
         environ = {"REKIT_HOME": home}
-        found = discover_skills(environ=environ)
+        # Scan just this temp home's skills dir (explicit root) so the assertion
+        # isolates USER discovery. `discover_skills()` with no root also folds in
+        # the repo's builtin skills — covered by tests/test_builtin_skills.py.
+        found = discover_skills(root=skills_dir(environ), environ=environ)
         names = {s.name for s in found}
         # Three real skills; the junk folder without a SKILL.md is ignored.
         assert names == {"jadx", "unpack-asar", "probe-endpoint"}, names
@@ -151,8 +154,10 @@ def test_discovery_finds_dropped_folders():
 
 
 def test_discovery_missing_home_is_empty():
-    # A missing REKIT_HOME must not crash — just no skills.
-    assert discover_skills(environ={"REKIT_HOME": "/nonexistent/rekit/home/xyz"}) == []
+    # A missing REKIT_HOME skills dir must not crash — just no user skills. Scan
+    # only that root so the builtin skills (found by a rootless call) don't count.
+    missing = skills_dir({"REKIT_HOME": "/nonexistent/rekit/home/xyz"})
+    assert discover_skills(root=missing, environ={"REKIT_HOME": "/nonexistent/rekit/home/xyz"}) == []
 
 
 def test_tier_parses():
@@ -205,7 +210,9 @@ def test_find_skills_ranks_decompile_by_intent():
 def test_skills_for_kind_exact_and_family():
     home = _build_home()
     try:
-        reg = Registry.from_home(environ={"REKIT_HOME": home})
+        # Isolate to this temp home's skills (explicit root) — builtin skills are
+        # exercised by tests/test_builtin_skills.py, not here.
+        reg = Registry.from_home(root=skills_dir({"REKIT_HOME": home}), environ={"REKIT_HOME": home})
 
         # Exact kind: only unpack-asar accepts archive/asar.
         asar = reg.skills_for_kind("archive/asar")
@@ -229,7 +236,7 @@ def test_skills_for_kind_exact_and_family():
 def test_skills_by_capability():
     home = _build_home()
     try:
-        reg = Registry.from_home(environ={"REKIT_HOME": home})
+        reg = Registry.from_home(root=skills_dir({"REKIT_HOME": home}), environ={"REKIT_HOME": home})
         assert {s.name for s in reg.skills_by_capability("decompile")} == {"jadx"}
         assert {s.name for s in reg.skills_by_capability("unpack")} == {"unpack-asar"}
         assert {s.name for s in reg.skills_by_capability("code-understanding")} == {"probe-endpoint"}
@@ -290,7 +297,7 @@ def test_host_gating_shared_bin_dir():
 def test_registry_available_only_filter():
     home = _build_home()
     try:
-        reg = Registry.from_home(environ={"REKIT_HOME": home})
+        reg = Registry.from_home(root=skills_dir({"REKIT_HOME": home}), environ={"REKIT_HOME": home})
         no_path = lambda name: None  # noqa: E731
         # jadx has a host gate; with nothing present it is unavailable.
         decompilers = reg.skills_by_capability(

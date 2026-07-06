@@ -10,8 +10,8 @@ import argparse
 from rekit import __version__
 
 DESCRIPTION = (
-    "rekit: the harness-agnostic orchestration runtime for the Parallax "
-    "reverse-engineering lab (ralph loop, ledger, skills, human channel)."
+    "rekit: a harness-agnostic orchestration runtime — persistent ledger, ralph "
+    "loop over pluggable brains, skills, and goalpacks. Point it at a target, pick a goal."
 )
 
 

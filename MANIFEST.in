@@ -1,0 +1,8 @@
+# Ship the builtin skills tree (repo root `skills/`) in the sdist so a source
+# distribution carries the committed SKILL.md + scripts/. Fetched host binaries
+# under any skill's bin/ (and dist/) are build artifacts, not source — prune them
+# so only the .gitkeep placeholder rides along.
+graft skills
+recursive-exclude skills/*/bin *
+recursive-exclude skills/*/dist *
+include skills/*/bin/.gitkeep

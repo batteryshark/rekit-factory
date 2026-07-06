@@ -8,9 +8,8 @@ still *read* what it needs (allow-default for reads); it just can't phone home o
 scribble outside its sandbox. Runs are **timeout-bounded** so a hostile input
 can't wedge the loop.
 
-This is a clean re-implementation of parallax's
-``prlx_transform_decompile.sandbox`` (D3) — nothing is imported from parallax;
-rekit depends on nothing outside stdlib.
+This is a clean, self-contained re-implementation (design decision D3) — nothing
+is imported; rekit depends on nothing outside stdlib.
 
 On a non-macOS host, or if ``sandbox-exec`` is missing, we degrade to running the
 tool *without* the profile. The no-network + confined-writes guarantee is the

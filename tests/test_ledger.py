@@ -8,8 +8,8 @@ Proves the four acceptance criteria of card T-048:
 - replay the event log from scratch → reconstructs the same ledger state;
 - project lifecycle — ``open_project`` / ``list_projects`` / ``resume`` round-trip.
 
-Plain-python style like the prlx-core tests (runnable via
-``python tests/test_ledger.py``) and pytest-compatible. Each test uses a temp
+Plain-python style (runnable via ``python tests/test_ledger.py``) and
+pytest-compatible. Each test uses a temp
 ``REKIT_HOME`` via the env var so nothing touches ``~/.rekit``.
 """
 

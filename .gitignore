@@ -21,3 +21,10 @@ htmlcov/
 # OS / editor
 .DS_Store
 *.swp
+
+# Builtin skills: SKILL.md + scripts/ are committed, but fetched host binaries are
+# not — they land in each skill's bin/ (or dist/) via scripts/fetch.sh. Ignore the
+# fetched payloads; keep the bin/.gitkeep placeholder so the empty dir is tracked.
+skills/*/bin/*
+!skills/*/bin/.gitkeep
+skills/*/dist/

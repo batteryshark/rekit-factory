@@ -1,7 +1,7 @@
 [project]
 name = "rekit"
 version = "0.1.0"
-description = "rekit: the harness-agnostic orchestration runtime for the Parallax reverse-engineering lab (ralph loop, persistent ledger, skill scoping, human channel). Depends on nothing."
+description = "rekit: a harness-agnostic orchestration runtime — ralph loop, persistent ledger, skills + scoping, human channel, goalpacks. Point it at a target, pick a goal. Depends on nothing."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
@@ -9,7 +9,7 @@ authors = [{ name = "Mario Mercaldi" }]
 keywords = ["orchestration", "runtime", "ralph-loop", "ledger", "reverse-engineering", "agent-harness"]
 # Zero runtime dependencies on purpose: rekit is a clean kernel. Heavy deps
 # (harness SDKs, tree-sitter, decompilers) live inside the skills that need them,
-# never in the core. It does not depend on parallax.
+# never in the core. It depends on nothing.
 dependencies = []
 
 [build-system]
@@ -28,3 +28,16 @@ include = ["rekit*"]
 # submodules), so they are data, not packages — hence an explicit glob here.
 [tool.setuptools.package-data]
 rekit = ["goalpacks/**/GOALPACK.md", "goalpacks/**/system-prompt.md", "goalpacks/**/renderer.py"]
+
+# Builtin skills live at the *repo root* (`rekit/skills/<skill>/`), committed to
+# this repo — NOT inside the `rekit` package — so they're resolved by
+# `rekit.skills.registry.builtin_skills_dir()` as `Path(__file__).parents[2] /
+# "skills"`. Because they sit outside any package, setuptools' package-data glob
+# (rooted at the package dir) can't reach them; MANIFEST.in ships them in the
+# **sdist**, and an editable / source checkout finds them directly at the repo
+# root. WHEEL CAVEAT: a plain `pip wheel .` does not vendor top-level-relative
+# data next to the installed package, so `builtin_skills_dir()` may point at a
+# non-existent path in a wheel install — discovery tolerates that (returns just
+# the user skills). Shipping builtin skills inside a wheel would require either
+# moving the tree under the package (`rekit/rekit/skills_builtin/`) or a custom
+# build step; deferred, since the target install here is editable/source.

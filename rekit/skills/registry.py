@@ -1,8 +1,14 @@
 """Filesystem skill discovery + the searchable registry.
 
-Discovery scans ``$REKIT_HOME/skills/*/SKILL.md`` — no pip, no entry points.
-Dropping a folder makes a skill available with zero install, including one
-authored in another project. Missing or malformed skills are skipped, never
+Discovery scans two roots for ``<root>/*/SKILL.md`` — no pip, no entry points:
+
+* **builtin** skills shipped in the rekit repo at ``<repo-root>/skills`` (committed;
+  these ride along with the package), and
+* **user** skills at ``$REKIT_HOME/skills`` (zero install — dropping a folder makes
+  a skill available, including one authored in another project).
+
+A user skill of the same name **shadows** a builtin one (the same builtin-vs-user
+precedence goalpacks use). Missing roots and malformed skills are skipped, never
 fatal.
 
 The :class:`Registry` is the searchable rack. It exposes the three primitives E4's
@@ -31,6 +37,20 @@ from .model import Skill, load_skill
 
 SKILL_FILE = "SKILL.md"
 
+
+def builtin_skills_dir() -> Path:
+    """``<repo-root>/skills`` — the builtin skills committed to the rekit repo.
+
+    Resolved relative to this package (``rekit/rekit/skills/registry.py``): two
+    ``parents`` up from the ``skills`` package is the ``rekit`` package, three is the
+    repo root that holds the committed ``skills/`` tree. Mirrors how
+    ``rekit.goalpacks._builtin_root`` resolves builtin goalpacks, except builtin
+    skills live at the *repo* root (not inside the package), so this reaches
+    ``parents[2]`` rather than ``parent``. The directory may be absent (e.g. a wheel
+    that did not ship the tree); callers tolerate that.
+    """
+    return Path(__file__).resolve().parents[2] / "skills"
+
 # Words too generic to help ranking (kept tiny — this is not NLP).
 _STOPWORDS = frozenset(
     """
@@ -46,18 +66,17 @@ def _tokens(text: str) -> list[str]:
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS and len(t) > 1]
 
 
-def discover_skills(root: Path | None = None, environ: dict | None = None) -> list[Skill]:
-    """Every skill under ``root`` (default ``$REKIT_HOME/skills``).
+def _scan_root(base: Path, environ: dict | None, into: dict[str, Skill], *,
+               overwrite: bool) -> None:
+    """Load every ``<base>/*/SKILL.md`` into ``into`` keyed by skill name.
 
-    Scans ``<root>/*/SKILL.md``. A missing root yields ``[]``; a folder whose
-    ``SKILL.md`` fails to parse is skipped (a bad skill must not sink the rack).
-    Sorted by name; first occurrence of a name wins.
+    A folder without a ``SKILL.md`` and any skill whose frontmatter fails to parse
+    are skipped — a bad skill never sinks the rack. When ``overwrite`` is True a
+    later root's skill replaces an earlier one of the same name (user shadows
+    builtin); otherwise the first-seen wins.
     """
-    base = Path(root) if root is not None else skills_dir(environ)
     if not base.is_dir():
-        return []
-
-    by_name: dict[str, Skill] = {}
+        return
     for child in sorted(base.iterdir()):
         if not child.is_dir():
             continue
@@ -68,7 +87,31 @@ def discover_skills(root: Path | None = None, environ: dict | None = None) -> li
             skill = load_skill(skill_md, environ)
         except Exception:
             continue
-        by_name.setdefault(skill.name, skill)
+        if overwrite or skill.name not in into:
+            into[skill.name] = skill
+
+
+def discover_skills(root: Path | None = None, environ: dict | None = None) -> list[Skill]:
+    """Every discoverable skill: **builtin** (``<repo-root>/skills``) + **user**
+    (``$REKIT_HOME/skills``).
+
+    Scans ``<root>/*/SKILL.md`` under each root. A missing root is silently empty;
+    a folder whose ``SKILL.md`` fails to parse is skipped (a bad skill must not
+    sink the rack). A **user** skill of the same name **shadows** a builtin one
+    (builtin is scanned first, user last and wins the name) — the builtin-vs-user
+    precedence goalpacks use.
+
+    Passing ``root`` explicitly scans *only* that directory (no builtin, no user) —
+    the escape hatch tests and subsets use to point discovery at a fixture tree.
+    Sorted by name.
+    """
+    by_name: dict[str, Skill] = {}
+    if root is not None:
+        _scan_root(Path(root), environ, by_name, overwrite=True)
+    else:
+        # Builtin first, then user — so a same-named user skill shadows the builtin.
+        _scan_root(builtin_skills_dir(), environ, by_name, overwrite=True)
+        _scan_root(skills_dir(environ), environ, by_name, overwrite=True)
     return [by_name[n] for n in sorted(by_name)]
 
 

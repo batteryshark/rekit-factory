@@ -1,7 +1,7 @@
 """The persistent, event-sourced project ledger (E1.1 + E1.3).
 
-This promotes parallax's in-memory ``orchestrator.Ledger`` into a durable,
-first-class ledger. What the orchestrator knows about a target — its artifacts by
+This is a durable, first-class event-sourced ledger. What rekit learns about a
+target — its artifacts by
 content hash, their kinds, the trees to analyze, the derivations that produced
 them, the tool-need leads, and the findings — is here recorded as an append-only
 stream of typed events (``ledger.jsonl``). The live in-memory state is a

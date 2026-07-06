@@ -34,7 +34,7 @@ from .model import (
     load_skill,
     normalize_tier,
 )
-from .registry import Registry, ScoredSkill, discover_skills
+from .registry import Registry, ScoredSkill, builtin_skills_dir, discover_skills
 from .runner import (
     DEFAULT_RUN,
     STATUS_ERROR,
@@ -65,6 +65,7 @@ __all__ = [
     "Registry",
     "ScoredSkill",
     "discover_skills",
+    "builtin_skills_dir",
     # scoping (E4)
     "Policy",
     "ScopedSkill",
