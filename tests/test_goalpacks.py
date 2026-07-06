@@ -1,21 +1,26 @@
-"""E6 (first slice) — goalpacks: goals that run on the rekit loop.
+"""E6 — goalpacks: goals that run on the rekit loop, reporting **optional**.
 
 Proves the goalpack model end-to-end on the loop:
 
 - ``discover_goalpacks()`` finds the builtin ``understand`` and a user goalpack
   dropped into a temp ``$REKIT_HOME/goalpacks/``;
 - ``load_goalpack("understand")`` resolves its renderer callable;
-- **end-to-end:** a scripted :class:`MockAdapter` emits ``FINDING: [does] ...`` /
-  ``[brittle] ...`` lines then ``DONE``; ``run_goalpack(...)`` drives the loop,
-  folds the findings into the generic ledger, and the goalpack's own renderer
-  returns understand's four-section shape with each finding under the right lens —
-  with no shared ``report_model``.
+- **report-as-artifact:** a scripted :class:`MockAdapter` emits ``FINDING: [does] ...``
+  / ``[brittle] ...`` lines then ``DONE``; ``run_goalpack(...)`` drives the loop,
+  folds the findings into the generic ledger, and — because understand declares a
+  renderer — returns a :class:`GoalpackResult` whose ``.report`` has understand's
+  four-section shape AND records the report as ``report/json`` + ``report/markdown``
+  ledger artifacts (content-addressed: re-running is a no-op);
+- **reporting is optional:** a no-renderer fixture goalpack (the *act*-goal case)
+  runs the loop and returns ``report=None`` / ``report_artifacts=[]`` while still
+  surfacing findings.
 
 Plain-python style (runnable via ``python tests/test_goalpacks.py``) and
 pytest-compatible. A temp ``$REKIT_HOME`` keeps everything hermetic — no network.
 """
 
 import contextlib
+import json
 import os
 import sys
 import tempfile
@@ -25,6 +30,7 @@ HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 
 from rekit.goalpacks import (  # noqa: E402
+    GoalpackResult,
     discover_goalpacks,
     load_goalpack,
     run_goalpack,
@@ -82,6 +88,26 @@ def _drop_user_goalpack(home: Path, name: str = "echo") -> Path:
     return gp
 
 
+def _drop_no_renderer_goalpack(home: Path, name: str = "act") -> Path:
+    """Author an *act*-style user goalpack with NO renderer — reporting is optional.
+
+    No ``renderer:`` frontmatter and no ``renderer.py`` on disk → ``renderer`` is
+    ``None``; running it produces findings/artifacts but no report."""
+    gp = home / "goalpacks" / name
+    gp.mkdir(parents=True)
+    (gp / "GOALPACK.md").write_text(
+        "---\n"
+        f"name: {name}\n"
+        "title: Act goalpack (no report)\n"
+        "goal: Do the thing; produce a patch, not a report.\n"
+        "requestedCapabilities: [code-reading]\n"
+        "---\n\nAn act-goal: findings/artifacts, no report renderer.\n",
+        encoding="utf-8",
+    )
+    (gp / "system-prompt.md").write_text("Emit findings then DONE.\n", encoding="utf-8")
+    return gp
+
+
 def test_discover_finds_builtin_understand_and_user_goalpack():
     """Discovery surfaces the shipped ``understand`` and a user goalpack dropped
     into ``$REKIT_HOME/goalpacks``."""
@@ -116,12 +142,14 @@ def test_load_unknown_goalpack_raises():
 
 def test_run_goalpack_drives_loop_and_renders_understand_shape():
     """End-to-end: a scripted brain emits lens-tagged findings then DONE;
-    ``run_goalpack`` folds them into the ledger and the renderer returns
-    understand's four-section shape grouped by lens."""
+    ``run_goalpack`` folds them into the ledger, returns a ``GoalpackResult`` whose
+    ``.report`` has understand's four-section shape, AND records the report as
+    ``report/json`` + ``report/markdown`` ledger artifacts on disk."""
     with temp_home() as (_home, work):
         target = _make_target(work)
         project = open_project(str(target))
         gp = load_goalpack("understand")
+        assert gp.renderer is not None, "understand DOES declare a report renderer"
 
         script = [
             MockTurn(
@@ -141,7 +169,10 @@ def test_run_goalpack_drives_loop_and_renders_understand_shape():
         ]
         adapter = MockAdapter(script)
 
-        report = run_goalpack(project, gp, adapter, max_rounds=8)
+        result = run_goalpack(project, gp, adapter, max_rounds=8)
+        assert isinstance(result, GoalpackResult)
+        report = result.report
+        assert report is not None
 
         # The four understand sections are present.
         for lens in ("does", "decides", "brittle", "surprising"):
@@ -164,17 +195,53 @@ def test_run_goalpack_drives_loop_and_renders_understand_shape():
         assert summary["counts"] == {"does": 1, "decides": 1, "brittle": 1, "surprising": 1}
         assert summary["done"] is True
 
+        # The report is a first-class ledger artifact: report/json + report/markdown.
+        kinds = {a.kind for a in result.report_artifacts}
+        assert kinds == {"report/json", "report/markdown"}, kinds
+        for art in result.report_artifacts:
+            assert art.meta.get("goalpack") == "understand"
+            assert art.meta.get("findingCount") == 4
+        ledger = project.reload()
+        for art in result.report_artifacts:
+            assert ledger.has_artifact(art.content_hash), "report should be in the ledger"
+
+        # report.json exists on disk under the project and holds the structured data.
+        json_path = project.dir / "reports" / "understand" / "report.json"
+        md_path = project.dir / "reports" / "understand" / "report.md"
+        assert json_path.is_file(), "report.json should be written under the project"
+        assert md_path.is_file(), "report.md should be written under the project"
+        on_disk = json.loads(json_path.read_text(encoding="utf-8"))
+        assert on_disk["summary"]["total"] == 4
+        # The markdown is human-readable: headed sections + the finding text.
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "## What it does" in md_text
+        assert "greeting" in md_text
+
         # The findings are durable in the ledger — the generic substrate the
         # goalpack rendered from (no shared report_model involved).
-        assert len(project.reload().findings()) == 4
+        assert len(ledger.findings()) == 4
 
         # The loop received the goalpack's own system prompt, not the goal string.
         assert adapter.calls[0].system_prompt == gp.system_prompt
 
+        # Re-rendering the same ledger state yields a byte-identical report, so its
+        # artifact hashes are stable and re-recording it is a content-addressed
+        # no-op (add_artifact dedupes on the hash → returns False the second time).
+        from rekit.goalpacks import _persist_report
+
+        report_again = gp.renderer(project, gp, result.summary)
+        md_again = gp.render_markdown(report_again)
+        arts_again = _persist_report(project, gp, report_again, md_again, ledger.findings())
+        assert {a.content_hash for a in arts_again} == {
+            a.content_hash for a in result.report_artifacts
+        }, "same report → same content hash (no-op)"
+        # No new artifact events entered the ledger on the second persist.
+        assert project.add_artifact(arts_again[0]) is False, "report already in ledger"
+
 
 def test_run_user_goalpack_end_to_end():
     """A user-authored goalpack (own renderer, imported by path) runs on the loop
-    and returns its own shape."""
+    and its own shape is reachable via ``GoalpackResult.report``."""
     with temp_home() as (home, work):
         _drop_user_goalpack(home, "echo")
         target = _make_target(work)
@@ -182,10 +249,45 @@ def test_run_user_goalpack_end_to_end():
         gp = load_goalpack("echo")
 
         adapter = MockAdapter([MockTurn(text="FINDING: hello world\nDONE\n")])
-        report = run_goalpack(project, gp, adapter, max_rounds=4)
+        result = run_goalpack(project, gp, adapter, max_rounds=4)
 
+        report = result.report
         assert report["name"] == "echo"
         assert any("hello world" in note for note in report["findings"])
+        # echo declares a renderer but no markdown → JSON-only report artifact.
+        kinds = {a.kind for a in result.report_artifacts}
+        assert kinds == {"report/json"}, kinds
+
+
+def test_no_renderer_goalpack_produces_no_report():
+    """Reporting is optional: an *act*-goal goalpack with no renderer runs the loop
+    and returns ``report=None`` / ``report_artifacts=[]`` while still surfacing the
+    ledger findings — proving a report is not required."""
+    with temp_home() as (home, work):
+        _drop_no_renderer_goalpack(home, "act")
+        target = _make_target(work)
+        project = open_project(str(target))
+        gp = load_goalpack("act")
+        assert gp.renderer is None, "a goalpack with no renderer.py declares no report"
+        assert gp.render_markdown is None
+
+        adapter = MockAdapter(
+            [MockTurn(text="FINDING: [does] patched the config loader\nDONE\n")]
+        )
+        result = run_goalpack(project, gp, adapter, max_rounds=4)
+
+        assert isinstance(result, GoalpackResult)
+        assert result.report is None, "no renderer → no report"
+        assert result.report_artifacts == [], "no report artifacts recorded"
+        # But the ledger substrate (findings) is still surfaced.
+        assert any("patched the config loader" in f.get("note", "") for f in result.findings)
+        assert len(result.findings) == 1
+
+        # No report/* artifact leaked into the ledger.
+        report_kinds = [k for k in project.reload().kinds if str(k).startswith("report/")]
+        assert report_kinds == [], report_kinds
+        # And no reports/ directory was written for this goalpack.
+        assert not (project.dir / "reports" / "act").exists()
 
 
 if __name__ == "__main__":
@@ -194,4 +296,5 @@ if __name__ == "__main__":
     test_load_unknown_goalpack_raises()
     test_run_goalpack_drives_loop_and_renders_understand_shape()
     test_run_user_goalpack_end_to_end()
+    test_no_renderer_goalpack_produces_no_report()
     print("rekit goalpacks tests passed")

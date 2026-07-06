@@ -17,6 +17,12 @@ The brain tags each finding with its lens via the loop's `FINDING:` protocol, e.
 the loop has stripped the ``FINDING:`` prefix, so each finding's ``note`` reads
 ``[brittle] assumes config.json exists``. This renderer peels the ``[lens]`` tag and
 buckets the text under the matching section.
+
+understand *does* want a report. Alongside :func:`render_report` (the structured
+dict), this module provides :func:`render_markdown` — the optional companion the
+goalpack contract looks for — which folds that same dict into a readable Markdown
+document (sections → headed bullet lists). :func:`rekit.goalpacks.run_goalpack`
+persists both as ``report/json`` + ``report/markdown`` ledger artifacts.
 """
 
 from __future__ import annotations
@@ -87,3 +93,53 @@ def _summary(goalpack: Any, summary: Any, sections: dict[str, list]) -> dict[str
         out["done"] = getattr(summary, "done", None)
         out["rounds"] = getattr(summary, "round_count", None)
     return out
+
+
+#: Human-readable heading for each lens, in report order.
+_SECTION_TITLES: dict[str, str] = {
+    "does": "What it does",
+    "decides": "What it decides",
+    "brittle": "Where it is brittle",
+    "surprising": "What is surprising",
+}
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    """Render understand's structured report to a readable Markdown document.
+
+    The contract: the goalpack's :func:`render_report` returns the structured dict;
+    this companion takes that same dict and returns a string. Each of the four
+    lenses becomes a ``##`` section with its findings as a bullet list (paths, when
+    present, shown inline). A short header carries the title and per-lens counts.
+    """
+    header = report.get("summary") or {}
+    title = header.get("title") or header.get("goalpack") or "understand"
+
+    lines: list[str] = [f"# {title}", ""]
+
+    total = header.get("total")
+    counts = header.get("counts") or {}
+    if total is not None:
+        summary_bits = ", ".join(f"{lens}: {counts.get(lens, 0)}" for lens in LENSES)
+        lines.append(f"_{total} finding(s) — {summary_bits}._")
+        lines.append("")
+
+    for lens in LENSES:
+        lines.append(f"## {_SECTION_TITLES[lens]}")
+        entries = report.get(lens) or []
+        if not entries:
+            lines.append("")
+            lines.append("_None recorded._")
+            lines.append("")
+            continue
+        lines.append("")
+        for entry in entries:
+            text = str(entry.get("text", "")).strip()
+            path = entry.get("path")
+            bullet = f"- {text}" if text else "- (no text)"
+            if path:
+                bullet += f" (`{path}`)"
+            lines.append(bullet)
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
