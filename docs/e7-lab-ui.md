@@ -334,10 +334,14 @@ Each phase ships something usable; observe lands before control.
   `loop.run`), `human/inbox.py` (`LedgerHumanChannel` + supervisor
   `post_question`/`answer`/`pending_questions`), and `lab/readmodel.py`
   (`fleet` / `project_view` / `health` folding all three logs, with the
-  blocked/suspended join). ⏳ *remaining:* `rekit serve` — the HTTP + websocket
-  transport that tails `projects/*` and pushes the read-model to the browser, and
-  writes answers back. *Acc:* a running CLI job appears live on the board with
-  correct status/round/counters.
+  blocked/suspended join), and ✅ `rekit serve` — `lab/server.py`: a stdlib
+  `ThreadingHTTPServer` over the read-model (`GET /api/fleet`, `GET /api/project`,
+  `POST /api/answer` writeback), a self-contained live browser client that polls
+  the API and renders the fleet + a cross-project decision inbox, a `rekit serve`
+  CLI subcommand, and a best-effort desktop notifier. (Client **polls** every 1.5s;
+  an SSE/websocket push is an optional upgrade.) *Acc met:* a running CLI job
+  appears live on the board with correct status/round/counters; answering a
+  decision in the browser unblocks the run.
 - **E7.1 · Mission Control + Project Detail (Ledger).** The fleet grid and the
   ledger view (artifacts / findings / leads). *Acc:* browse any project's
   findings and artifacts without touching the loop.
@@ -365,10 +369,12 @@ Each phase ships something usable; observe lands before control.
   losing the pending question — hence file-backed, not in-memory. A *suspended*
   (missing-tool) run is the same mechanism: the loop blocks on an `inbox.jsonl`
   question until you install/skip.
-- **Skill index is a core prerequisite.** Forage-at-scale needs `registry.find_skills`
-  backed by a real index (capability / accepts-kind / description), plus a
-  `FIND_SKILL` loop action. That is rekit *core* (an E3/E4 follow-up), not E7 — but
-  E7.4's foraging surfaces it, so the index should land before E7.4.
+- **Skill discovery / `FIND_SKILL`.** ✅ *built* — `registry.find_skills` already
+  is an intent-ranked search, and the `FIND_SKILL: <intent>` loop action now wires
+  it in (`loop._handle_find_skill`): available matches widen scope, uninstalled
+  ones become install leads, forbidden ones are reported. A linear scored scan is
+  fine to thousands of skills; an inverted index (capability / accepts-kind /
+  description postings) is a later optimization only, not a correctness need.
 - **Non-daemon runs.** Observable but not controllable. Acceptable; documented in
   the card ("external run — observe only"). Revisit if it bites.
 - **Notification reach.** Desktop only for E7. Mobile/remote push is a natural
