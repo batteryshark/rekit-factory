@@ -171,6 +171,7 @@ def make_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *,
     """Build (but do not start) the threaded HTTP server, bound to a projects
     ``root`` (default: ``$REKIT_HOME/projects``). ``port=0`` picks a free port."""
     httpd = ThreadingHTTPServer((host, port), _Handler)
+    httpd.daemon_threads = True  # request threads never keep the process alive
     httpd.rekit_root = root  # type: ignore[attr-defined]
     return httpd
 
@@ -192,17 +193,25 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *,
     if notify:
         threading.Thread(target=_notifier_loop, args=(base, stop),
                          daemon=True).start()
+    # Run the server on a background thread so the main thread can own Ctrl-C.
+    # (shutdown() must be called from a *different* thread than serve_forever, or
+    # it deadlocks — hence this split, not serve_forever() in the main thread.)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
     url = f"http://{host}:{httpd.server_address[1]}"
     print(f"rekit lab — Mission Control at {url}")
     print(f"  reading {base}")
     print("  Ctrl-C to stop")
     try:
-        httpd.serve_forever()
+        while not stop.wait(0.5):
+            pass
     except KeyboardInterrupt:
         print("\nstopping…")
     finally:
         stop.set()
-        httpd.shutdown()
+        httpd.shutdown()      # safe: serve_forever runs in server_thread
+        httpd.server_close()
+        server_thread.join(timeout=2)
     return 0
 
 
