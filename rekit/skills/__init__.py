@@ -20,9 +20,9 @@ E3 fills the framework:
   ``tier``, host-gating.
 * :mod:`rekit.skills.registry` — filesystem discovery + the searchable registry
   (``find_skills`` / ``skills_for_kind`` / ``skills_by_capability``).
-
-The scoping *policy* (``kinds ∩ capabilities`` filtered by tier) lands in E4; this
-package exposes the primitives it composes and leaves ``tier`` on the model.
+* :mod:`rekit.skills.scoping` — the scoping *policy* (E4): ``scope_skills`` computes
+  ``(kinds ∩ capabilities)`` filtered by a per-goalpack :class:`Policy` over trust
+  tiers, so a read-only goalpack never sees a network/destructive skill.
 """
 
 from .home import ENV_VAR, bin_dir, rekit_home, skills_dir
@@ -35,6 +35,7 @@ from .model import (
     normalize_tier,
 )
 from .registry import Registry, ScoredSkill, discover_skills
+from .scoping import Policy, ScopedSkill, scope_scoped_skills, scope_skills
 
 __all__ = [
     # home
@@ -53,4 +54,9 @@ __all__ = [
     "Registry",
     "ScoredSkill",
     "discover_skills",
+    # scoping (E4)
+    "Policy",
+    "ScopedSkill",
+    "scope_skills",
+    "scope_scoped_skills",
 ]

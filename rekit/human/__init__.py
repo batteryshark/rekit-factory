@@ -11,5 +11,26 @@ proactively — direction forks (*"go deeper here or move on?"*) and genuine
 ambiguity (*"licence check or telemetry — which matters to you?"*). Trust-tier
 gates route through here too.
 
-Filled by epic E4. No logic here yet (E0 scaffold).
+Public surface (E4.3)
+---------------------
+- :class:`HumanChannel` — the ABC every impl satisfies (``ask`` /
+  ``present_choices`` / ``confirm``).
+- :class:`CLIHumanChannel` — the default interactive stdin/stdout impl.
+- :class:`ScriptedHumanChannel` — pre-programmed answers for hermetic tests.
+- :func:`gate_skill` — auto-allow per policy or route a gated-tier skill through
+  the channel; the seam the ralph loop and sandbox network-gate call.
 """
+
+from .channel import (
+    CLIHumanChannel,
+    HumanChannel,
+    ScriptedHumanChannel,
+    gate_skill,
+)
+
+__all__ = [
+    "HumanChannel",
+    "CLIHumanChannel",
+    "ScriptedHumanChannel",
+    "gate_skill",
+]
