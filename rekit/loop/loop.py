@@ -65,6 +65,8 @@ _LEAD_BODY_RE = re.compile(r"^(?P<cap>[\w./-]+)\s+for\s+(?P<kind>[\w./*-]+)", re
 _DERIVED_BODY_RE = re.compile(r"^(?P<transform>[\w./-]+)\s*(?:->|=>)\s*(?P<path>.+)$")
 # "RUN_SKILL: <skill-name> [on <path>]" — the brain asks the loop to execute a skill.
 _RUN_SKILL_RE = re.compile(r"^\s*run[_ ]?skill\s*[:\-]\s*(.+)$", re.IGNORECASE)
+# "FIND_SKILL: <intent>" — the brain searches the rack for a capability at runtime.
+_FIND_SKILL_RE = re.compile(r"^\s*find[_ ]?skill\s*[:\-]\s*(.+)$", re.IGNORECASE)
 # "<skill-name> [on <path>]" inside a RUN_SKILL line.
 _RUN_SKILL_BODY_RE = re.compile(
     r"^(?P<name>[\w./-]+)\s*(?:\s+on\s+(?P<path>.+))?$", re.IGNORECASE
@@ -286,6 +288,74 @@ def _render_skill_lines(scoped: list[ScopedSkill]) -> list[str]:
     return lines
 
 
+def _effective_caps(
+    registry: Any, goal: str,
+    requested_capabilities: list[str] | None, discovered_caps: set[str],
+) -> list[str] | None:
+    """The capabilities requested for scoping this round: the goal's request
+    (explicit, or inferred from wording) unioned with any capability the brain has
+    discovered via ``FIND_SKILL``. Returns None when nothing was requested *or*
+    discovered, so :func:`_scoped_tools` keeps its goal-word inference fallback.
+    """
+    if not discovered_caps:
+        return requested_capabilities
+    base = (requested_capabilities if requested_capabilities is not None
+            else _capabilities_from_goal(registry, goal))
+    return sorted(set(base) | set(discovered_caps))
+
+
+def _handle_find_skill(text: str, registry: Any, project: Project, policy: Policy):
+    """Process ``FIND_SKILL: <intent>`` lines — the runtime, lazy half of discovery.
+
+    With thousands of skills the brain is never shown the whole rack; it *searches*
+    it by intent (:meth:`~rekit.skills.registry.Registry.find_skills`, already an
+    intent-ranked lookup). For each match this decides an outcome and reports it
+    back so the next round can act:
+
+    * **available + in policy** → its capability is added to ``discovered_caps`` so
+      the kind-scoper exposes it next round (a real, runnable tool);
+    * **not installed** → an install ``lead`` is recorded (surfaces to the operator
+      / Inbox as a missing-tool decision);
+    * **forbidden by policy** → reported, never reachable.
+
+    Returns ``(feedback_text, discovered_caps, leads_recorded)``. No FIND_SKILL
+    lines (or no registry) → empty results.
+    """
+    if registry is None:
+        return "", set(), 0
+    intents = [m.group(1).strip()
+               for raw in (text or "").splitlines()
+               if (m := _FIND_SKILL_RE.match(raw.strip()))]
+    if not intents:
+        return "", set(), 0
+
+    lines: list[str] = ["Skill search (FIND_SKILL) results:"]
+    caps: set[str] = set()
+    leads = 0
+    for intent in intents:
+        matches = registry.find_skills(intent, limit=5)
+        if not matches:
+            lines.append(f'  - "{intent}": no match in the rack')
+            continue
+        lines.append(f'  - "{intent}":')
+        for s in matches:
+            tier = s.tier
+            if not policy.allows(tier):
+                status = "forbidden by your policy"
+            elif not s.available():
+                status = "not installed → install lead recorded"
+                kind = s.accepts[0] if s.accepts else "any"
+                project.record_lead(s.capability or intent, kind, requires=[s.name])
+                leads += 1
+            else:
+                gate = "gated (asks first)" if policy.is_gated(tier) else "auto-runs"
+                status = f"available, {gate} — now in scope"
+                if s.capability:
+                    caps.add(s.capability)
+            lines.append(f"      {s.name} — {s.capability or '?'} [{tier}] — {status}")
+    return "\n".join(lines), caps, leads
+
+
 def _pick_tier(project: Project, round_index: int, default_tier: str) -> str:
     """Choose the model tier for a round (a loop decision, not per-skill).
 
@@ -370,13 +440,19 @@ def run(
     # can react to what a RUN_SKILL actually produced.
     run_feedback: str = ""
 
+    # Capabilities the brain has pulled in at runtime via FIND_SKILL — unioned into
+    # the requested set each round so a discovered, available skill becomes runnable.
+    discovered_caps: set[str] = set()
+
     for i in range(max_rounds):
         # Scope the skill set from the *current* ledger kinds ∩ requested caps,
         # filtered by policy — recomputed each round because a prior run may have
-        # revealed new kinds (a fresh tree re-entering the ledger).
+        # revealed new kinds (a fresh tree re-entering the ledger) or the brain may
+        # have discovered a capability via FIND_SKILL.
         scoped = _scoped_tools(
             project, registry, goal, policy,
-            requested_capabilities=requested_capabilities,
+            requested_capabilities=_effective_caps(
+                registry, goal, requested_capabilities, discovered_caps),
         )
         tools = [sc.name for sc in scoped]
         context = build_context(project, goal, scoped=scoped, run_feedback=run_feedback)
@@ -398,7 +474,17 @@ def run(
             scoped=scoped, channel=channel, policy=policy,
         )
         summary.rounds.append(round_result)
-        run_feedback = _run_feedback(round_result)
+
+        # FIND_SKILL: let the brain search the full rack at runtime. Available
+        # matches widen the next round's scope; unavailable matches become install
+        # leads. Do this before the round-end heartbeat so the leads are counted.
+        find_feedback, new_caps, find_leads = _handle_find_skill(
+            result.text, registry, project, policy)
+        discovered_caps |= new_caps
+        round_result.leads += find_leads
+
+        run_feedback = "\n".join(
+            part for part in (_run_feedback(round_result), find_feedback) if part)
 
         if runlog is not None:
             runlog.round_ended(
@@ -438,13 +524,16 @@ def _round_ask(index: int, goal: str) -> str:
             "`FINDING: ...`, `LEAD: <capability> for <kind>`, "
             "`DERIVED: <transform> -> <path>`. To execute one of the available "
             "skills, emit `RUN_SKILL: <skill-name> [on <path>]` — the loop runs it "
-            "(gating + sandboxing) and reports the result next round. "
-            "Emit `DONE` when the goal is complete."
+            "(gating + sandboxing) and reports the result next round. To search the "
+            "rack for a capability you need but don't see listed, emit "
+            "`FIND_SKILL: <what you need>` — matches (and any install leads) come "
+            "back next round. Emit `DONE` when the goal is complete."
         )
     return (
         "Continue working the goal from the ledger context above. "
         "Report new FINDING/LEAD/DERIVED lines, emit `RUN_SKILL: <name> [on <path>]` "
-        "to run a skill, and emit DONE when complete."
+        "to run a skill, `FIND_SKILL: <intent>` to search the rack for more, and "
+        "emit DONE when complete."
     )
 
 
