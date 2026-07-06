@@ -6,5 +6,23 @@ The loop — not any individual skill — chooses the model tier per step (cheap
 the high-volume floor/triage, beefy for heavy judgment) and decides when to fan
 work out to scoped subagents. Default tempo is parallel, not waterfall.
 
-Filled by epic E2. No logic here yet (E0 scaffold).
+Public surface (E2 first slice)
+-------------------------------
+- :func:`run` — drive a goal to termination via a harness adapter over the ledger.
+- :class:`LoopSummary` / :class:`RoundResult` — the coverage-aware outcome.
+- :func:`build_context` — render the ledger snapshot into brain context.
 """
+
+from .loop import (
+    LoopSummary,
+    RoundResult,
+    build_context,
+    run,
+)
+
+__all__ = [
+    "run",
+    "LoopSummary",
+    "RoundResult",
+    "build_context",
+]
