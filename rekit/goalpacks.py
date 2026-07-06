@@ -39,9 +39,15 @@ working):
 * the *renderer* returns the structured report ``dict`` — unchanged;
 * the *markdown* function (if any) takes that same ``dict`` and returns a string.
 
-Discovery scans **builtin** ``rekit/goalpacks/*/GOALPACK.md`` (shipped with the
-package) and **user** ``$REKIT_HOME/goalpacks/*/GOALPACK.md``. A user goalpack of
-the same name shadows a builtin one.
+Discovery scans three roots, in this order: **builtin**
+``rekit/goalpacks/*/GOALPACK.md`` (shipped with the package — kept generic; rekit
+ships no domain goalpacks), then every dir on the **search path** ``$REKIT_GOALPATH``
+(``os.pathsep``-separated, like ``PATH``; each dir holds ``*/GOALPACK.md``), then
+**user** ``$REKIT_HOME/goalpacks/*/GOALPACK.md``. Later roots shadow earlier ones on
+a name collision, so a ``$REKIT_GOALPATH`` goalpack shadows a builtin, and a user
+goalpack shadows both — the search path sits between builtin and user. Point rekit
+at an external goalpack collection (e.g. ``/path/to/goalpacks``) by adding its dir
+to ``$REKIT_GOALPATH``; no install needed.
 
 A goalpack *runs* via :func:`run_goalpack`, which drives :func:`rekit.loop.run`
 with the goalpack's system prompt / goal / requested capabilities, then — **only if
@@ -55,6 +61,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -70,6 +77,10 @@ from .skills.scoping import Policy
 
 #: The frontmatter file that marks a folder as a goalpack.
 GOALPACK_FILE = "GOALPACK.md"
+
+#: Environment variable naming a search path of extra goalpack roots. Like ``PATH``,
+#: it is ``os.pathsep``-separated; each entry is a dir holding ``<name>/GOALPACK.md``.
+GOALPATH_ENV_VAR = "REKIT_GOALPATH"
 
 #: The brain's full system prompt lives in this sibling file.
 SYSTEM_PROMPT_FILE = "system-prompt.md"
@@ -127,16 +138,20 @@ class GoalpackResult:
 
 
 def discover_goalpacks(environ: dict | None = None) -> list[Goalpack]:
-    """Every goalpack: builtin ``rekit/goalpacks`` + user ``$REKIT_HOME/goalpacks``.
+    """Every goalpack: builtin ``rekit/goalpacks`` + ``$REKIT_GOALPATH`` + user
+    ``$REKIT_HOME/goalpacks``.
 
-    Scans ``<root>/*/GOALPACK.md`` under both roots. A missing root yields nothing;
-    a folder whose ``GOALPACK.md`` fails to parse (or whose declared renderer won't
-    import) is skipped rather than sinking discovery. A **user** goalpack shadows a
-    builtin one of the same name (user roots are scanned last and win the name).
+    Scans ``<root>/*/GOALPACK.md`` under each root, in shadowing order: builtin,
+    then every dir on ``$REKIT_GOALPATH`` (``os.pathsep``-separated), then user. A
+    missing root yields nothing; a folder whose ``GOALPACK.md`` fails to parse (or
+    whose declared renderer won't import) is skipped rather than sinking discovery. A
+    later root shadows an earlier one of the same name — so a ``$REKIT_GOALPATH``
+    goalpack shadows a builtin, and a **user** goalpack shadows both (user roots are
+    scanned last and win the name).
     """
     by_name: dict[str, Goalpack] = {}
-    # Builtin first, then user — so a user goalpack of the same name shadows it.
-    for root in (_builtin_root(), _user_root(environ)):
+    # Builtin, then the REKIT_GOALPATH search path, then user — later shadows earlier.
+    for root in (_builtin_root(), *_goalpath_roots(environ), _user_root(environ)):
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
@@ -276,6 +291,20 @@ def _builtin_root() -> Path:
 def _user_root(environ: dict | None = None) -> Path:
     """``$REKIT_HOME/goalpacks`` — user-authored goalpacks (zero install)."""
     return _home.rekit_home(environ) / "goalpacks"
+
+
+def _goalpath_roots(environ: dict | None = None) -> list[Path]:
+    """The dirs on ``$REKIT_GOALPATH`` — a ``PATH``-style, ``os.pathsep``-separated
+    search path of external goalpack collections.
+
+    Each entry is a dir holding ``<name>/GOALPACK.md``. Empty entries are dropped; the
+    order is preserved (earlier entries are shadowed by later ones, per the discovery
+    order). Points rekit at goalpack collections that don't ship with the package
+    (e.g. ``/path/to/goalpacks``) with zero install.
+    """
+    environ = environ if environ is not None else os.environ
+    raw = str(environ.get(GOALPATH_ENV_VAR) or "")
+    return [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
 
 
 def _load_from_dir(directory: Path) -> Goalpack:
