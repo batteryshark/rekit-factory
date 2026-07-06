@@ -1,0 +1,23 @@
+[project]
+name = "rekit"
+version = "0.1.0"
+description = "rekit: the harness-agnostic orchestration runtime for the Parallax reverse-engineering lab (ralph loop, persistent ledger, skill scoping, human channel). Depends on nothing."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mario Mercaldi" }]
+keywords = ["orchestration", "runtime", "ralph-loop", "ledger", "reverse-engineering", "agent-harness"]
+# Zero runtime dependencies on purpose: rekit is a clean kernel. Heavy deps
+# (harness SDKs, tree-sitter, decompilers) live inside the skills that need them,
+# never in the core. It does not depend on parallax.
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+rekit = "rekit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rekit*"]
