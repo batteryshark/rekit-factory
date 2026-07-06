@@ -39,29 +39,30 @@ working):
 * the *renderer* returns the structured report ``dict`` — unchanged;
 * the *markdown* function (if any) takes that same ``dict`` and returns a string.
 
-Discovery scans three roots, in this order: **builtin**
+Discovery scans two roots, in this order: **builtin**
 ``rekit/goalpacks/*/GOALPACK.md`` (shipped with the package — kept generic; rekit
-ships no domain goalpacks), then every dir on the **search path** ``$REKIT_GOALPATH``
-(``os.pathsep``-separated, like ``PATH``; each dir holds ``*/GOALPACK.md``), then
-**user** ``$REKIT_HOME/goalpacks/*/GOALPACK.md``. Later roots shadow earlier ones on
-a name collision, so a ``$REKIT_GOALPATH`` goalpack shadows a builtin, and a user
-goalpack shadows both — the search path sits between builtin and user. Point rekit
-at an external goalpack collection (e.g. ``/path/to/goalpacks``) by adding its dir
-to ``$REKIT_GOALPATH``; no install needed.
+ships no domain goalpacks), then **user** ``$REKIT_HOME/goalpacks/*/GOALPACK.md``. A
+**user** goalpack shadows a builtin of the same name (user is scanned last and
+wins). To run a goalpack that lives elsewhere, point rekit at its folder directly
+with :func:`load_goalpack_from_path` — no install, no environment search path.
 
-A goalpack *runs* via :func:`run_goalpack`, which drives :func:`rekit.loop.run`
-with the goalpack's system prompt / goal / requested capabilities, then — **only if
-a renderer is declared** — folds the ledger findings into the report, persists it as
-``report.json`` (+ ``report.md`` when a markdown function is present) under the
-project's report area, and records those files as ``report/json`` / ``report/markdown``
-ledger artifacts. Either way it returns a :class:`GoalpackResult`.
+A goalpack **bundles its own skills**: if ``<goalpack>/skills/`` exists, those
+skills come along for the run (passed to skill discovery as an extra root), so a
+shared goalpack is self-contained.
+
+A goalpack *runs* via :func:`run_goalpack`, a thin wrapper over the ad-hoc
+:func:`run_goal` entry point: it drives :func:`rekit.loop.run` with the goalpack's
+system prompt / goal / requested capabilities (and its bundled skills), then —
+**only if a renderer is declared** — folds the ledger findings into the report,
+persists it as ``report.json`` (+ ``report.md`` when a markdown function is present)
+under the project's report area, and records those files as ``report/json`` /
+``report/markdown`` ledger artifacts. Either way it returns a :class:`GoalpackResult`.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -73,14 +74,14 @@ from .ledger.artifacts import Artifact, from_path
 from .ledger.project import Project
 from .loop import loop as _loop
 from .skills import frontmatter, home as _home
+from .skills.registry import Registry, discover_skills
 from .skills.scoping import Policy
 
 #: The frontmatter file that marks a folder as a goalpack.
 GOALPACK_FILE = "GOALPACK.md"
 
-#: Environment variable naming a search path of extra goalpack roots. Like ``PATH``,
-#: it is ``os.pathsep``-separated; each entry is a dir holding ``<name>/GOALPACK.md``.
-GOALPATH_ENV_VAR = "REKIT_GOALPATH"
+#: A goalpack's bundled skills live in this subdir; present → they ride along on a run.
+SKILLS_SUBDIR = "skills"
 
 #: The brain's full system prompt lives in this sibling file.
 SYSTEM_PROMPT_FILE = "system-prompt.md"
@@ -138,20 +139,18 @@ class GoalpackResult:
 
 
 def discover_goalpacks(environ: dict | None = None) -> list[Goalpack]:
-    """Every goalpack: builtin ``rekit/goalpacks`` + ``$REKIT_GOALPATH`` + user
-    ``$REKIT_HOME/goalpacks``.
+    """Every goalpack: builtin ``rekit/goalpacks`` + user ``$REKIT_HOME/goalpacks``.
 
-    Scans ``<root>/*/GOALPACK.md`` under each root, in shadowing order: builtin,
-    then every dir on ``$REKIT_GOALPATH`` (``os.pathsep``-separated), then user. A
-    missing root yields nothing; a folder whose ``GOALPACK.md`` fails to parse (or
-    whose declared renderer won't import) is skipped rather than sinking discovery. A
-    later root shadows an earlier one of the same name — so a ``$REKIT_GOALPATH``
-    goalpack shadows a builtin, and a **user** goalpack shadows both (user roots are
-    scanned last and win the name).
+    Scans ``<root>/*/GOALPACK.md`` under each root, in shadowing order: builtin, then
+    user. A missing root yields nothing; a folder whose ``GOALPACK.md`` fails to parse
+    (or whose declared renderer won't import) is skipped rather than sinking
+    discovery. A **user** goalpack shadows a builtin of the same name (user is scanned
+    last and wins). To run a goalpack elsewhere on disk, use
+    :func:`load_goalpack_from_path`.
     """
     by_name: dict[str, Goalpack] = {}
-    # Builtin, then the REKIT_GOALPATH search path, then user — later shadows earlier.
-    for root in (_builtin_root(), *_goalpath_roots(environ), _user_root(environ)):
+    # Builtin, then user — later shadows earlier (a user goalpack shadows a builtin).
+    for root in (_builtin_root(), _user_root(environ)):
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
@@ -177,6 +176,59 @@ def load_goalpack(name: str, environ: dict | None = None) -> Goalpack:
     raise KeyError(f"no goalpack named {name!r}")
 
 
+def load_goalpack_from_path(path: str | Path) -> Goalpack:
+    """Load a goalpack from a direct folder ``path`` (a dir holding ``GOALPACK.md``).
+
+    This is the "point rekit at this goalpack" entry point — no discovery, no env
+    var, no install. Its bundled ``skills/`` (if present) ride along when the goalpack
+    runs. Raises :class:`FileNotFoundError` if the folder has no ``GOALPACK.md``.
+    """
+    directory = Path(path).expanduser()
+    if not (directory / GOALPACK_FILE).is_file():
+        raise FileNotFoundError(f"no {GOALPACK_FILE} in {directory}")
+    return _load_from_dir(directory)
+
+
+def run_goal(
+    project: Project,
+    goal: str,
+    adapter: HarnessAdapter,
+    *,
+    tools: list[str | Path] | None = None,
+    system_prompt: str | None = None,
+    requested_capabilities: list[str] | None = None,
+    channel: HumanChannel | None = None,
+    policy: Policy | None = None,
+    environ: dict | None = None,
+    tier: str = CHEAP,
+    max_rounds: int = 8,
+) -> Any:
+    """Run an **ad-hoc** goal on the ralph loop — the primary interface.
+
+    Point rekit at ``project`` (the target), hand it some ``tools`` (extra skill
+    dirs), and give it a ``goal`` string. Builds a :class:`Registry` from
+    :func:`~rekit.skills.registry.discover_skills` (builtin + ``$REKIT_HOME/skills``
+    + the passed ``tools`` dirs, which win on a name collision) and drives
+    :func:`rekit.loop.run`. No goalpack needed — a goalpack is optional packaging on
+    top of this (see :func:`run_goalpack`).
+
+    Returns the loop's :class:`~rekit.loop.LoopSummary`.
+    """
+    registry = Registry(discover_skills(environ=environ, extra_roots=tools))
+    return _loop.run(
+        project,
+        goal,
+        adapter,
+        system_prompt=system_prompt,
+        requested_capabilities=requested_capabilities,
+        channel=channel,
+        policy=policy,
+        registry=registry,
+        tier=tier,
+        max_rounds=max_rounds,
+    )
+
+
 def run_goalpack(
     project: Project,
     goalpack: Goalpack,
@@ -184,15 +236,16 @@ def run_goalpack(
     *,
     channel: HumanChannel | None = None,
     policy: Policy | None = None,
-    registry: Any = None,
+    environ: dict | None = None,
     tier: str = CHEAP,
     max_rounds: int = 8,
 ) -> GoalpackResult:
     """Run ``goalpack`` on the ralph loop; report only if the goalpack asks for one.
 
-    Always drives :func:`rekit.loop.run` with the goalpack's ``system_prompt`` /
-    ``goal`` / ``requested_capabilities`` (so the loop scopes exactly the
-    capabilities the goal asked for). Then:
+    A thin wrapper over :func:`run_goal`: drives the loop with the goalpack's
+    ``system_prompt`` / ``goal`` / ``requested_capabilities`` and its **bundled
+    skills** (``<goalpack.dir>/skills/`` if present, passed as ad-hoc ``tools``), so
+    the loop scopes exactly what the goal asked for. Then:
 
     * **renderer declared** → call it to fold the ledger's generic findings into the
       goalpack's own report shape, persist that as a content-addressed ``report/*``
@@ -202,15 +255,19 @@ def run_goalpack(
       report artifacts — just the ledger substrate (findings). This is the
       *act*-goal case: reporting is optional.
     """
-    summary = _loop.run(
+    bundled = goalpack.dir / SKILLS_SUBDIR
+    tools = [bundled] if bundled.is_dir() else None
+
+    summary = run_goal(
         project,
         goalpack.goal,
         adapter,
+        tools=tools,
         system_prompt=goalpack.system_prompt,
         requested_capabilities=list(goalpack.requested_capabilities),
         channel=channel,
         policy=policy,
-        registry=registry,
+        environ=environ,
         tier=tier,
         max_rounds=max_rounds,
     )
@@ -291,20 +348,6 @@ def _builtin_root() -> Path:
 def _user_root(environ: dict | None = None) -> Path:
     """``$REKIT_HOME/goalpacks`` — user-authored goalpacks (zero install)."""
     return _home.rekit_home(environ) / "goalpacks"
-
-
-def _goalpath_roots(environ: dict | None = None) -> list[Path]:
-    """The dirs on ``$REKIT_GOALPATH`` — a ``PATH``-style, ``os.pathsep``-separated
-    search path of external goalpack collections.
-
-    Each entry is a dir holding ``<name>/GOALPACK.md``. Empty entries are dropped; the
-    order is preserved (earlier entries are shadowed by later ones, per the discovery
-    order). Points rekit at goalpack collections that don't ship with the package
-    (e.g. ``/path/to/goalpacks``) with zero install.
-    """
-    environ = environ if environ is not None else os.environ
-    raw = str(environ.get(GOALPATH_ENV_VAR) or "")
-    return [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
 
 
 def _load_from_dir(directory: Path) -> Goalpack:

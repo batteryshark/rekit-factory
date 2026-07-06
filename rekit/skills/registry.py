@@ -1,19 +1,19 @@
 """Filesystem skill discovery + the searchable registry.
 
-Discovery scans three roots for ``<root>/*/SKILL.md`` — no pip, no entry points:
+Discovery scans two roots for ``<root>/*/SKILL.md`` — no pip, no entry points:
 
 * **builtin** skills shipped in the rekit repo at ``<repo-root>/skills`` (committed;
-  these ride along with the package),
-* every dir on the **search path** ``$REKIT_SKILLPATH`` (``os.pathsep``-separated,
-  like ``PATH``; each entry holds ``<name>/SKILL.md``) — external skill collections
-  that don't ship with the package (e.g. a sibling ``/path/to/skills`` dir), and
+  these ride along with the package), and
 * **user** skills at ``$REKIT_HOME/skills`` (zero install — dropping a folder makes
   a skill available, including one authored in another project).
 
-Later roots **shadow** earlier ones on a name collision: a ``$REKIT_SKILLPATH``
-skill shadows a builtin, and a user skill shadows both (the same builtin →
-search-path → user precedence goalpacks use for ``$REKIT_GOALPATH``). Missing
-roots and malformed skills are skipped, never fatal.
+A **user** skill **shadows** a builtin of the same name (user roots are scanned
+last and win). Missing roots and malformed skills are skipped, never fatal.
+
+Callers may also pass ``extra_roots`` — extra skill dirs scanned **last** (highest
+precedence, shadowing builtin and user) for that one call. This is the direct-path
+mechanism used for a goalpack's bundled ``skills/`` and ad-hoc ``--tools`` dirs;
+it is a parameter, not an environment search path.
 
 The :class:`Registry` is the searchable rack. It exposes the three primitives E4's
 scoping resolver composes, plus the intent search that mirrors ToolSearch:
@@ -31,7 +31,6 @@ to E4; this module only supplies the lookups and leaves tier on the model.
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,11 +40,6 @@ from .home import skills_dir
 from .model import Skill, load_skill
 
 SKILL_FILE = "SKILL.md"
-
-#: Environment variable naming a search path of extra skill roots. Like ``PATH``,
-#: it is ``os.pathsep``-separated; each entry is a dir holding ``<name>/SKILL.md``.
-#: Mirrors ``rekit.goalpacks.GOALPATH_ENV_VAR`` (``REKIT_GOALPATH``) for skills.
-SKILLPATH_ENV_VAR = "REKIT_SKILLPATH"
 
 
 def builtin_skills_dir() -> Path:
@@ -101,46 +95,39 @@ def _scan_root(base: Path, environ: dict | None, into: dict[str, Skill], *,
             into[skill.name] = skill
 
 
-def _skillpath_roots(environ: dict | None = None) -> list[Path]:
-    """The dirs on ``$REKIT_SKILLPATH`` — a ``PATH``-style, ``os.pathsep``-separated
-    search path of external skill collections.
-
-    Each entry is a dir holding ``<name>/SKILL.md``. Empty entries are dropped; the
-    order is preserved (earlier entries are shadowed by later ones, per the discovery
-    order). Points rekit at skill collections that don't ship with the package (e.g.
-    ``/path/to/skills``) with zero install. Mirrors ``rekit.goalpacks._goalpath_roots``.
-    """
-    environ = environ if environ is not None else os.environ
-    raw = str(environ.get(SKILLPATH_ENV_VAR) or "")
-    return [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
-
-
-def discover_skills(root: Path | None = None, environ: dict | None = None) -> list[Skill]:
-    """Every discoverable skill: **builtin** (``<repo-root>/skills``) +
-    ``$REKIT_SKILLPATH`` search path + **user** (``$REKIT_HOME/skills``).
+def discover_skills(
+    root: Path | None = None,
+    environ: dict | None = None,
+    *,
+    extra_roots: list[str | Path] | None = None,
+) -> list[Skill]:
+    """Every discoverable skill: **builtin** (``<repo-root>/skills``) + **user**
+    (``$REKIT_HOME/skills``), plus any ``extra_roots`` passed for this call.
 
     Scans ``<root>/*/SKILL.md`` under each root, in shadowing order: builtin, then
-    every dir on ``$REKIT_SKILLPATH`` (``os.pathsep``-separated), then user. A
-    missing root is silently empty; a folder whose ``SKILL.md`` fails to parse is
-    skipped (a bad skill must not sink the rack). A later root **shadows** an earlier
-    one of the same name — so a ``$REKIT_SKILLPATH`` skill shadows a builtin, and a
-    **user** skill shadows both (user roots are scanned last and win the name). The
-    same builtin → search-path → user precedence goalpacks use.
+    user, then each dir in ``extra_roots`` (in order). A missing root is silently
+    empty; a folder whose ``SKILL.md`` fails to parse is skipped (a bad skill must
+    not sink the rack). A later root **shadows** an earlier one of the same name — so
+    a **user** skill shadows a builtin, and an ``extra_roots`` skill shadows both.
 
-    Passing ``root`` explicitly scans *only* that directory (no builtin, no
-    search path, no user) — the escape hatch tests and subsets use to point
-    discovery at a fixture tree. Sorted by name.
+    ``extra_roots`` is the direct-path mechanism for extra skill dirs — a goalpack's
+    bundled ``skills/`` or ad-hoc ``--tools`` dirs — scanned last so they win. It is
+    a parameter, not an environment search path.
+
+    Passing ``root`` explicitly scans *only* that directory (no builtin, no user, no
+    ``extra_roots``) — the escape hatch tests and subsets use to point discovery at a
+    fixture tree. Sorted by name.
     """
     by_name: dict[str, Skill] = {}
     if root is not None:
         _scan_root(Path(root), environ, by_name, overwrite=True)
     else:
-        # Builtin, then the REKIT_SKILLPATH search path, then user — later shadows
-        # earlier (a search-path skill shadows a builtin; a user skill shadows both).
+        # Builtin, then user, then extra_roots — later shadows earlier (a user skill
+        # shadows a builtin; an extra_roots skill shadows both).
         _scan_root(builtin_skills_dir(), environ, by_name, overwrite=True)
-        for path_root in _skillpath_roots(environ):
-            _scan_root(path_root, environ, by_name, overwrite=True)
         _scan_root(skills_dir(environ), environ, by_name, overwrite=True)
+        for extra in extra_roots or []:
+            _scan_root(Path(extra), environ, by_name, overwrite=True)
     return [by_name[n] for n in sorted(by_name)]
 
 
@@ -164,8 +151,9 @@ class Registry:
         self._skills: list[Skill] = list(skills)
 
     @classmethod
-    def from_home(cls, root: Path | None = None, environ: dict | None = None) -> "Registry":
-        return cls(discover_skills(root=root, environ=environ))
+    def from_home(cls, root: Path | None = None, environ: dict | None = None, *,
+                  extra_roots: list[str | Path] | None = None) -> "Registry":
+        return cls(discover_skills(root=root, environ=environ, extra_roots=extra_roots))
 
     # ---- accessors ---------------------------------------------------------------
 

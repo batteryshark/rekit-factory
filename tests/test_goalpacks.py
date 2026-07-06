@@ -1,27 +1,33 @@
 """E6 — goalpacks: goals that run on the rekit loop, reporting **optional**.
 
-Proves the goalpack model end-to-end on the loop **against fixture goalpacks** — no
-domain goalpack ships with rekit, so this framework test builds its own goalpacks in
-temp dirs and puts them on the discovery search path:
+``REKIT_HOME`` is the only env var. Discovery scans builtin ``rekit/goalpacks`` +
+``$REKIT_HOME/goalpacks``; a goalpack elsewhere on disk is loaded by direct path via
+:func:`load_goalpack_from_path`. Proves the goalpack model end-to-end on the loop
+**against fixture goalpacks** — no domain goalpack ships with rekit, so this
+framework test builds its own goalpacks in temp dirs:
 
-- ``discover_goalpacks()`` finds a fixture goalpack dropped on ``$REKIT_GOALPATH`` and
-  a second one dropped into ``$REKIT_HOME/goalpacks/``;
-- a ``$REKIT_GOALPATH`` dir is scanned (the search-path root sits between builtin and
-  user);
-- ``load_goalpack(...)`` resolves the fixture's renderer callable;
+- ``discover_goalpacks()`` finds a fixture goalpack dropped into
+  ``$REKIT_HOME/goalpacks/``;
+- ``load_goalpack_from_path(dir)`` loads a goalpack from any folder holding a
+  ``GOALPACK.md`` (the "point rekit at this goalpack" entry point) and resolves its
+  renderer callable;
 - **report-as-artifact:** a scripted :class:`MockAdapter` emits ``FINDING: [does] ...``
   / ``[brittle] ...`` lines then ``DONE``; ``run_goalpack(...)`` drives the loop,
   folds the findings into the generic ledger, and — because the fixture declares a
   renderer — returns a :class:`GoalpackResult` whose ``.report`` carries the fixture's
   shape AND records the report as ``report/json`` + ``report/markdown`` ledger
   artifacts (content-addressed: re-running is a no-op);
+- **bundled skills:** a goalpack's own ``skills/`` folder is registered during
+  ``run_goalpack`` (passed to skill discovery as an extra root);
+- **ad-hoc run_goal:** the primary interface — a target + a tools dir + a goal
+  string, no goalpack — surfaces the tools dir's skill to the loop;
 - **reporting is optional:** a no-renderer fixture goalpack (the *act*-goal case)
   runs the loop and returns ``report=None`` / ``report_artifacts=[]`` while still
   surfacing findings.
 
 Plain-python style (runnable via ``python tests/test_goalpacks.py``) and
-pytest-compatible. Temp ``$REKIT_HOME`` + ``$REKIT_GOALPATH`` keep everything
-hermetic — no network, no dependency on any shipped goalpack.
+pytest-compatible. Temp ``$REKIT_HOME`` keeps everything hermetic — no network, no
+dependency on any shipped goalpack.
 """
 
 import contextlib
@@ -38,6 +44,8 @@ from rekit.goalpacks import (  # noqa: E402
     GoalpackResult,
     discover_goalpacks,
     load_goalpack,
+    load_goalpack_from_path,
+    run_goal,
     run_goalpack,
 )
 from rekit.harness import MockAdapter, MockTurn  # noqa: E402
@@ -46,22 +54,19 @@ from rekit.ledger import open_project  # noqa: E402
 
 @contextlib.contextmanager
 def temp_env():
-    """Temp ``REKIT_HOME`` + ``REKIT_GOALPATH`` (both restored afterwards), a temp
-    goalpath dir, and a temp workspace. Yields ``(home, goalpath, work)`` as
+    """Temp ``REKIT_HOME`` (restored afterwards), a temp goalpack collection dir (for
+    load-by-path), and a temp workspace. Yields ``(home, collection, work)`` as
     ``Path``s. Keeps discovery hermetic: nothing outside these temp roots is seen."""
     saved_home = os.environ.get("REKIT_HOME")
-    saved_goalpath = os.environ.get("REKIT_GOALPATH")
-    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as goalpath, tempfile.TemporaryDirectory() as work:
+    with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as collection, tempfile.TemporaryDirectory() as work:
         os.environ["REKIT_HOME"] = home
-        os.environ["REKIT_GOALPATH"] = goalpath
         try:
-            yield Path(home), Path(goalpath), Path(work)
+            yield Path(home), Path(collection), Path(work)
         finally:
-            for key, saved in (("REKIT_HOME", saved_home), ("REKIT_GOALPATH", saved_goalpath)):
-                if saved is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = saved
+            if saved_home is None:
+                os.environ.pop("REKIT_HOME", None)
+            else:
+                os.environ["REKIT_HOME"] = saved_home
 
 
 def _make_target(work: Path) -> Path:
@@ -122,7 +127,8 @@ def render_markdown(report):
 def _drop_fixture_goalpack(root: Path, name: str = "fixture") -> Path:
     """Author a fixture goalpack (own renderer + markdown) under ``root/<name>``.
 
-    ``root`` is any goalpack root — a ``$REKIT_GOALPATH`` dir or ``$REKIT_HOME/goalpacks``.
+    ``root`` is any goalpack root — a collection dir (for load-by-path) or
+    ``$REKIT_HOME/goalpacks``.
     """
     gp = root / name
     gp.mkdir(parents=True)
@@ -163,47 +169,73 @@ def _drop_no_renderer_goalpack(root: Path, name: str = "act") -> Path:
     return gp
 
 
-def test_discover_finds_goalpath_and_user_goalpacks():
-    """Discovery surfaces a fixture on ``$REKIT_GOALPATH`` and one in
-    ``$REKIT_HOME/goalpacks`` — and rekit ships no domain goalpacks of its own."""
-    with temp_env() as (home, goalpath, _work):
-        _drop_fixture_goalpack(goalpath, "on-goalpath")
+def _drop_fixture_skill(root: Path, name: str, *, capability: str = "code-reading",
+                        tier: str = "read-only") -> Path:
+    """Write a minimal valid ``<root>/<name>/SKILL.md`` (+ runnable scripts/) fixture.
+
+    ``accepts: ['*']`` so it is in scope for the seeded ``tree`` root; a runnable
+    ``scripts/run.sh`` so it resolves as *available* (in-scope, not shadowed as
+    unavailable) — the discriminator these registration tests rely on."""
+    skill_dir = root / name
+    (skill_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\n"
+        f"name: {name}\n"
+        f"capability: {capability}\n"
+        f"tier: {tier}\n"
+        f"accepts: ['*']\n"
+        f"emits: [analysis/observations]\n"
+        f"run: scripts/run.sh\n"
+        f"description: A fixture skill named {name}, keyword {capability}.\n"
+        f"---\n# {name}\n",
+        encoding="utf-8",
+    )
+    run_sh = skill_dir / "scripts" / "run.sh"
+    run_sh.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+    run_sh.chmod(0o755)
+    return skill_dir
+
+
+def test_discover_finds_user_goalpack():
+    """Discovery surfaces a fixture in ``$REKIT_HOME/goalpacks`` — and rekit ships no
+    domain goalpacks of its own."""
+    with temp_env() as (home, _collection, _work):
         _drop_fixture_goalpack(home / "goalpacks", "on-home")
         names = {gp.name for gp in discover_goalpacks()}
-        assert "on-goalpath" in names, f"REKIT_GOALPATH goalpack missing: {names}"
         assert "on-home" in names, f"user goalpack missing: {names}"
-        # rekit ships zero domain goalpacks; only the fixtures we dropped are seen.
-        assert names == {"on-goalpath", "on-home"}, names
+        # rekit ships zero domain goalpacks; only the fixture we dropped is seen.
+        assert names == {"on-home"}, names
 
 
-def test_goalpath_dir_is_discovered():
-    """A dir on ``$REKIT_GOALPATH`` is scanned for ``*/GOALPACK.md`` — the search-path
-    root (between builtin and user) is what makes an external collection discoverable."""
-    with temp_env() as (_home, goalpath, _work):
-        _drop_fixture_goalpack(goalpath, "external")
-        gp = load_goalpack("external")
+def test_load_goalpack_from_path_loads_by_dir():
+    """``load_goalpack_from_path(dir)`` loads a goalpack from a direct folder path —
+    the "point rekit at this goalpack" entry point, no env var, no install."""
+    with temp_env() as (_home, collection, _work):
+        gp_dir = _drop_fixture_goalpack(collection, "external")
+        gp = load_goalpack_from_path(gp_dir)
         assert gp.name == "external"
-        assert gp.dir.parent == goalpath, "should resolve from the REKIT_GOALPATH dir"
+        assert gp.dir == gp_dir
+        assert callable(gp.renderer), "renderer should resolve to a callable"
 
 
-def test_goalpath_multiple_dirs_are_all_scanned():
-    """``$REKIT_GOALPATH`` is ``os.pathsep``-separated (like ``PATH``): every dir on
-    it is scanned."""
-    with temp_env() as (_home, goalpath, work):
-        second = work / "extra-goalpacks"
-        second.mkdir()
-        _drop_fixture_goalpack(goalpath, "first")
-        _drop_fixture_goalpack(second, "second")
-        os.environ["REKIT_GOALPATH"] = os.pathsep.join([str(goalpath), str(second)])
-        names = {gp.name for gp in discover_goalpacks()}
-        assert {"first", "second"} <= names, names
+def test_load_goalpack_from_path_missing_manifest_raises():
+    """A folder with no ``GOALPACK.md`` raises ``FileNotFoundError``."""
+    with temp_env() as (_home, collection, _work):
+        empty = collection / "empty"
+        empty.mkdir()
+        try:
+            load_goalpack_from_path(empty)
+        except FileNotFoundError:
+            pass
+        else:  # pragma: no cover - failure path
+            raise AssertionError("expected FileNotFoundError for a folder with no GOALPACK.md")
 
 
 def test_load_fixture_resolves_renderer_callable():
-    """``load_goalpack(...)`` resolves the renderer to a real callable and carries the
-    declared goal + requested capabilities."""
-    with temp_env() as (_home, goalpath, _work):
-        _drop_fixture_goalpack(goalpath, "fixture")
+    """``load_goalpack(...)`` (name lookup) resolves the renderer to a real callable
+    and carries the declared goal + requested capabilities."""
+    with temp_env() as (home, _collection, _work):
+        _drop_fixture_goalpack(home / "goalpacks", "fixture")
         gp = load_goalpack("fixture")
         assert gp.name == "fixture"
         assert callable(gp.renderer), "renderer should resolve to a callable"
@@ -227,11 +259,11 @@ def test_run_goalpack_drives_loop_and_records_report_artifact():
     DONE; ``run_goalpack`` folds them into the ledger, returns a ``GoalpackResult``
     whose ``.report`` carries the fixture's four-section shape, AND records the report
     as ``report/json`` + ``report/markdown`` ledger artifacts on disk."""
-    with temp_env() as (_home, goalpath, work):
-        _drop_fixture_goalpack(goalpath, "fixture")
+    with temp_env() as (_home, collection, work):
+        gp_dir = _drop_fixture_goalpack(collection, "fixture")
         target = _make_target(work)
         project = open_project(str(target))
-        gp = load_goalpack("fixture")
+        gp = load_goalpack_from_path(gp_dir)
         assert gp.renderer is not None, "the fixture DOES declare a report renderer"
 
         script = [
@@ -316,15 +348,80 @@ def test_run_goalpack_drives_loop_and_records_report_artifact():
         assert project.add_artifact(arts_again[0]) is False, "report already in ledger"
 
 
+def test_run_goalpack_registers_bundled_skills():
+    """A goalpack's bundled ``skills/`` folder is registered during ``run_goalpack``:
+    the loop surfaces the bundled skill in its scoped tool set (via ``RUN_SKILL``
+    feedback), proving it was passed to skill discovery as an extra root."""
+    with temp_env() as (_home, collection, work):
+        gp_dir = _drop_fixture_goalpack(collection, "bundled")
+        # Bundle a skill inside the goalpack. Its capability matches the goalpack's
+        # requestedCapabilities (code-reading) so scoping surfaces it.
+        _drop_fixture_skill(gp_dir / "skills", "bundled-tool", capability="code-reading")
+        target = _make_target(work)
+        project = open_project(str(target))
+        gp = load_goalpack_from_path(gp_dir)
+
+        # The brain asks the loop to run the bundled skill by name. If the skill were
+        # NOT registered, the loop reports "not in the scoped skill set". If it IS
+        # registered and in scope, the loop attempts to run it (its host tool won't
+        # resolve, but that is a different, non-"skipped-out-of-scope" outcome).
+        adapter = MockAdapter(
+            [MockTurn(text="RUN_SKILL: bundled-tool\nFINDING: [does] tried the bundled tool\nDONE\n")]
+        )
+        result = run_goalpack(project, gp, adapter, max_rounds=2)
+
+        runs = result.summary.skill_runs
+        assert runs, "the bundled skill run should have been dispatched"
+        run = runs[0]
+        assert run.skill == "bundled-tool"
+        # The key assertion: it was NOT rejected as out-of-scope (which is what an
+        # unregistered skill would produce). It was in the scoped set.
+        assert not (run.status == "skipped" and "not in the scoped" in (run.detail or "")), (
+            f"bundled skill was not registered/in-scope: {run.status} / {run.detail}"
+        )
+
+
+def test_run_goal_adhoc_registers_tools_dir_skill():
+    """The ad-hoc primary interface: ``run_goal(project, goal, adapter, tools=[dir])``
+    — a target + a tools dir + a goal string, no goalpack — surfaces the tools dir's
+    skill to the loop's scoped set."""
+    with temp_env() as (_home, _collection, work):
+        tools_dir = work / "tools"
+        tools_dir.mkdir()
+        _drop_fixture_skill(tools_dir, "adhoc-tool", capability="code-reading")
+        target = _make_target(work)
+        project = open_project(str(target))
+
+        adapter = MockAdapter(
+            [MockTurn(text="RUN_SKILL: adhoc-tool\nFINDING: tried the ad-hoc tool\nDONE\n")]
+        )
+        summary = run_goal(
+            project,
+            "Read the code using code-reading tools.",
+            adapter,
+            tools=[tools_dir],
+            requested_capabilities=["code-reading"],
+            max_rounds=2,
+        )
+
+        runs = summary.skill_runs
+        assert runs, "the ad-hoc tools-dir skill run should have been dispatched"
+        run = runs[0]
+        assert run.skill == "adhoc-tool"
+        assert not (run.status == "skipped" and "not in the scoped" in (run.detail or "")), (
+            f"ad-hoc tools skill was not registered/in-scope: {run.status} / {run.detail}"
+        )
+
+
 def test_no_renderer_goalpack_produces_no_report():
     """Reporting is optional: an *act*-goal goalpack with no renderer runs the loop
     and returns ``report=None`` / ``report_artifacts=[]`` while still surfacing the
     ledger findings — proving a report is not required."""
-    with temp_env() as (_home, goalpath, work):
-        _drop_no_renderer_goalpack(goalpath, "act")
+    with temp_env() as (_home, collection, work):
+        gp_dir = _drop_no_renderer_goalpack(collection, "act")
         target = _make_target(work)
         project = open_project(str(target))
-        gp = load_goalpack("act")
+        gp = load_goalpack_from_path(gp_dir)
         assert gp.renderer is None, "a goalpack with no renderer.py declares no report"
         assert gp.render_markdown is None
 
@@ -347,12 +444,27 @@ def test_no_renderer_goalpack_produces_no_report():
         assert not (project.dir / "reports" / "act").exists()
 
 
+ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+
+
+def main():
+    failures = []
+    for test in ALL_TESTS:
+        try:
+            test()
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            failures.append((test.__name__, exc))
+            print(f"FAIL {test.__name__}: {exc}")
+            traceback.print_exc()
+        else:
+            print(f"ok   {test.__name__}")
+    if failures:
+        print(f"\n{len(failures)} failed, {len(ALL_TESTS) - len(failures)} passed")
+        return 1
+    print(f"\nall {len(ALL_TESTS)} goalpack tests passed")
+    return 0
+
+
 if __name__ == "__main__":
-    test_discover_finds_goalpath_and_user_goalpacks()
-    test_goalpath_dir_is_discovered()
-    test_goalpath_multiple_dirs_are_all_scanned()
-    test_load_fixture_resolves_renderer_callable()
-    test_load_unknown_goalpack_raises()
-    test_run_goalpack_drives_loop_and_records_report_artifact()
-    test_no_renderer_goalpack_produces_no_report()
-    print("rekit goalpacks tests passed")
+    raise SystemExit(main())
