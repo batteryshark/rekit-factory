@@ -24,7 +24,7 @@ def main(argv=None):
     serve_p = sub.add_parser(
         "serve", help="start Mission Control — the local lab UI over $REKIT_HOME")
     serve_p.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
-    serve_p.add_argument("--port", type=int, default=4747, help="bind port (default 4747)")
+    serve_p.add_argument("--port", type=int, default=7358, help="bind port (default 7358)")
     serve_p.add_argument("--no-notify", action="store_true",
                          help="disable desktop notifications on new decisions")
 

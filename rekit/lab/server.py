@@ -36,8 +36,9 @@ from ..human import inbox as _inbox
 from ..ledger.home import projects_root
 from .readmodel import fleet, health, project_view
 
-#: Default port — a familiar local dashboard port; override with --port.
-DEFAULT_PORT = 4747
+#: Default port — 7358 is "REKT" on a phone keypad, and chosen to avoid clashing
+#: with common local dashboards (e.g. opencode-ensemble on 4747). Override with --port.
+DEFAULT_PORT = 7358
 DEFAULT_HOST = "127.0.0.1"
 
 
@@ -177,7 +178,15 @@ def make_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *,
 def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *,
           notify: bool = True) -> int:
     """Run Mission Control until interrupted. Returns a process exit code."""
-    httpd = make_server(host, port)
+    try:
+        httpd = make_server(host, port)
+    except OSError as exc:
+        # Almost always "address already in use" — a clear message beats a traceback.
+        print(f"rekit: could not start on {host}:{port} — {exc}")
+        print(f"  something else is already using port {port}.")
+        print(f"  → pick another port:   rekit serve --port {port + 1}")
+        print(f"  → or see what's there:  lsof -nP -i :{port}")
+        return 1
     base = _projects_base(None)
     stop = threading.Event()
     if notify:
