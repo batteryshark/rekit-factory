@@ -277,14 +277,18 @@ CLIENT_HTML = r"""<!doctype html>
 <title>rekit · Mission Control</title>
 <style>
 :root{--bg:#080d17;--panel:#0e1626;--panel2:#121d31;--line:#1d2a44;--line2:#2a3b5c;
---ink:#d8e2f2;--ink2:#9fb0cc;--ink3:#647694;--green:#46e08a;--teal:#35d6c3;--violet:#a78bfa;
---amber:#f5b13d;--red:#f25563;--blue:#5aa8f2;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+--ink:#d8e2f2;--ink2:#9fb0cc;--ink3:#647694;--ink4:#43536f;--green:#46e08a;--teal:#35d6c3;--violet:#a78bfa;
+--amber:#f5b13d;--red:#f25563;--blue:#5aa8f2;--card2:#0a1120;--grid:#0e1628;--raise:#17233b;--headerbg:rgba(10,17,32,.85);
+--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
 --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+:root[data-theme="light"]{--bg:#eef2f8;--panel:#ffffff;--panel2:#f3f6fb;--line:#dde4ef;--line2:#c6d0e0;
+--ink:#16233b;--ink2:#42506b;--ink3:#6a7890;--ink4:#9aa6bd;--green:#1f9d63;--teal:#0e9b8c;--violet:#6d4fc7;
+--amber:#c67d16;--red:#d5384a;--blue:#2b74cf;--card2:#f6f9fd;--grid:#e6ebf4;--raise:#e7edf6;--headerbg:rgba(255,255,255,.9)}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
-background-image:linear-gradient(#0e1628 1px,transparent 1px),linear-gradient(90deg,#0e1628 1px,transparent 1px);
+background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
 background-size:44px 44px}
 header{display:flex;align-items:center;gap:16px;padding:14px 24px;border-bottom:1px solid var(--line);
-background:rgba(10,17,32,.85);backdrop-filter:blur(6px);position:sticky;top:0;z-index:5}
+background:var(--headerbg);backdrop-filter:blur(6px);position:sticky;top:0;z-index:5}
 .wm{font-family:var(--mono);font-weight:700;font-size:16px}.wm .k{color:var(--green)}
 .sp{flex:1}.legend{display:flex;gap:14px;font-family:var(--mono);font-size:12px;color:var(--ink2)}
 .legend i{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
@@ -294,12 +298,12 @@ background:rgba(10,17,32,.85);backdrop-filter:blur(6px);position:sticky;top:0;z-
 main{padding:22px 24px 60px;max-width:1400px}
 h2{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--ink3);margin:26px 0 12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:15px}
-.card{position:relative;background:linear-gradient(180deg,var(--panel),#0a1120);border:1px solid var(--line);
+.card{position:relative;background:linear-gradient(180deg,var(--panel),var(--card2));border:1px solid var(--line);
 border-radius:10px;padding:15px 16px;overflow:hidden}
 .stripe{position:absolute;left:0;top:0;bottom:0;width:3px}
 .s-running .stripe{background:var(--green)}.s-blocked .stripe{background:var(--amber)}
 .s-suspended .stripe{background:var(--violet)}.s-done .stripe{background:var(--blue)}
-.s-idle .stripe{background:#43536f}.s-failed .stripe{background:var(--red)}
+.s-idle .stripe{background:var(--ink4)}.s-failed .stripe{background:var(--red)}
 .ct{display:flex;align-items:flex-start;gap:10px;margin-bottom:10px}
 .nm{font-family:var(--mono);font-weight:600;font-size:14px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pill{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.09em;padding:3px 9px;border-radius:99px;white-space:nowrap}
@@ -336,8 +340,8 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .kv b{color:var(--ink)}.kv .teal{color:var(--teal)}
 .tabs{display:flex;gap:3px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:4px;margin-bottom:16px;width:fit-content}
 .tab{font-family:var(--mono);font-size:12px;color:var(--ink3);padding:7px 14px;border-radius:6px;background:none;display:flex;gap:6px;align-items:center}
-.tab.on{background:#17233b;color:var(--green)}.tab .n{background:var(--bg);border-radius:99px;padding:0 6px;font-size:10px;color:var(--ink3)}
-.panel{background:linear-gradient(180deg,var(--panel),#0a1120);border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:14px}
+.tab.on{background:var(--raise);color:var(--green)}.tab .n{background:var(--bg);border-radius:99px;padding:0 6px;font-size:10px;color:var(--ink3)}
+.panel{background:linear-gradient(180deg,var(--panel),var(--card2));border:1px solid var(--line);border-radius:10px;padding:15px;margin-bottom:14px}
 .panel h3{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.13em;color:var(--ink3);margin:0 0 12px}
 .find{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}.find:last-child{border-bottom:0}
 .find .sev{width:5px;border-radius:3px;background:var(--violet);flex-shrink:0}
@@ -347,18 +351,20 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .art{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12px;padding:4px 0;color:var(--ink2)}.art .k{color:var(--ink3);font-size:10px;margin-left:auto;text-transform:uppercase}
 .stream{background:var(--bg);border:1px solid var(--line);border-radius:10px;font-family:var(--mono);font-size:12px;max-height:540px;overflow:auto;padding:6px 0}
 .ev{display:flex;gap:11px;padding:4px 13px;border-left:2px solid transparent}.ev:hover{background:var(--panel)}
-.ev .ts{color:#43536f;flex-shrink:0}.ev .ty{flex-shrink:0;width:104px;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ev .m{color:var(--ink2);min-width:0}
+.ev .ts{color:var(--ink4);flex-shrink:0}.ev .ty{flex-shrink:0;width:104px;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ev .m{color:var(--ink2);min-width:0}
 .ev.run{border-left-color:var(--green)}.ev.run .ty{color:var(--green)}.ev.ledger .ty{color:var(--teal)}
 .empty2{color:var(--ink3);font-size:12.5px;padding:8px 0}
 .nav{font-family:var(--mono);font-size:12px;color:var(--ink3);background:none;border:0;padding:6px 11px;border-radius:6px;cursor:pointer}
-.nav:hover{color:var(--ink)}.nav.on{color:var(--green);background:#17233b}
+.nav:hover{color:var(--ink)}.nav.on{color:var(--green);background:var(--raise)}
 .newrun-btn{font-family:var(--sans);font-weight:600;font-size:13px;background:linear-gradient(180deg,#4fe895,#31c274);color:#04160c;border:0;border-radius:8px;padding:8px 14px;cursor:pointer}
 .newrun-btn:hover{filter:brightness(1.06)}
 .stop-btn{font-family:var(--mono);font-size:11px;color:#f5868f;background:rgba(242,85,99,.08);border:1px solid rgba(242,85,99,.35);border-radius:6px;padding:4px 9px;cursor:pointer}
 .stop-btn:hover{background:rgba(242,85,99,.16)}
+.rerun-btn{font-family:var(--mono);font-size:11px;color:var(--green);background:rgba(70,224,138,.08);border:1px solid #2ea86a;border-radius:6px;padding:4px 9px;cursor:pointer}
+.rerun-btn:hover{background:rgba(70,224,138,.16)}
 .form{max-width:720px;display:flex;flex-direction:column;gap:18px;margin-top:6px}
 .field label{display:block;font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink3);margin-bottom:8px}
-.field .hint{text-transform:none;letter-spacing:0;color:#43536f;font-size:11px;margin-left:8px}
+.field .hint{text-transform:none;letter-spacing:0;color:var(--ink4);font-size:11px;margin-left:8px}
 .field input,.field textarea{width:100%;background:var(--bg);border:1px solid var(--line2);border-radius:8px;color:var(--ink);font-family:var(--sans);font-size:14px;padding:11px 13px;outline:0}
 .field textarea{min-height:70px;resize:vertical;line-height:1.5}
 .field input:focus,.field textarea:focus{border-color:var(--green)}
@@ -366,7 +372,7 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .row{display:flex;gap:12px;flex-wrap:wrap}.row>.field{flex:1;min-width:150px}
 .seg{display:flex;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:3px;width:fit-content;flex-wrap:wrap}
 .seg button{font-family:var(--mono);font-size:12px;color:var(--ink3);background:none;border:0;padding:7px 13px;border-radius:6px;cursor:pointer}
-.seg button.on{background:#17233b;color:var(--green)}
+.seg button.on{background:var(--raise);color:var(--green)}
 .expl{font-size:12px;color:var(--ink3);margin:6px 0 0;line-height:1.5}
 .capgrp{border:1px solid var(--line);border-radius:9px;background:var(--bg);margin-bottom:8px;overflow:hidden}
 .capgrp .h{display:flex;align-items:center;gap:9px;padding:10px 12px;cursor:pointer}.capgrp .h:hover{background:var(--panel2)}
@@ -394,6 +400,7 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
   <div class="sp"></div>
   <div class="legend" id="legend"></div>
   <button class="newrun-btn" onclick="showNewRun()">+ New Run</button>
+  <button class="nav" onclick="toggleTheme()" title="Toggle light / dark" style="font-size:15px">◐</button>
   <div class="live"><i></i><span id="tick">live</span></div>
 </header>
 <main>
@@ -408,6 +415,13 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 </main>
 <script>
 const $=id=>document.getElementById(id);
+try{if(localStorage.getItem('rekit-theme')==='light')document.documentElement.setAttribute('data-theme','light');}catch(e){}
+function toggleTheme(){
+  const light=document.documentElement.getAttribute('data-theme')==='light';
+  if(light)document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme','light');
+  try{localStorage.setItem('rekit-theme',light?'':'light');}catch(e){}
+}
 const PILL={running:'p-running',blocked:'p-blocked',suspended:'p-suspended',done:'p-done',idle:'p-idle',failed:'p-failed'};
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 async function answer(pid,qid,val){
@@ -441,7 +455,7 @@ function renderDecisions(fleet){
 function card(v){
   const r=v.run||{},c=r.counters||{},cost=r.cost||{};
   return `<div class="card clk s-${v.status}" onclick="openProject('${v.id}')"><span class="stripe"></span>
-    <div class="ct"><div class="nm">${esc(v.id)}</div>${v.status==='running'?`<button class="stop-btn" onclick="event.stopPropagation();stopRun('${v.id}')">stop</button>`:''}<span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span></div>
+    <div class="ct"><div class="nm">${esc(v.id)}</div>${termBtns(v)}<span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span></div>
     <div class="goal">${esc(r.goal||'—')}</div>
     <div class="meta"><span class="tag"><span class="k">R</span> ${r.round||0}/${r.maxRounds||0}</span>
       <span class="tag">${esc(r.tier||'—')}</span>
@@ -477,6 +491,18 @@ function showNewRun(){view='newrun';hideAll();$('newrun-view').style.display='';
 function setTab(t){currentTab=t;if(lastDetail)renderDetail(lastDetail);}
 function setActFilter(f){actFilter=f;if(lastDetail)renderDetail(lastDetail);}
 async function stopRun(id){try{await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({projectId:id})});}catch(e){}refresh();}
+async function reRun(id){try{
+    const v=await (await fetch('/api/project?id='+encodeURIComponent(id))).json();
+    if(v.error)return; const r=v.run||{};
+    await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({target:v.target,goal:r.goal||'',harness:r.harness||'mock',tier:r.tier||'cheap',maxRounds:r.maxRounds||8})});
+  }catch(e){}refresh();}
+function termBtns(v){
+  const s=v.status;
+  if(s==='running') return `<button class="stop-btn" onclick="event.stopPropagation();stopRun('${v.id}')">stop</button>`;
+  if(s==='done'||s==='idle'||s==='failed') return `<button class="rerun-btn" onclick="event.stopPropagation();reRun('${v.id}')">re-run</button>`;
+  return '';
+}
 async function pollFleet(){try{const r=await fetch('/api/fleet');render(await r.json());tick();}catch(e){fail();}}
 async function pollDetail(){if(!currentId)return;try{
     const r=await fetch('/api/project?id='+encodeURIComponent(currentId));const v=await r.json();
@@ -511,7 +537,7 @@ function renderDetail(v){
   }
   $('detail-view').innerHTML=`
     <div class="detail-head"><button class="back" onclick="showFleet()">← Fleet</button>
-      <span class="dtitle">${esc(v.id)}</span><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span>${v.status==='running'?`<button class="stop-btn" onclick="stopRun('${v.id}')">stop</button>`:''}</div>
+      <span class="dtitle">${esc(v.id)}</span><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span>${termBtns(v)}</div>
     <div class="dgoal">${esc(r.goal||'—')}</div>
     <div class="kv"><span>R <b>${r.round||0}/${r.maxRounds||0}</b></span><span>tier <b>${esc(r.tier||'—')}</b></span>
       <span>${esc(r.harness||'—')} <b class="teal">${esc(r.model||'')}</b></span><span>spend <b>$${(cost.usd||0).toFixed(2)}</b></span></div>
