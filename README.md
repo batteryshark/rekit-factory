@@ -2,14 +2,20 @@
   <img src="rekit-logo.png" alt="rekit — Reverse Engineering System" width="380">
 </div>
 
-# rekit — Reverse Engineering System
+# rekit-factory — RE orchestration runtime (the "dark factory")
+
+> **Renamed from `rekit`.** The **`rekit`** name now belongs to the RE **skill/tool
+> kit** (`runner-lab/rekit`) — the curated set of skills/tools agents use. This repo is
+> the separate **orchestration runtime** that *drives* that kit: point it at a target,
+> pick a goal, and agents work it — a lights-out "dark factory" for RE.
+> (The internal Python package is still named `rekit`; a deeper rename is a follow-up.)
 
 **A harness-agnostic reverse-engineering runtime.** Point it at a target, pick a
 goal, and agents work it: **load · analyze · understand · adapt · wreck it.**
 
-rekit is the kernel: the ralph loop, the persistent project **ledger**, discovery
-and artifact tracking, skill loading/scoping, the human channel, and goalpacks
-(goals you run against a target).
+rekit-factory is the kernel: the ralph loop, the persistent project **ledger**,
+discovery and artifact tracking, skill loading/scoping, the human channel, and
+goalpacks (goals you run against a target).
 
 ## Scope
 

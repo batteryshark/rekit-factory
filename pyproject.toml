@@ -1,5 +1,5 @@
 [project]
-name = "rekit"
+name = "rekit-factory"
 version = "0.1.0"
 description = "rekit: a harness-agnostic orchestration runtime — ralph loop, persistent ledger, skills + scoping, human channel, goalpacks. Point it at a target, pick a goal. Depends on nothing."
 readme = "README.md"
@@ -17,7 +17,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project.scripts]
-rekit = "rekit.cli:main"
+rekit-factory = "rekit.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["rekit*"]
