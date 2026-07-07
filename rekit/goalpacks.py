@@ -97,6 +97,14 @@ DEFAULT_MARKDOWN_FUNC = "render_markdown"
 #: frontmatter declares no explicit ``html:`` spec.
 DEFAULT_HTML_FUNC = "render_html"
 
+#: Module (file stem) + function for a goalpack's optional *prepare* step — a
+#: deterministic pass that runs BEFORE the loop to reveal/transform the target
+#: (e.g. recursively unpack packed containers) so the brain and the report both
+#: analyse the revealed source. Kept in its own ``prepare.py`` (not the renderer)
+#: because preparing a target is an analyse concern, not a reporting one.
+DEFAULT_PREPARE_MODULE = "prepare"
+DEFAULT_PREPARE_FUNC = "prepare"
+
 #: Artifact kinds a persisted report is recorded under in the ledger.
 REPORT_JSON_KIND = "report/json"
 REPORT_MARKDOWN_KIND = "report/markdown"
@@ -125,6 +133,10 @@ class Goalpack:
     dir: Path
     render_markdown: Callable[[dict[str, Any]], str] | None = None
     render_html: Callable[[dict[str, Any]], str] | None = None
+    #: Optional pre-loop prepare step (``prepare(project, registry, *, channel,
+    #: policy, environ)``): reveal/transform the target before analysis. None when
+    #: the goalpack ships no ``prepare.py``.
+    prepare: Callable[..., None] | None = None
 
 
 @dataclass(frozen=True)
@@ -272,6 +284,21 @@ def run_goalpack(
     bundled = goalpack.dir / SKILLS_SUBDIR
     tools = [bundled] if bundled.is_dir() else None
 
+    # Optional deterministic prepare pass, BEFORE the loop: reveal/transform the
+    # target (e.g. recursively unpack packed containers) so the brain and the report
+    # both analyse the revealed source instead of an opaque bundle. Skills it runs
+    # fold their outputs back into the ledger, so the loop's per-round scoping picks
+    # up the revealed artifacts. Best-effort — a prepare failure must not sink the run.
+    if goalpack.prepare is not None:
+        registry = Registry(discover_skills(environ=environ, extra_roots=tools))
+        try:
+            goalpack.prepare(
+                project, registry,
+                channel=channel, policy=policy, environ=environ,
+            )
+        except Exception:  # noqa: BLE001 — a prepare step must not crash the run.
+            pass
+
     summary = run_goal(
         project,
         goalpack.goal,
@@ -405,6 +432,8 @@ def _load_from_dir(directory: Path) -> Goalpack:
         str(meta.get("html") or "").strip(),
     )
 
+    prepare = _resolve_prepare(directory, str(meta.get("prepare") or "").strip())
+
     return Goalpack(
         name=name,
         title=title,
@@ -415,7 +444,21 @@ def _load_from_dir(directory: Path) -> Goalpack:
         dir=directory,
         render_markdown=render_markdown,
         render_html=render_html,
+        prepare=prepare,
     )
+
+
+def _resolve_prepare(directory: Path, prepare_spec: str) -> Callable[..., None] | None:
+    """Resolve the optional pre-loop ``prepare`` callable for a goalpack.
+
+    From an explicit ``prepare:`` frontmatter spec, else from a ``prepare`` function
+    in a sibling ``prepare.py`` — its own module, kept apart from the renderer because
+    preparing/revealing a target is an analyse concern, not reporting. ``None`` when
+    neither is present (most goalpacks need no prepare step).
+    """
+    if prepare_spec:
+        return _resolve_callable(directory, prepare_spec, DEFAULT_PREPARE_MODULE)
+    return _optional_callable(directory, DEFAULT_PREPARE_MODULE, DEFAULT_PREPARE_FUNC)
 
 
 def _resolve_reporting(
