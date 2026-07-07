@@ -21,6 +21,7 @@ from .readmodel import (
     fleet,
     health,
     project_detail,
+    project_report,
     project_view,
     reap_stale,
 )
@@ -28,8 +29,8 @@ from .server import DEFAULT_HOST, DEFAULT_PORT, handle, make_server, serve
 from .supervisor import Supervisor
 
 __all__ = [
-    "fleet", "project_view", "project_detail", "event_stream", "health",
-    "reap_stale", "BLOCKED", "SUSPENDED",
+    "fleet", "project_view", "project_detail", "project_report", "event_stream",
+    "health", "reap_stale", "BLOCKED", "SUSPENDED",
     "skills_catalog", "harnesses", "goalpacks_catalog", "Supervisor",
     "serve", "make_server", "handle", "DEFAULT_HOST", "DEFAULT_PORT",
 ]

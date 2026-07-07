@@ -206,6 +206,46 @@ def test_run_route_launches_goalpack():
         assert any(v["id"] == data["id"] for v in fleet(projects_root()))
 
 
+def _drop_report_goalpack(name="mcd"):
+    gp = Path(os.environ["REKIT_HOME"]) / "goalpacks" / name
+    gp.mkdir(parents=True, exist_ok=True)
+    (gp / "GOALPACK.md").write_text(
+        f"---\nname: {name}\ntitle: MCD\ngoal: Disclose capabilities.\n"
+        "requestedCapabilities: [survey]\nrenderer: renderer:render_report\n---\nx\n", encoding="utf-8")
+    (gp / "system-prompt.md").write_text("Emit findings then DONE.\n", encoding="utf-8")
+    (gp / "renderer.py").write_text(
+        "def render_report(project, goalpack, summary):\n"
+        "    return {'title': 'Report', 'findings': [f.get('note') for f in project.ledger.findings()]}\n"
+        "def render_markdown(report):\n"
+        "    return '# ' + report['title'] + '\\n\\n## Findings\\n' + "
+        "'\\n'.join('- ' + str(x) for x in report['findings']) + '\\n'\n",
+        encoding="utf-8")
+
+
+def test_report_route_with_a_rendered_report():
+    with _temp_home():
+        from rekit.goalpacks import load_goalpack, run_goalpack
+        from rekit.harness import MockAdapter, MockTurn
+        _drop_report_goalpack()
+        ws = tempfile.mkdtemp(prefix="rekit-target-")
+        target = Path(ws) / "r.bin"
+        target.write_bytes(b"\x7fELF")
+        project = open_project(str(target))
+        run_goalpack(project, load_goalpack("mcd"),
+                     MockAdapter([MockTurn(text="FINDING: a sink\nDONE\n")]))
+        status, data = _body(handle("GET", f"/api/report?id={project.id}", root=projects_root()))
+        assert status == 200 and data["hasReport"] is True
+        assert "Findings" in (data["markdown"] or "")
+        assert data["meta"].get("goalpack") == "mcd"
+
+
+def test_report_route_no_report():
+    with _temp_home():
+        p = _project("plain.bin")
+        status, data = _body(handle("GET", f"/api/report?id={p.id}", root=projects_root()))
+        assert status == 200 and data["hasReport"] is False
+
+
 def test_stop_route_unknown_id():
     with _temp_home():
         status, data = _body(handle("POST", "/api/stop",

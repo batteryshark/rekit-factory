@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..human import inbox as _inbox
 from ..ledger.home import projects_root, rekit_home
-from .readmodel import fleet, health, project_detail, reap_stale
+from .readmodel import fleet, health, project_detail, project_report, reap_stale
 
 #: Default port — 7358 is "REKT" on a phone keypad, and chosen to avoid clashing
 #: with common local dashboards (e.g. opencode-ensemble on 4747). Override with --port.
@@ -88,6 +88,13 @@ def handle(method: str, path: str, body: bytes = b"", *,
         if not pid or not (d / "project.json").exists():
             return _json(404, {"error": "no such project"})
         return _json(200, project_detail(d))
+
+    if method == "GET" and route == "/api/report":
+        pid = (query.get("id") or [""])[0]
+        d = base / pid
+        if not pid or not (d / "project.json").exists():
+            return _json(404, {"error": "no such project"})
+        return _json(200, project_report(d))
 
     if method == "POST" and route == "/api/answer":
         try:
@@ -371,6 +378,18 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .ev .ts{color:var(--ink4);flex-shrink:0}.ev .ty{flex-shrink:0;width:104px;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ev .m{color:var(--ink2);min-width:0}
 .ev.run{border-left-color:var(--green)}.ev.run .ty{color:var(--green)}.ev.ledger .ty{color:var(--teal)}
 .empty2{color:var(--ink3);font-size:12.5px;padding:8px 0}
+.report{font-size:13.5px;line-height:1.6;color:var(--ink2)}
+.report h1{font-size:19px;color:var(--ink);margin:2px 0 12px;font-weight:700}
+.report h2{font-size:15px;color:var(--ink);margin:20px 0 8px;font-family:var(--mono)}
+.report h3{font-size:11px;color:var(--ink3);text-transform:uppercase;letter-spacing:.1em;margin:16px 0 6px}
+.report h4,.report h5,.report h6{font-size:13px;color:var(--ink);margin:12px 0 5px}
+.report p{margin:0 0 10px}.report ul{margin:0 0 10px;padding-left:20px}.report li{margin:3px 0}
+.report code{font-family:var(--mono);font-size:12px;background:var(--panel2);padding:1px 5px;border-radius:4px;color:var(--teal)}
+.report pre{font-family:var(--mono);font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:11px;overflow-x:auto;color:var(--ink2);margin:0 0 10px}
+.report pre code{background:none;padding:0;color:inherit}.report strong{color:var(--ink)}
+.deriv{padding:10px 0;border-bottom:1px solid var(--line)}.deriv:last-child{border-bottom:0}
+.deriv .dt{font-family:var(--mono);font-size:12.5px;color:var(--ink)}.deriv .dc{font-family:var(--mono);font-size:10px;color:var(--teal);margin-left:8px;text-transform:uppercase;letter-spacing:.05em}
+.douts{margin-top:5px}.dout{font-family:var(--mono);font-size:11.5px;color:var(--ink2);padding:2px 0}.dout .k{color:var(--ink3);font-size:10px;margin-left:8px;text-transform:uppercase}
 .nav{font-family:var(--mono);font-size:12px;color:var(--ink3);background:none;border:0;padding:6px 11px;border-radius:6px;cursor:pointer}
 .nav:hover{color:var(--ink)}.nav.on{color:var(--green);background:var(--raise)}
 .nav.ic{display:inline-flex;align-items:center;padding:6px 8px;color:var(--ink2)}.nav.ic:hover{color:var(--ink)}.nav.ic svg{width:17px;height:17px;display:block}
@@ -507,7 +526,7 @@ function render(data){
   renderDecisions(f);
   $('fleet').innerHTML=f.length?f.map(card).join(''):'<div class="empty">no projects yet — start a run from the CLI</div>';
 }
-let view='fleet',currentId=null,currentTab='overview',lastDetail=null,actFilter='all';
+let view='fleet',currentId=null,currentTab='overview',lastDetail=null,actFilter='all',reportCache={};
 let nr={mode:'adhoc',harness:'mock',tier:'cheap',rounds:8,openCaps:new Set(),target:'',goal:'',goalpack:null};
 function tick(){$('tick').textContent='live · '+new Date().toLocaleTimeString();}
 function fail(){$('tick').textContent='reconnecting…';}
@@ -515,7 +534,7 @@ function refresh(){if(view==='detail')return pollDetail();if(view==='fleet')retu
 const VIEWS=['fleet-view','detail-view','newrun-view','skills-view','settings-view'];
 function hideAll(){VIEWS.forEach(id=>$(id).style.display='none');}
 function navHL(){['fleet','skills','settings'].forEach(n=>{const b=$('nav-'+n);if(b)b.classList.toggle('on',view===n);});}
-function openProject(id){view='detail';currentId=id;currentTab='overview';actFilter='all';lastDetail=null;
+function openProject(id){view='detail';currentId=id;currentTab='overview';actFilter='all';lastDetail=null;delete reportCache[id];
   hideAll();const dv=$('detail-view');dv.style.display='';dv.innerHTML='<div class="empty">loading…</div>';navHL();pollDetail();}
 function showFleet(){view='fleet';currentId=null;hideAll();$('fleet-view').style.display='';navHL();pollFleet();}
 function showSkills(){view='skills';hideAll();$('skills-view').style.display='';navHL();renderSkills();}
@@ -542,10 +561,36 @@ async function pollDetail(){if(!currentId)return;try{
     if(v.error){showFleet();return;}renderDetail(v);tick();
   }catch(e){fail();}}
 function counter(v,color,label){return `<div class="c"><div class="v" style="color:${color}">${v}</div><div class="l">${label}</div></div>`;}
+async function fetchReport(id){
+  try{const r=await (await fetch('/api/report?id='+encodeURIComponent(id))).json();
+    reportCache[id]=r;
+    if(view==='detail'&&currentId===id&&currentTab==='outputs'&&lastDetail)renderDetail(lastDetail);
+  }catch(e){reportCache[id]={hasReport:false};}
+}
+function mdToHtml(md){
+  const e=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const inline=t=>e(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/(^|[^*])\*([^*]+)\*/g,'$1<em>$2</em>');
+  let h='',inList=false,inCode=false,code='';
+  for(const raw of String(md).split('\n')){
+    if(raw.trim().slice(0,3)==='```'){ if(inCode){h+='<pre><code>'+e(code)+'</code></pre>';code='';inCode=false;}else{inCode=true;} continue; }
+    if(inCode){code+=raw+'\n';continue;}
+    const line=raw.replace(/\s+$/,'');
+    const hd=line.match(/^(#{1,6})\s+(.*)$/);
+    if(hd){if(inList){h+='</ul>';inList=false;}const l=hd[1].length;h+='<h'+l+'>'+inline(hd[2])+'</h'+l+'>';continue;}
+    const li=line.match(/^\s*[-*]\s+(.*)$/);
+    if(li){if(!inList){h+='<ul>';inList=true;}h+='<li>'+inline(li[1])+'</li>';continue;}
+    if(!line.trim()){if(inList){h+='</ul>';inList=false;}continue;}
+    if(inList){h+='</ul>';inList=false;}
+    h+='<p>'+inline(line)+'</p>';
+  }
+  if(inList)h+='</ul>'; if(inCode)h+='<pre><code>'+e(code)+'</code></pre>';
+  return h;
+}
 function renderDetail(v){
   lastDetail=v;
   const r=v.run||{},c=r.counters||{},cost=r.cost||{};
-  const pend=v.pending||[],find=v.findings||[],leads=v.leads||[],arts=v.artifacts||[],evs=v.events||[];
+  const pend=v.pending||[],find=v.findings||[],leads=v.leads||[],arts=v.artifacts||[],evs=v.events||[],derivs=v.derivations||[];
+  const outCount=(v.hasReport?1:0)+derivs.length;
   const tabBtn=(id,label,n)=>`<button class="tab ${currentTab===id?'on':''}" onclick="setTab('${id}')">${label}${n!=null?`<span class="n">${n}</span>`:''}</button>`;
   let pane='';
   if(currentTab==='overview'){
@@ -562,6 +607,15 @@ function renderDetail(v){
       (leads.length?leads.map(l=>`<div class="lead"><span class="lc">${esc(l.capability)}</span><span style="color:var(--ink3)">for ${esc(l.kind)}</span>${(l.requires&&l.requires.length)?`<span class="lr">needs ${esc(l.requires.join(', '))}</span>`:''}</div>`).join(''):'<div class="empty2">none</div>')+`</div>`;
     pane+=`<div class="panel"><h3>Artifacts · ${arts.length}</h3>`+
       (arts.length?arts.map(a=>`<div class="art">${a.isTree?'▸':'◦'} ${esc(a.path||a.id)}${a.analyzed?' <span style="color:var(--green)">✓</span>':''}<span class="k">${esc(a.kind)}</span></div>`).join(''):'<div class="empty2">none</div>')+`</div>`;
+  } else if(currentTab==='outputs'){
+    let rep='';
+    if(v.hasReport){
+      const rc=reportCache[v.id];
+      if(rc){rep=`<div class="panel"><h3>Report${rc.meta&&rc.meta.goalpack?' · '+esc(rc.meta.goalpack):''}</h3><div class="report">${rc.markdown?mdToHtml(rc.markdown):(rc.json?`<pre>${esc(rc.json)}</pre>`:'<div class="empty2">report is empty</div>')}</div></div>`;}
+      else{rep=`<div class="panel"><h3>Report</h3><div class="empty2">loading…</div></div>`;fetchReport(v.id);}
+    }
+    const dv=derivs.length?`<div class="panel"><h3>Produced files · ${derivs.length}</h3>`+derivs.map(d=>`<div class="deriv"><span class="dt">${esc(d.transform)}</span>${d.capability?`<span class="dc">${esc(d.capability)}</span>`:''}<div class="douts">${(d.outputs||[]).map(o=>`<div class="dout">⇢ ${esc(o.path||o.id)}<span class="k">${esc(o.kind)}</span></div>`).join('')||'<span class="empty2">no output files</span>'}</div></div>`).join('')+`</div>`:'';
+    pane=(rep+dv)||`<div class="empty2" style="padding:20px">This run hasn't produced a report or output files yet.</div>`;
   } else {
     const filtered=evs.filter(e=>actFilter==='all'?true:actFilter==='findings'?e.type==='finding_recorded':e.source===actFilter);
     pane=`<div style="margin-bottom:10px">${['all','run','ledger','findings'].map(f=>`<button class="fbtn ${actFilter===f?'on':''}" onclick="setActFilter('${f}')">${f}</button>`).join('')}</div>
@@ -574,7 +628,7 @@ function renderDetail(v){
     <div class="dgoal">${esc(r.goal||'—')}</div>
     <div class="kv"><span>R <b>${r.round||0}/${r.maxRounds||0}</b></span><span>tier <b>${esc(r.tier||'—')}</b></span>
       <span>${esc(r.harness||'—')} <b class="teal">${esc(r.model||'')}</b></span><span>spend <b>$${(cost.usd||0).toFixed(2)}</b></span></div>
-    <div class="tabs">${tabBtn('overview','Overview')}${tabBtn('ledger','Ledger',find.length)}${tabBtn('activity','Activity',evs.length)}</div>
+    <div class="tabs">${tabBtn('overview','Overview')}${tabBtn('outputs','Outputs',outCount||null)}${tabBtn('ledger','Ledger',find.length)}${tabBtn('activity','Activity',evs.length)}</div>
     <div class="pane">${pane}</div>`;
 }
 async function renderNewRun(){
