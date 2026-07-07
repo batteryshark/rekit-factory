@@ -33,7 +33,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from ..human import inbox as _inbox
-from ..ledger.home import projects_root
+from ..ledger.home import projects_root, rekit_home
 from .readmodel import fleet, health, project_detail, reap_stale
 
 #: Default port — 7358 is "REKT" on a phone keypad, and chosen to avoid clashing
@@ -141,6 +141,14 @@ def handle(method: str, path: str, body: bytes = b"", *,
     if method == "GET" and route == "/api/harnesses":
         from .catalog import harnesses
         return _json(200, {"harnesses": harnesses()})
+
+    if method == "GET" and route == "/api/info":
+        base = _projects_base(root)
+        return _json(200, {
+            "rekitHome": str(rekit_home()),
+            "projectsDir": str(base),
+            "projects": len(fleet(base)),
+        })
 
     return _json(404, {"error": "not found"})
 
@@ -356,6 +364,7 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .empty2{color:var(--ink3);font-size:12.5px;padding:8px 0}
 .nav{font-family:var(--mono);font-size:12px;color:var(--ink3);background:none;border:0;padding:6px 11px;border-radius:6px;cursor:pointer}
 .nav:hover{color:var(--ink)}.nav.on{color:var(--green);background:var(--raise)}
+.nav.ic{display:inline-flex;align-items:center;padding:6px 8px;color:var(--ink2)}.nav.ic:hover{color:var(--ink)}.nav.ic svg{width:17px;height:17px;display:block}
 .newrun-btn{font-family:var(--sans);font-weight:600;font-size:13px;background:linear-gradient(180deg,#4fe895,#31c274);color:#04160c;border:0;border-radius:8px;padding:8px 14px;cursor:pointer}
 .newrun-btn:hover{filter:brightness(1.06)}
 .stop-btn{font-family:var(--mono);font-size:11px;color:#f5868f;background:rgba(242,85,99,.08);border:1px solid rgba(242,85,99,.35);border-radius:6px;padding:4px 9px;cursor:pointer}
@@ -400,7 +409,8 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
   <div class="sp"></div>
   <div class="legend" id="legend"></div>
   <button class="newrun-btn" onclick="showNewRun()">+ New Run</button>
-  <button class="nav" onclick="toggleTheme()" title="Toggle light / dark" style="font-size:15px">◐</button>
+  <button class="nav ic" id="theme-btn" onclick="toggleTheme()" title="Light / dark"></button>
+  <button class="nav ic" onclick="showSettings()" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M4 5l2 2M18 17l2 2M2.5 12h3M18.5 12h3M4 19l2-2M18 7l2-2"/></svg></button>
   <div class="live"><i></i><span id="tick">live</span></div>
 </header>
 <main>
@@ -412,15 +422,22 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
   <div id="detail-view" style="display:none"></div>
   <div id="newrun-view" style="display:none"></div>
   <div id="skills-view" style="display:none"></div>
+  <div id="settings-view" style="display:none"></div>
 </main>
 <script>
 const $=id=>document.getElementById(id);
+const SUN='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5 5l1.4 1.4M17.6 17.6l1.4 1.4M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg>';
+const MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
 try{if(localStorage.getItem('rekit-theme')==='light')document.documentElement.setAttribute('data-theme','light');}catch(e){}
+function isLight(){return document.documentElement.getAttribute('data-theme')==='light';}
+function updateThemeIcon(){const b=$('theme-btn');if(!b)return;
+  b.innerHTML=isLight()?MOON:SUN;                 // show what a click switches TO
+  b.title=isLight()?'Switch to dark':'Switch to light';}
 function toggleTheme(){
-  const light=document.documentElement.getAttribute('data-theme')==='light';
-  if(light)document.documentElement.removeAttribute('data-theme');
+  if(isLight())document.documentElement.removeAttribute('data-theme');
   else document.documentElement.setAttribute('data-theme','light');
-  try{localStorage.setItem('rekit-theme',light?'':'light');}catch(e){}
+  try{localStorage.setItem('rekit-theme',isLight()?'light':'');}catch(e){}
+  updateThemeIcon();
 }
 const PILL={running:'p-running',blocked:'p-blocked',suspended:'p-suspended',done:'p-done',idle:'p-idle',failed:'p-failed'};
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
@@ -480,13 +497,14 @@ let nr={harness:'mock',tier:'cheap',rounds:8,openCaps:new Set(),target:'',goal:'
 function tick(){$('tick').textContent='live · '+new Date().toLocaleTimeString();}
 function fail(){$('tick').textContent='reconnecting…';}
 function refresh(){if(view==='detail')return pollDetail();if(view==='fleet')return pollFleet();}
-const VIEWS=['fleet-view','detail-view','newrun-view','skills-view'];
+const VIEWS=['fleet-view','detail-view','newrun-view','skills-view','settings-view'];
 function hideAll(){VIEWS.forEach(id=>$(id).style.display='none');}
 function navHL(){['fleet','skills'].forEach(n=>{const b=$('nav-'+n);if(b)b.classList.toggle('on',view===n);});}
 function openProject(id){view='detail';currentId=id;currentTab='overview';actFilter='all';lastDetail=null;
   hideAll();const dv=$('detail-view');dv.style.display='';dv.innerHTML='<div class="empty">loading…</div>';navHL();pollDetail();}
 function showFleet(){view='fleet';currentId=null;hideAll();$('fleet-view').style.display='';navHL();pollFleet();}
 function showSkills(){view='skills';hideAll();$('skills-view').style.display='';navHL();renderSkills();}
+function showSettings(){view='settings';hideAll();$('settings-view').style.display='';navHL();renderSettings();}
 function showNewRun(){view='newrun';hideAll();$('newrun-view').style.display='';navHL();renderNewRun();}
 function setTab(t){currentTab=t;if(lastDetail)renderDetail(lastDetail);}
 function setActFilter(f){actFilter=f;if(lastDetail)renderDetail(lastDetail);}
@@ -596,6 +614,24 @@ async function renderSkills(){
   $('skills-view').innerHTML=`<h2>Skills · ${cat.total||0} in the rack</h2>${caps||'<div class="empty2">none discovered</div>'}
     <h2 style="margin-top:26px">Harnesses</h2>${hs}`;
 }
+async function renderSettings(){
+  let info={};
+  try{info=await (await fetch('/api/info')).json();}catch(e){}
+  const kv=(l,v)=>`<div class="kv"><span>${l} <b>${esc(v)}</b></span></div>`;
+  $('settings-view').innerHTML=`
+    <h2>Settings</h2>
+    <div class="panel"><h3>Storage</h3>
+      ${kv('REKIT_HOME',info.rekitHome||'~/.rekit')}
+      ${kv('projects dir',info.projectsDir||'')}
+      ${kv('tracked projects',info.projects!=null?info.projects:0)}</div>
+    <div class="panel"><h3>Live view</h3>
+      <div class="kv"><span>a read-model over <b>$REKIT_HOME</b> · polled every 1.5s</span></div>
+      <div class="kv"><span>desktop notifications fire on new decisions (wait &amp; notify)</span></div>
+      <div class="kv"><span>reaps zombie "running" cards from a dead session on start</span></div></div>
+    <div class="panel"><h3>Theme</h3>
+      <div class="kv"><span>toggle light / dark with the sun · moon in the header — persists in this browser</span></div></div>`;
+}
+updateThemeIcon();
 refresh();setInterval(refresh,1500);
 </script>
 </body></html>

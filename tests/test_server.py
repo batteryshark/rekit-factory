@@ -194,6 +194,14 @@ def test_harnesses_route():
     assert "mock" in names and "pi" in names
 
 
+def test_info_route():
+    with _temp_home():
+        status, data = _body(handle("GET", "/api/info", root=projects_root()))
+        assert status == 200
+        for key in ("rekitHome", "projectsDir", "projects"):
+            assert key in data, key
+
+
 # -- notifier core ----------------------------------------------------------
 
 def test_new_notifications_reports_only_fresh():
