@@ -406,11 +406,11 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
   <span class="wm">RE<span class="k">KIT</span></span>
   <button class="nav" id="nav-fleet" onclick="showFleet()">Fleet</button>
   <button class="nav" id="nav-skills" onclick="showSkills()">Skills</button>
+  <button class="nav ic" id="nav-settings" onclick="showSettings()" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
   <div class="sp"></div>
   <div class="legend" id="legend"></div>
   <button class="newrun-btn" onclick="showNewRun()">+ New Run</button>
   <button class="nav ic" id="theme-btn" onclick="toggleTheme()" title="Light / dark"></button>
-  <button class="nav ic" onclick="showSettings()" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M4 5l2 2M18 17l2 2M2.5 12h3M18.5 12h3M4 19l2-2M18 7l2-2"/></svg></button>
   <div class="live"><i></i><span id="tick">live</span></div>
 </header>
 <main>
@@ -499,7 +499,7 @@ function fail(){$('tick').textContent='reconnecting…';}
 function refresh(){if(view==='detail')return pollDetail();if(view==='fleet')return pollFleet();}
 const VIEWS=['fleet-view','detail-view','newrun-view','skills-view','settings-view'];
 function hideAll(){VIEWS.forEach(id=>$(id).style.display='none');}
-function navHL(){['fleet','skills'].forEach(n=>{const b=$('nav-'+n);if(b)b.classList.toggle('on',view===n);});}
+function navHL(){['fleet','skills','settings'].forEach(n=>{const b=$('nav-'+n);if(b)b.classList.toggle('on',view===n);});}
 function openProject(id){view='detail';currentId=id;currentTab='overview';actFilter='all';lastDetail=null;
   hideAll();const dv=$('detail-view');dv.style.display='';dv.innerHTML='<div class="empty">loading…</div>';navHL();pollDetail();}
 function showFleet(){view='fleet';currentId=null;hideAll();$('fleet-view').style.display='';navHL();pollFleet();}
