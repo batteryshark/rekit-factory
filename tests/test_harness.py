@@ -158,7 +158,15 @@ def test_pi_missing_binary_raises():
 
 
 def test_pi_real_smoke():
-    """One real cheap MiniMax-M3 call — parseable HarnessResult end to end."""
+    """One real cheap MiniMax-M3 call — parseable HarnessResult end to end.
+
+    Opt-in: this makes a live, billable, network-dependent call, so it is skipped
+    unless ``REKIT_PI_SMOKE=1`` — the default suite stays hermetic and fast. Run
+    it explicitly with ``REKIT_PI_SMOKE=1 python tests/test_harness.py``.
+    """
+    if not os.environ.get("REKIT_PI_SMOKE"):
+        print("SKIP test_pi_real_smoke: set REKIT_PI_SMOKE=1 to run the real pi call")
+        return
     if shutil.which("pi") is None:
         print("SKIP test_pi_real_smoke: pi not on PATH")
         return
