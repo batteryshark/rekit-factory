@@ -13,7 +13,7 @@ Public surface (E7.0):
 - :func:`health` — status counts for the fleet health ring.
 """
 
-from .catalog import harnesses, skills_catalog
+from .catalog import goalpacks_catalog, harnesses, skills_catalog
 from .readmodel import (
     BLOCKED,
     SUSPENDED,
@@ -30,6 +30,6 @@ from .supervisor import Supervisor
 __all__ = [
     "fleet", "project_view", "project_detail", "event_stream", "health",
     "reap_stale", "BLOCKED", "SUSPENDED",
-    "skills_catalog", "harnesses", "Supervisor",
+    "skills_catalog", "harnesses", "goalpacks_catalog", "Supervisor",
     "serve", "make_server", "handle", "DEFAULT_HOST", "DEFAULT_PORT",
 ]

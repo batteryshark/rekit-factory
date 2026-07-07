@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import threading
 
+from ..goalpacks import load_goalpack, run_goalpack
 from ..harness import MockAdapter, MockTurn
 from ..harness.base import HarnessAdapter
 from ..human import LedgerHumanChannel
@@ -85,12 +86,13 @@ class Supervisor:
     def launch(
         self,
         target: str,
-        goal: str,
+        goal: str = "",
         *,
         harness: str = "mock",
         tier: str = "cheap",
         max_rounds: int = 8,
         tools: list[str] | None = None,
+        goalpack: str | None = None,
     ) -> str:
         """Start a run for ``goal`` against ``target`` and return its project id now.
 
@@ -109,25 +111,36 @@ class Supervisor:
         project = open_project(target)
         runlog = RunLog(project.dir)
         channel = LedgerHumanChannel(project.dir)
-        registry = Registry.from_home(extra_roots=tools)
         adapter = self._build_adapter(harness)
         cancel = threading.Event()
+        # A goalpack launch loads the pack up front (a bad name fails the launch
+        # cleanly); its own goal / capabilities / bundled skills drive the loop, so
+        # no ad-hoc registry is needed. An ad-hoc launch builds the rack from tools.
+        pack = load_goalpack(goalpack) if goalpack else None
+        registry = None if pack is not None else Registry.from_home(extra_roots=tools)
 
         def _drive() -> None:
             # The loop already writes run.jsonl for observability; the thread's only
             # extra job is to never let an exception escape and to unregister itself.
             try:
-                _run(
-                    project,
-                    goal,
-                    adapter,
-                    registry=registry,
-                    channel=channel,
-                    runlog=runlog,
-                    tier=tier,
-                    max_rounds=max_rounds,
-                    cancel=cancel,
-                )
+                if pack is not None:
+                    run_goalpack(
+                        project, pack, adapter,
+                        channel=channel, runlog=runlog, cancel=cancel,
+                        tier=tier, max_rounds=max_rounds,
+                    )
+                else:
+                    _run(
+                        project,
+                        goal,
+                        adapter,
+                        registry=registry,
+                        channel=channel,
+                        runlog=runlog,
+                        tier=tier,
+                        max_rounds=max_rounds,
+                        cancel=cancel,
+                    )
             except Exception:  # noqa: BLE001 — a run thread must never crash the process.
                 pass
             finally:

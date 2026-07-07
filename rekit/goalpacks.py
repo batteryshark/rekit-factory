@@ -202,6 +202,8 @@ def run_goal(
     environ: dict | None = None,
     tier: str = CHEAP,
     max_rounds: int = 8,
+    runlog=None,
+    cancel=None,
 ) -> Any:
     """Run an **ad-hoc** goal on the ralph loop — the primary interface.
 
@@ -226,6 +228,8 @@ def run_goal(
         registry=registry,
         tier=tier,
         max_rounds=max_rounds,
+        runlog=runlog,
+        cancel=cancel,
     )
 
 
@@ -239,6 +243,8 @@ def run_goalpack(
     environ: dict | None = None,
     tier: str = CHEAP,
     max_rounds: int = 8,
+    runlog=None,
+    cancel=None,
 ) -> GoalpackResult:
     """Run ``goalpack`` on the ralph loop; report only if the goalpack asks for one.
 
@@ -270,6 +276,8 @@ def run_goalpack(
         environ=environ,
         tier=tier,
         max_rounds=max_rounds,
+        runlog=runlog,
+        cancel=cancel,
     )
 
     findings = project.ledger.findings()

@@ -171,8 +171,39 @@ def test_run_route_launches_and_appears_in_fleet():
 
 
 def test_run_route_requires_target_and_goal():
-    status, _ = _body(handle("POST", "/api/run", b'{"goal": "x"}'))
+    status, _ = _body(handle("POST", "/api/run", b'{"goal": "x"}'))       # no target
     assert status == 400
+    status, _ = _body(handle("POST", "/api/run", b'{"target": "/x"}'))    # no goal/goalpack
+    assert status == 400
+
+
+def _drop_goalpack(name="probe"):
+    gp = Path(os.environ["REKIT_HOME"]) / "goalpacks" / name
+    gp.mkdir(parents=True, exist_ok=True)
+    (gp / "GOALPACK.md").write_text(
+        f"---\nname: {name}\ntitle: Probe\ngoal: Read the target and report findings.\n"
+        "requestedCapabilities: [code-understanding]\n---\nfixture\n", encoding="utf-8")
+    (gp / "system-prompt.md").write_text("Emit findings then DONE.\n", encoding="utf-8")
+
+
+def test_goalpacks_route():
+    with _temp_home():
+        _drop_goalpack()
+        status, data = _body(handle("GET", "/api/goalpacks", root=projects_root()))
+        assert status == 200 and any(g["name"] == "probe" for g in data["goalpacks"])
+
+
+def test_run_route_launches_goalpack():
+    with _temp_home():
+        _drop_goalpack()
+        ws = tempfile.mkdtemp(prefix="rekit-target-")
+        target = Path(ws) / "gp.bin"
+        target.write_bytes(b"\x7fELF")
+        body = json.dumps({"target": str(target), "goalpack": "probe",
+                           "harness": "mock", "maxRounds": 3}).encode()
+        status, data = _body(handle("POST", "/api/run", body, root=projects_root()))
+        assert status == 200 and data["ok"] is True and data["id"]
+        assert any(v["id"] == data["id"] for v in fleet(projects_root()))
 
 
 def test_stop_route_unknown_id():

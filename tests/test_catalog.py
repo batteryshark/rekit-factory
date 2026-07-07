@@ -22,7 +22,7 @@ from pathlib import Path
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 
-from rekit.lab.catalog import harnesses, skills_catalog  # noqa: E402
+from rekit.lab.catalog import goalpacks_catalog, harnesses, skills_catalog  # noqa: E402
 
 
 # -- fixture skills: two capabilities, one host that cannot resolve ----------
@@ -141,6 +141,29 @@ def test_harnesses_shape():
     assert by_name["mock"]["status"] == "available"
     assert "pi" in by_name
     assert by_name["pi"]["status"] in {"available", "unconfigured"}
+
+
+def test_goalpacks_catalog():
+    home = tempfile.mkdtemp(prefix="rekit-home-")
+    gp = Path(home) / "goalpacks" / "probe"
+    gp.mkdir(parents=True)
+    (gp / "GOALPACK.md").write_text(
+        "---\nname: probe\ntitle: Probe\ngoal: Read it.\n"
+        "requestedCapabilities: [code-understanding]\n---\nx\n", encoding="utf-8")
+    (gp / "system-prompt.md").write_text("Emit findings then DONE.\n", encoding="utf-8")
+    saved = os.environ.get("REKIT_HOME")
+    os.environ["REKIT_HOME"] = home
+    try:
+        cat = goalpacks_catalog()
+        g = next((x for x in cat["goalpacks"] if x["name"] == "probe"), None)
+        assert g is not None
+        assert g["goal"] == "Read it." and g["capabilities"] == ["code-understanding"]
+        assert g["rendersReport"] is False   # no renderer declared
+    finally:
+        if saved is None:
+            os.environ.pop("REKIT_HOME", None)
+        else:
+            os.environ["REKIT_HOME"] = saved
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -114,3 +114,22 @@ def harnesses() -> list[dict[str, Any]]:
         {"name": "opencode", "status": "planned",
          "description": "OpenCode as a brain behind the seam (not yet built)."},
     ]
+
+
+def goalpacks_catalog(environ: dict | None = None) -> dict[str, Any]:
+    """Discoverable goalpacks — the packaged (goal + skills + optional report)
+    presets the New Run composer offers as an alternative to an ad-hoc goal.
+
+    Returns ``{"goalpacks": [{"name", "title", "goal", "capabilities": [...],
+    "rendersReport": bool}, ...]}``, sorted by name. Import is lazy so the catalog
+    stays a leaf. Never raises — a bad goalpack folder is skipped by discovery.
+    """
+    from ..goalpacks import discover_goalpacks
+
+    packs = sorted(discover_goalpacks(environ=environ), key=lambda g: g.name)
+    return {"goalpacks": [
+        {"name": g.name, "title": g.title, "goal": g.goal,
+         "capabilities": list(g.requested_capabilities),
+         "rendersReport": g.renderer is not None}
+        for g in packs
+    ]}

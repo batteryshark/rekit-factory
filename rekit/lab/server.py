@@ -109,16 +109,21 @@ def handle(method: str, path: str, body: bytes = b"", *,
             data = json.loads(body or b"{}")
         except (ValueError, TypeError):
             return _json(400, {"error": "invalid JSON body"})
-        target, goal = data.get("target"), data.get("goal")
-        if not target or not goal:
-            return _json(400, {"error": "target and goal are required"})
+        target = data.get("target")
+        goal = data.get("goal")
+        goalpack = data.get("goalpack")
+        if not target:
+            return _json(400, {"error": "target is required"})
+        if not goal and not goalpack:
+            return _json(400, {"error": "a goal or a goalpack is required"})
         try:
             pid = _supervisor().launch(
-                target, goal,
+                target, goal or "",
                 harness=data.get("harness", "mock"),
                 tier=data.get("tier", "cheap"),
                 max_rounds=int(data.get("maxRounds", 8)),
                 tools=data.get("tools") or None,
+                goalpack=goalpack or None,
             )
         except Exception as exc:  # noqa: BLE001 — surface a clean error to the UI.
             return _json(500, {"error": f"launch failed: {exc}"})
@@ -141,6 +146,10 @@ def handle(method: str, path: str, body: bytes = b"", *,
     if method == "GET" and route == "/api/harnesses":
         from .catalog import harnesses
         return _json(200, {"harnesses": harnesses()})
+
+    if method == "GET" and route == "/api/goalpacks":
+        from .catalog import goalpacks_catalog
+        return _json(200, goalpacks_catalog())
 
     if method == "GET" and route == "/api/info":
         base = _projects_base(root)
@@ -395,6 +404,12 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .ttier.ro{background:rgba(70,224,138,.14);color:var(--green)}.ttier.gated{background:rgba(245,177,61,.14);color:var(--amber)}.ttier.na{background:rgba(242,85,99,.1);color:var(--red)}
 .launch{align-self:flex-start;font-family:var(--sans);font-weight:700;font-size:14px;background:linear-gradient(180deg,#4fe895,#31c274);color:#04160c;border:0;border-radius:9px;padding:12px 22px;cursor:pointer}
 .launch:hover{filter:brightness(1.06)}
+.gp-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.gp{border:1px solid var(--line);border-radius:9px;padding:12px;background:var(--bg);text-align:left;cursor:pointer}
+.gp:hover{border-color:var(--line2)}.gp.on{border-color:#2ea86a;background:rgba(70,224,138,.05)}
+.gpn{font-family:var(--mono);font-weight:600;font-size:13px;color:var(--ink)}.gp.on .gpn{color:var(--green)}
+.gpd{font-size:11.5px;color:var(--ink3);margin-top:4px;line-height:1.4}
+.gpm{font-family:var(--mono);font-size:10px;color:var(--ink4);margin-top:8px}
 .fbtn{font-family:var(--mono);font-size:10.5px;color:var(--ink3);border:1px solid var(--line);border-radius:6px;padding:3px 9px;background:none;cursor:pointer;margin-right:6px}.fbtn.on{color:var(--green);border-color:#2ea86a}
 .hrow{display:flex;align-items:center;gap:11px;padding:11px 13px;border:1px solid var(--line);border-radius:8px;background:var(--bg);margin-bottom:8px}
 .hrow .hn{font-family:var(--mono);font-size:13px;color:var(--ink)}.hrow .hd{font-size:12px;color:var(--ink3);margin-top:2px}
@@ -493,7 +508,7 @@ function render(data){
   $('fleet').innerHTML=f.length?f.map(card).join(''):'<div class="empty">no projects yet — start a run from the CLI</div>';
 }
 let view='fleet',currentId=null,currentTab='overview',lastDetail=null,actFilter='all';
-let nr={harness:'mock',tier:'cheap',rounds:8,openCaps:new Set(),target:'',goal:''};
+let nr={mode:'adhoc',harness:'mock',tier:'cheap',rounds:8,openCaps:new Set(),target:'',goal:'',goalpack:null};
 function tick(){$('tick').textContent='live · '+new Date().toLocaleTimeString();}
 function fail(){$('tick').textContent='reconnecting…';}
 function refresh(){if(view==='detail')return pollDetail();if(view==='fleet')return pollFleet();}
@@ -563,21 +578,27 @@ function renderDetail(v){
     <div class="pane">${pane}</div>`;
 }
 async function renderNewRun(){
-  let harn=[],cat={capabilities:[]};
+  let harn=[],cat={capabilities:[]},packs=[];
   try{harn=(await (await fetch('/api/harnesses')).json()).harnesses||[];}catch(e){}
   try{cat=await (await fetch('/api/skills')).json();}catch(e){}
+  try{packs=(await (await fetch('/api/goalpacks')).json()).goalpacks||[];}catch(e){}
   const harnOpts=harn.filter(h=>h.status!=='planned').map(h=>`<button class="${nr.harness===h.name?'on':''}" onclick="setHarness('${h.name}')">${esc(h.name)}${h.status==='unconfigured'?' ·cfg?':''}</button>`).join('');
   const caps=(cat.capabilities||[]).map(c=>{
     const open=nr.openCaps.has(c.capability);
     return `<div class="capgrp ${open?'open':''}"><div class="h" onclick="toggleCap('${c.capability}')"><span class="cn">${esc(c.capability)}</span><span class="cc">${c.skills.length}</span></div>
       <div class="b">${c.skills.map(s=>`<div class="skrow"><span class="sn">${esc(s.name)}</span><div class="meta"><span class="ttier ${s.available?(s.tier==='read-only'?'ro':'gated'):'na'}">${s.available?esc(s.tier):'not installed'}</span></div></div>`).join('')}</div></div>`;
   }).join('');
+  const goalSection = nr.mode==='pack'
+    ? (packs.length?`<div class="gp-grid">${packs.map(g=>`<button class="gp ${nr.goalpack===g.name?'on':''}" onclick="pickPack('${g.name}')"><div class="gpn">${esc(g.title||g.name)}</div><div class="gpd">${esc(g.goal||'')}</div><div class="gpm">${(g.capabilities||[]).map(esc).join(' · ')||'auto-scoped'}${g.rendersReport?' · renders report':''}</div></button>`).join('')}</div>`:`<div class="empty2">no goalpacks in $REKIT_HOME/goalpacks</div>`)
+    : `<textarea id="nr-goal" placeholder="Explain the graphics pipeline and write a patch to force windowed mode.">${esc(nr.goal)}</textarea>`;
   $('newrun-view').innerHTML=`
     <div class="detail-head"><button class="back" onclick="showFleet()">← Fleet</button><span class="dtitle">New Run</span></div>
     <div class="dgoal">point rekit at a target, hand it a goal — it forages under a gate</div>
     <div class="form">
       <div class="field"><label>Target <span class="hint">a path on this machine</span></label><input class="mono" id="nr-target" placeholder="~/targets/renderer.dll" value="${esc(nr.target)}"></div>
-      <div class="field"><label>Goal</label><textarea id="nr-goal" placeholder="Explain the graphics pipeline and write a patch to force windowed mode.">${esc(nr.goal)}</textarea></div>
+      <div class="field"><label>Goal <span class="hint">ad-hoc, or a packaged goalpack</span></label>
+        <div class="seg" style="margin-bottom:10px"><button class="${nr.mode==='adhoc'?'on':''}" onclick="setMode('adhoc')">Ad-hoc goal</button><button class="${nr.mode==='pack'?'on':''}" onclick="setMode('pack')">Goalpack</button></div>
+        ${goalSection}</div>
       <div class="row">
         <div class="field"><label>Harness</label><div class="seg">${harnOpts||'<button class="on">mock</button>'}</div></div>
         <div class="field"><label>Tier floor</label><div class="seg">${['cheap','beefy'].map(t=>`<button class="${nr.tier===t?'on':''}" onclick="setTier('${t}')">${t}</button>`).join('')}</div></div>
@@ -591,16 +612,26 @@ function nrCapture(){const t=$('nr-target'),g=$('nr-goal'),r=$('nr-rounds');if(t
 function toggleCap(c){nrCapture();nr.openCaps.has(c)?nr.openCaps.delete(c):nr.openCaps.add(c);renderNewRun();}
 function setHarness(h){nrCapture();nr.harness=h;renderNewRun();}
 function setTier(t){nrCapture();nr.tier=t;renderNewRun();}
+function setMode(m){nrCapture();nr.mode=m;renderNewRun();}
+function pickPack(name){nrCapture();nr.goalpack=name;renderNewRun();}
 async function submitRun(){
   nrCapture();
-  const target=(nr.target||'').trim(),goal=(nr.goal||'').trim();
-  if(!target||!goal){alert('Target and goal are both required.');return;}
+  const target=(nr.target||'').trim();
+  if(!target){alert('Target is required.');return;}
+  const body={target,harness:nr.harness,tier:nr.tier,maxRounds:parseInt(nr.rounds)||8};
+  if(nr.mode==='pack'){
+    if(!nr.goalpack){alert('Pick a goalpack.');return;}
+    body.goalpack=nr.goalpack;
+  }else{
+    const goal=(nr.goal||'').trim();
+    if(!goal){alert('Goal is required.');return;}
+    body.goal=goal;
+  }
   try{
-    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({target,goal,harness:nr.harness,tier:nr.tier,maxRounds:parseInt(nr.rounds)||8})});
+    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
     if(d.error){alert('Launch failed: '+d.error);return;}
-    nr={harness:nr.harness,tier:nr.tier,rounds:8,openCaps:new Set(),target:'',goal:''};
+    nr={mode:nr.mode,harness:nr.harness,tier:nr.tier,rounds:8,openCaps:new Set(),target:'',goal:'',goalpack:null};
     showFleet();
   }catch(e){alert('Launch failed.');}
 }
