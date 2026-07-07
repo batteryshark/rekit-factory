@@ -400,9 +400,12 @@ Each phase ships something usable; observe lands before control.
   goal. *Distribution to build later, each just packaging those entry points:*
   an **npm package** for driving rekit under pi, an **opencode plugin**, and
   adapters for other harnesses (claude-code, codex) as they land.
-- **Light theme.** A second palette for less-technical operators. Deferred; the v2
-  mock ships a visible toggle affordance (stubbed). Needs a light token set + a
-  semantic-color remap (the accent green and status hues must stay legible on a
-  light ground).
+- **Light theme.** ✅ *built* — a `[data-theme=light]` token set (green darkened
+  for contrast) with a header toggle (◐) persisted in localStorage. The hardcoded
+  darks are now CSS vars so they flip cleanly.
+- **Stop / Re-run / stale-run reaper.** ✅ *built* — Stop now kills an in-flight pi
+  turn (process-group SIGKILL) not just between rounds; terminal cards get Re-run
+  (relaunch on the persisted project, re-derives nothing); a reaper clears zombie
+  "running" cards whose owning process died (pid-tracked).
 - **Mobile/remote decision push.** Route `question_posted` to a phone so decisions
   can be answered away from the desk — a second consumer of `inbox.jsonl`.
