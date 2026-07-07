@@ -250,6 +250,79 @@ def test_host_gate_records_lead_no_crash():
         assert not ledger.derivations, "unavailable skill records no derivation"
 
 
+# --------------------------------------------------------------------------------
+# (4) tree-summary surveys an arbitrary source tree (pure stdlib, read-only)
+# --------------------------------------------------------------------------------
+
+def test_tree_summary_surveys_source_tree():
+    """A fixture source tree fed to the ``tree-summary`` builtin via its ``run.sh``
+    yields both a JSON survey and a Markdown report: the JSON carries the right test
+    count and doc map, and the .md's ordered outline lists the docs and tests.
+
+    Runs the real ``scripts/run.sh <input> <out_dir>`` in a subprocess (with this
+    interpreter's dir on PATH so its ``python3`` resolves), the way the runner does —
+    pure stdlib, read-only, no host tool."""
+    import subprocess
+
+    skill_dir = builtin_skills_dir() / "tree-summary"
+    run_sh = skill_dir / "scripts" / "run.sh"
+    assert run_sh.is_file(), run_sh
+
+    with temp_home() as (_home, _skills_root, work):
+        # Build a small mixed source tree, plus noise dirs that must be skipped.
+        src = work / "project"
+        (src / "pkg").mkdir(parents=True)
+        (src / "tests").mkdir()
+        (src / "docs").mkdir()
+        (src / ".git").mkdir()               # noise: never descended into
+        (src / "node_modules" / "dep").mkdir(parents=True)  # noise
+        (src / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+        (src / "pkg" / "core.py").write_text("x = 1\n", encoding="utf-8")
+        (src / "tests" / "test_core.py").write_text("def test_x():\n    pass\n", encoding="utf-8")
+        (src / "README.md").write_text("# proj\n", encoding="utf-8")
+        (src / "docs" / "guide.md").write_text("# guide\n", encoding="utf-8")
+        (src / "CHANGELOG.md").write_text("## 0.1.0\n", encoding="utf-8")
+        (src / ".git" / "config").write_text("junk\n", encoding="utf-8")
+        (src / "node_modules" / "dep" / "index.js").write_text("junk\n", encoding="utf-8")
+
+        out_dir = work / "survey-out"
+
+        # Put this interpreter's dir first on PATH so run.sh's `python3` resolves to
+        # the venv/interpreter running the tests (there may be no other python3).
+        env = dict(os.environ)
+        env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+        proc = subprocess.run(
+            ["sh", str(run_sh), str(src), str(out_dir)],
+            capture_output=True, text=True, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+        # Both outputs exist under out_dir.
+        json_path = out_dir / "tree-summary.json"
+        md_path = out_dir / "tree-summary.md"
+        assert json_path.is_file(), out_dir
+        assert md_path.is_file(), out_dir
+
+        # The input tree was not modified (read-only).
+        assert not (src / "tree-summary.json").exists()
+
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        # Right test count (>= 1) — the tests/ dir and test_core.py both counted.
+        assert data["tests"]["count"] >= 1, data["tests"]
+        assert "tests/test_core.py" in data["tests"]["files"], data["tests"]
+        # Doc map lists both README.md and docs/guide.md.
+        assert "README.md" in data["docs"], data["docs"]
+        assert "docs/guide.md" in data["docs"], data["docs"]
+        # Noise dirs were skipped: no .js / node_modules content leaked into counts.
+        assert not any(f.startswith("node_modules") for f in data["docs"]), data["docs"]
+
+        md = md_path.read_text(encoding="utf-8")
+        # The ordered outline is present and catalogs the docs and tests.
+        assert "## Ordered outline" in md, md
+        assert "docs/guide.md" in md and "README.md" in md, md
+        assert "tests/test_core.py" in md, md
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
