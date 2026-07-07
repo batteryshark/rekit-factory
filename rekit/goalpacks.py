@@ -93,9 +93,14 @@ DEFAULT_RENDERER_MODULE = "renderer"
 #: frontmatter declares no explicit ``markdown:`` spec.
 DEFAULT_MARKDOWN_FUNC = "render_markdown"
 
+#: Function looked up in the renderer module for an HTML rendering when the
+#: frontmatter declares no explicit ``html:`` spec.
+DEFAULT_HTML_FUNC = "render_html"
+
 #: Artifact kinds a persisted report is recorded under in the ledger.
 REPORT_JSON_KIND = "report/json"
 REPORT_MARKDOWN_KIND = "report/markdown"
+REPORT_HTML_KIND = "report/html"
 
 
 @dataclass(frozen=True)
@@ -105,8 +110,10 @@ class Goalpack:
 
     ``renderer`` is a resolved callable ``(project, goalpack, loop_summary) -> dict``
     (the goalpack owns the shape it folds the ledger's generic findings into), or
-    ``None`` when the goalpack declares no report. ``render_markdown`` is an optional
-    ``(report: dict) -> str`` companion that turns that dict into a readable form.
+    ``None`` when the goalpack declares no report. ``render_markdown`` and
+    ``render_html`` are optional ``(report: dict) -> str`` companions that turn that
+    dict into a readable form (Markdown / a self-contained HTML document); either may
+    be ``None`` independently.
     """
 
     name: str
@@ -117,6 +124,7 @@ class Goalpack:
     renderer: Callable[..., dict[str, Any]] | None
     dir: Path
     render_markdown: Callable[[dict[str, Any]], str] | None = None
+    render_html: Callable[[dict[str, Any]], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -295,8 +303,11 @@ def run_goalpack(
     markdown = None
     if goalpack.render_markdown is not None:
         markdown = goalpack.render_markdown(report)
+    html = None
+    if goalpack.render_html is not None:
+        html = goalpack.render_html(report)
 
-    artifacts = _persist_report(project, goalpack, report, markdown, findings)
+    artifacts = _persist_report(project, goalpack, report, markdown, html, findings)
     return GoalpackResult(
         report=report,
         report_artifacts=artifacts,
@@ -313,10 +324,11 @@ def _persist_report(
     goalpack: Goalpack,
     report: dict[str, Any],
     markdown: str | None,
+    html: str | None,
     findings: list[dict],
 ) -> list[Artifact]:
-    """Write ``report.json`` (+ ``report.md``) and record them as ``report/*``
-    ledger artifacts.
+    """Write ``report.json`` (+ ``report.md`` + ``report.html``) and record them as
+    ``report/*`` ledger artifacts.
 
     The report is a **derived artifact** among many in the ledger: content-addressed,
     so re-running a goalpack that produces byte-identical report files is a no-op
@@ -344,6 +356,13 @@ def _persist_report(
         md_art = from_path(md_path, kind=REPORT_MARKDOWN_KIND, meta=dict(meta))
         project.add_artifact(md_art)
         artifacts.append(md_art)
+
+    if html is not None:
+        html_path = reports_dir / "report.html"
+        html_path.write_text(html, encoding="utf-8")
+        html_art = from_path(html_path, kind=REPORT_HTML_KIND, meta=dict(meta))
+        project.add_artifact(html_art)
+        artifacts.append(html_art)
 
     return artifacts
 
@@ -379,10 +398,11 @@ def _load_from_dir(directory: Path) -> Goalpack:
     if prompt_path.is_file():
         system_prompt = prompt_path.read_text(encoding="utf-8")
 
-    renderer, render_markdown = _resolve_reporting(
+    renderer, render_markdown, render_html = _resolve_reporting(
         directory,
         str(meta.get("renderer") or "").strip(),
         str(meta.get("markdown") or "").strip(),
+        str(meta.get("html") or "").strip(),
     )
 
     return Goalpack(
@@ -394,25 +414,32 @@ def _load_from_dir(directory: Path) -> Goalpack:
         renderer=renderer,
         dir=directory,
         render_markdown=render_markdown,
+        render_html=render_html,
     )
 
 
 def _resolve_reporting(
-    directory: Path, renderer_spec: str, markdown_spec: str
-) -> tuple[Callable[..., dict[str, Any]] | None, Callable[[dict[str, Any]], str] | None]:
-    """Resolve the optional ``renderer`` and ``markdown`` callables for a goalpack.
+    directory: Path, renderer_spec: str, markdown_spec: str, html_spec: str = "",
+) -> tuple[
+    Callable[..., dict[str, Any]] | None,
+    Callable[[dict[str, Any]], str] | None,
+    Callable[[dict[str, Any]], str] | None,
+]:
+    """Resolve the optional ``renderer`` + ``markdown`` + ``html`` callables for a goalpack.
 
     Reporting is optional: with no ``renderer:`` frontmatter **and** no
-    ``renderer.py`` on disk, this returns ``(None, None)`` — a valid goalpack that
-    produces no report. When a renderer is present, an accompanying markdown function
-    is resolved from the explicit ``markdown:`` spec, else from a ``render_markdown``
-    function in the renderer module if one exists (else ``None`` → JSON-only report).
+    ``renderer.py`` on disk, this returns ``(None, None, None)`` — a valid goalpack
+    that produces no report. When a renderer is present, the ``markdown`` and ``html``
+    companions are resolved from their explicit ``markdown:`` / ``html:`` specs, else
+    from ``render_markdown`` / ``render_html`` functions in the renderer module if they
+    exist (each independently ``None`` when absent — a goalpack may render any subset of
+    JSON / Markdown / HTML).
     """
     default_module = directory / f"{DEFAULT_RENDERER_MODULE}.py"
 
     # No renderer declared and no default module → this goalpack produces no report.
     if not renderer_spec and not default_module.is_file():
-        return None, None
+        return None, None, None
 
     renderer = _resolve_callable(directory, renderer_spec, DEFAULT_RENDERER_MODULE)
 
@@ -423,7 +450,14 @@ def _resolve_reporting(
         # Fall back to a render_markdown in the renderer module, if present.
         render_markdown = _optional_callable(directory, DEFAULT_RENDERER_MODULE, DEFAULT_MARKDOWN_FUNC)
 
-    return renderer, render_markdown
+    render_html: Callable[[dict[str, Any]], str] | None = None
+    if html_spec:
+        render_html = _resolve_callable(directory, html_spec, DEFAULT_RENDERER_MODULE)
+    else:
+        # Fall back to a render_html in the renderer module, if present.
+        render_html = _optional_callable(directory, DEFAULT_RENDERER_MODULE, DEFAULT_HTML_FUNC)
+
+    return renderer, render_markdown, render_html
 
 
 def _resolve_callable(directory: Path, spec: str, default_module: str) -> Callable[..., Any]:

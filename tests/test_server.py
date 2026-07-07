@@ -218,7 +218,11 @@ def _drop_report_goalpack(name="mcd"):
         "    return {'title': 'Report', 'findings': [f.get('note') for f in project.ledger.findings()]}\n"
         "def render_markdown(report):\n"
         "    return '# ' + report['title'] + '\\n\\n## Findings\\n' + "
-        "'\\n'.join('- ' + str(x) for x in report['findings']) + '\\n'\n",
+        "'\\n'.join('- ' + str(x) for x in report['findings']) + '\\n'\n"
+        "def render_html(report):\n"
+        "    items = ''.join('<li>' + str(x) + '</li>' for x in report['findings'])\n"
+        "    return '<!doctype html><html><body><h1>' + report['title'] + "
+        "'</h1><ul>' + items + '</ul></body></html>'\n",
         encoding="utf-8")
 
 
@@ -236,6 +240,9 @@ def test_report_route_with_a_rendered_report():
         status, data = _body(handle("GET", f"/api/report?id={project.id}", root=projects_root()))
         assert status == 200 and data["hasReport"] is True
         assert "Findings" in (data["markdown"] or "")
+        # A goalpack that renders HTML has its self-contained document surfaced too.
+        assert (data["html"] or "").startswith("<!doctype html>")
+        assert "<li>" in (data["html"] or "")
         assert data["meta"].get("goalpack") == "mcd"
 
 

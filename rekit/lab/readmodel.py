@@ -38,6 +38,7 @@ SUSPENDED = "suspended"
 #: ``goalpacks._persist_report`` — kept as literals so this stays a light leaf).
 REPORT_MARKDOWN_KIND = "report/markdown"
 REPORT_JSON_KIND = "report/json"
+REPORT_HTML_KIND = "report/html"
 
 #: Fleet sort order: what needs a human first, finished work last.
 _RANK = {BLOCKED: 0, SUSPENDED: 1, _runlog.RUNNING: 2,
@@ -172,7 +173,7 @@ def project_detail(project_dir: str | Path) -> dict[str, Any]:
         for (_t, ih), dv in ledger.derivations.items()
     ]
     view["hasReport"] = any(
-        e.artifact.kind in (REPORT_MARKDOWN_KIND, REPORT_JSON_KIND)
+        e.artifact.kind in (REPORT_HTML_KIND, REPORT_MARKDOWN_KIND, REPORT_JSON_KIND)
         for e in ledger.entries.values())
     view["events"] = event_stream(d)
     return view
@@ -191,31 +192,39 @@ def _read_text(path: str | None) -> str | None:
 def project_report(project_dir: str | Path) -> dict[str, Any]:
     """The goalpack's rendered report for one project, read from disk (E7.1).
 
-    Finds the ``report/markdown`` and ``report/json`` artifacts in the ledger and
-    reads their content. Returns ``{"hasReport", "markdown", "json", "meta"}`` —
-    ``markdown``/``json`` are None when the goalpack rendered no report (an
-    *act*-goal) or nothing has run yet. The last-recorded report wins, so a re-run
-    shows the freshest one.
+    Finds the ``report/html``, ``report/markdown`` and ``report/json`` artifacts in
+    the ledger and reads their content. Returns
+    ``{"hasReport", "html", "markdown", "json", "meta"}`` — each render is None when
+    the goalpack did not produce it (a goalpack may render any subset; an *act*-goal
+    produces none), or nothing has run yet. ``html`` is a self-contained document the
+    UI renders in an isolated frame and is preferred over ``markdown`` when present.
+    The last-recorded report wins, so a re-run shows the freshest one.
     """
     d = Path(project_dir)
     ledger = _load_ledger(d / LEDGER_FILENAME)
-    markdown = json_text = None
+    html = markdown = json_text = None
     meta: dict[str, Any] = {}
     for e in ledger.entries.values():
         a = e.artifact
-        if a.kind == REPORT_MARKDOWN_KIND:
+        if a.kind == REPORT_HTML_KIND:
+            text = _read_text(a.path)
+            if text is not None:
+                html = text
+                meta = dict(a.meta or {})
+        elif a.kind == REPORT_MARKDOWN_KIND:
             text = _read_text(a.path)
             if text is not None:
                 markdown = text
-                meta = dict(a.meta or {})
+                if not meta:
+                    meta = dict(a.meta or {})
         elif a.kind == REPORT_JSON_KIND:
             text = _read_text(a.path)
             if text is not None:
                 json_text = text
                 if not meta:
                     meta = dict(a.meta or {})
-    return {"hasReport": bool(markdown or json_text),
-            "markdown": markdown, "json": json_text, "meta": meta}
+    return {"hasReport": bool(html or markdown or json_text),
+            "html": html, "markdown": markdown, "json": json_text, "meta": meta}
 
 
 def fleet(root: str | Path | None = None) -> list[dict[str, Any]]:

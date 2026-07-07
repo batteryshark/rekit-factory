@@ -121,6 +121,19 @@ def render_markdown(report):
             lines.append("- " + entry["text"])
         lines.append("")
     return "\\n".join(lines).rstrip() + "\\n"
+
+
+def render_html(report):
+    name = report.get("summary", {}).get("goalpack", "fixture")
+    parts = ["<!doctype html><html><head><meta charset=\\"utf-8\\">",
+             "<title>" + name + "</title></head><body>", "<h1>" + name + "</h1>"]
+    for lens in LENSES:
+        parts.append("<h2>" + lens + "</h2><ul>")
+        for entry in report.get(lens, []):
+            parts.append("<li>" + entry["text"] + "</li>")
+        parts.append("</ul>")
+    parts.append("</body></html>")
+    return "".join(parts)
 '''
 
 
@@ -309,9 +322,9 @@ def test_run_goalpack_drives_loop_and_records_report_artifact():
         assert summary["counts"] == {"does": 1, "decides": 1, "brittle": 1, "surprising": 1}
         assert summary["done"] is True
 
-        # The report is a first-class ledger artifact: report/json + report/markdown.
+        # The report is a first-class ledger artifact: report/json + markdown + html.
         kinds = {a.kind for a in result.report_artifacts}
-        assert kinds == {"report/json", "report/markdown"}, kinds
+        assert kinds == {"report/json", "report/markdown", "report/html"}, kinds
         for art in result.report_artifacts:
             assert art.meta.get("goalpack") == "fixture"
             assert art.meta.get("findingCount") == 4
@@ -319,15 +332,19 @@ def test_run_goalpack_drives_loop_and_records_report_artifact():
         for art in result.report_artifacts:
             assert ledger.has_artifact(art.content_hash), "report should be in the ledger"
 
-        # report.json / report.md exist on disk under the project.
+        # report.json / report.md / report.html exist on disk under the project.
         json_path = project.dir / "reports" / "fixture" / "report.json"
         md_path = project.dir / "reports" / "fixture" / "report.md"
+        html_path = project.dir / "reports" / "fixture" / "report.html"
         assert json_path.is_file(), "report.json should be written under the project"
         assert md_path.is_file(), "report.md should be written under the project"
+        assert html_path.is_file(), "report.html should be written under the project"
         on_disk = json.loads(json_path.read_text(encoding="utf-8"))
         assert on_disk["summary"]["total"] == 4
         md_text = md_path.read_text(encoding="utf-8")
         assert "greeting" in md_text
+        html_text = html_path.read_text(encoding="utf-8")
+        assert html_text.startswith("<!doctype html>") and "greeting" in html_text
 
         # The findings are durable in the ledger — the generic substrate rendered from.
         assert len(ledger.findings()) == 4
@@ -341,7 +358,9 @@ def test_run_goalpack_drives_loop_and_records_report_artifact():
 
         report_again = gp.renderer(project, gp, result.summary)
         md_again = gp.render_markdown(report_again)
-        arts_again = _persist_report(project, gp, report_again, md_again, ledger.findings())
+        html_again = gp.render_html(report_again) if gp.render_html else None
+        arts_again = _persist_report(
+            project, gp, report_again, md_again, html_again, ledger.findings())
         assert {a.content_hash for a in arts_again} == {
             a.content_hash for a in result.report_artifacts
         }, "same report → same content hash (no-op)"
@@ -424,6 +443,7 @@ def test_no_renderer_goalpack_produces_no_report():
         gp = load_goalpack_from_path(gp_dir)
         assert gp.renderer is None, "a goalpack with no renderer.py declares no report"
         assert gp.render_markdown is None
+        assert gp.render_html is None
 
         adapter = MockAdapter(
             [MockTurn(text="FINDING: [does] patched the config loader\nDONE\n")]

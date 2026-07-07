@@ -378,6 +378,7 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .ev .ts{color:var(--ink4);flex-shrink:0}.ev .ty{flex-shrink:0;width:104px;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ev .m{color:var(--ink2);min-width:0}
 .ev.run{border-left-color:var(--green)}.ev.run .ty{color:var(--green)}.ev.ledger .ty{color:var(--teal)}
 .empty2{color:var(--ink3);font-size:12.5px;padding:8px 0}
+.reportframe{width:100%;border:0;height:78vh;background:#fff;border-radius:8px;display:block}
 .report{font-size:13.5px;line-height:1.6;color:var(--ink2)}
 .report h1{font-size:19px;color:var(--ink);margin:2px 0 12px;font-weight:700}
 .report h2{font-size:15px;color:var(--ink);margin:20px 0 8px;font-family:var(--mono)}
@@ -526,7 +527,7 @@ function render(data){
   renderDecisions(f);
   $('fleet').innerHTML=f.length?f.map(card).join(''):'<div class="empty">no projects yet — start a run from the CLI</div>';
 }
-let view='fleet',currentId=null,currentTab='overview',lastDetail=null,actFilter='all',reportCache={};
+let view='fleet',currentId=null,currentTab='overview',lastDetail=null,actFilter='all',reportCache={},lastDetailKey=null;
 let nr={mode:'adhoc',harness:'mock',tier:'cheap',rounds:8,openCaps:new Set(),target:'',goal:'',goalpack:null};
 function tick(){$('tick').textContent='live · '+new Date().toLocaleTimeString();}
 function fail(){$('tick').textContent='reconnecting…';}
@@ -534,7 +535,7 @@ function refresh(){if(view==='detail')return pollDetail();if(view==='fleet')retu
 const VIEWS=['fleet-view','detail-view','newrun-view','skills-view','settings-view'];
 function hideAll(){VIEWS.forEach(id=>$(id).style.display='none');}
 function navHL(){['fleet','skills','settings'].forEach(n=>{const b=$('nav-'+n);if(b)b.classList.toggle('on',view===n);});}
-function openProject(id){view='detail';currentId=id;currentTab='overview';actFilter='all';lastDetail=null;delete reportCache[id];
+function openProject(id){view='detail';currentId=id;currentTab='overview';actFilter='all';lastDetail=null;lastDetailKey=null;delete reportCache[id];
   hideAll();const dv=$('detail-view');dv.style.display='';dv.innerHTML='<div class="empty">loading…</div>';navHL();pollDetail();}
 function showFleet(){view='fleet';currentId=null;hideAll();$('fleet-view').style.display='';navHL();pollFleet();}
 function showSkills(){view='skills';hideAll();$('skills-view').style.display='';navHL();renderSkills();}
@@ -558,7 +559,12 @@ function termBtns(v){
 async function pollFleet(){try{const r=await fetch('/api/fleet');render(await r.json());tick();}catch(e){fail();}}
 async function pollDetail(){if(!currentId)return;try{
     const r=await fetch('/api/project?id='+encodeURIComponent(currentId));const v=await r.json();
-    if(v.error){showFleet();return;}renderDetail(v);tick();
+    if(v.error){showFleet();return;}
+    // Skip the re-render (which would recreate the report iframe and reload it) when
+    // the detail data is unchanged — the poll only needs to refresh on real change.
+    const key=JSON.stringify(v);
+    if(key!==lastDetailKey){lastDetailKey=key;renderDetail(v);}else{lastDetail=v;}
+    tick();
   }catch(e){fail();}}
 function counter(v,color,label){return `<div class="c"><div class="v" style="color:${color}">${v}</div><div class="l">${label}</div></div>`;}
 async function fetchReport(id){
@@ -611,7 +617,14 @@ function renderDetail(v){
     let rep='';
     if(v.hasReport){
       const rc=reportCache[v.id];
-      if(rc){rep=`<div class="panel"><h3>Report${rc.meta&&rc.meta.goalpack?' · '+esc(rc.meta.goalpack):''}</h3><div class="report">${rc.markdown?mdToHtml(rc.markdown):(rc.json?`<pre>${esc(rc.json)}</pre>`:'<div class="empty2">report is empty</div>')}</div></div>`;}
+      if(rc){
+        const hd=`<h3>Report${rc.meta&&rc.meta.goalpack?' · '+esc(rc.meta.goalpack):''}</h3>`;
+        // A goalpack's own HTML render is a self-contained, styled document — show it
+        // in an isolated frame (set via srcdoc after mount). Fall back to markdown/json.
+        const body=rc.html?`<iframe id="reportFrame" class="reportframe" sandbox="allow-same-origin"></iframe>`
+          :`<div class="report">${rc.markdown?mdToHtml(rc.markdown):(rc.json?`<pre>${esc(rc.json)}</pre>`:'<div class="empty2">report is empty</div>')}</div>`;
+        rep=`<div class="panel">${hd}${body}</div>`;
+      }
       else{rep=`<div class="panel"><h3>Report</h3><div class="empty2">loading…</div></div>`;fetchReport(v.id);}
     }
     const dv=derivs.length?`<div class="panel"><h3>Produced files · ${derivs.length}</h3>`+derivs.map(d=>`<div class="deriv"><span class="dt">${esc(d.transform)}</span>${d.capability?`<span class="dc">${esc(d.capability)}</span>`:''}<div class="douts">${(d.outputs||[]).map(o=>`<div class="dout">⇢ ${esc(o.path||o.id)}<span class="k">${esc(o.kind)}</span></div>`).join('')||'<span class="empty2">no output files</span>'}</div></div>`).join('')+`</div>`:'';
@@ -630,6 +643,17 @@ function renderDetail(v){
       <span>${esc(r.harness||'—')} <b class="teal">${esc(r.model||'')}</b></span><span>spend <b>$${(cost.usd||0).toFixed(2)}</b></span></div>
     <div class="tabs">${tabBtn('overview','Overview')}${tabBtn('outputs','Outputs',outCount||null)}${tabBtn('ledger','Ledger',find.length)}${tabBtn('activity','Activity',evs.length)}</div>
     <div class="pane">${pane}</div>`;
+  // The HTML report frame renders a document we generated; srcdoc is set as a
+  // property (no attribute-escaping) and the frame auto-sizes to its content.
+  if(currentTab==='outputs'){
+    const rc=reportCache[currentId];
+    if(rc&&rc.html){
+      // The report is a self-contained styled document; render it in a fixed-height
+      // frame (set via srcdoc — no attribute-escaping) that scrolls internally.
+      const f=document.getElementById('reportFrame');
+      if(f) f.srcdoc=rc.html;
+    }
+  }
 }
 async function renderNewRun(){
   let harn=[],cat={capabilities:[]},packs=[];
