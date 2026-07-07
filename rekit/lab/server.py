@@ -361,6 +361,8 @@ button{font-family:var(--sans);cursor:pointer;border:0;border-radius:8px;padding
 .dtitle{font-family:var(--mono);font-weight:600;font-size:18px}
 .dgoal{color:var(--ink2);font-size:13px;margin:0 0 14px;line-height:1.4}
 .kv{display:flex;gap:14px;font-family:var(--mono);font-size:12px;color:var(--ink3);flex-wrap:wrap;margin-bottom:16px}
+.kv .hb{color:var(--green)}.kv .hb::first-letter{color:var(--green);animation:hbpulse 1.4s ease-in-out infinite}
+@keyframes hbpulse{0%,100%{opacity:1}50%{opacity:.25}}
 .kv b{color:var(--ink)}.kv .teal{color:var(--teal)}
 .tabs{display:flex;gap:3px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:4px;margin-bottom:16px;width:fit-content}
 .tab{font-family:var(--mono);font-size:12px;color:var(--ink3);padding:7px 14px;border-radius:6px;background:none;display:flex;gap:6px;align-items:center}
@@ -560,13 +562,29 @@ async function pollFleet(){try{const r=await fetch('/api/fleet');render(await r.
 async function pollDetail(){if(!currentId)return;try{
     const r=await fetch('/api/project?id='+encodeURIComponent(currentId));const v=await r.json();
     if(v.error){showFleet();return;}
-    // Skip the re-render (which would recreate the report iframe and reload it) when
-    // the detail data is unchanged — the poll only needs to refresh on real change.
+    // Re-render on change; also re-render every poll while a run is in flight so the
+    // round heartbeat (elapsed seconds) keeps ticking. For a settled run we skip the
+    // re-render when the data is unchanged, so the report iframe isn't reloaded.
     const key=JSON.stringify(v);
-    if(key!==lastDetailKey){lastDetailKey=key;renderDetail(v);}else{lastDetail=v;}
+    const active=v.status==='running'||v.status==='blocked'||v.status==='suspended';
+    if(active||key!==lastDetailKey){lastDetailKey=key;renderDetail(v);}else{lastDetail=v;}
     tick();
   }catch(e){fail();}}
 function counter(v,color,label){return `<div class="c"><div class="v" style="color:${color}">${v}</div><div class="l">${label}</div></div>`;}
+// A skill's availability chip. The skill itself is installed (it's on disk under
+// $REKIT_HOME/skills); "available" only reflects whether its host tool resolves. So
+// a host-gated skill missing its tool reads "needs <tool>", not "not installed".
+function skillTag(s){
+  if(s.available) return `<span class="ttier ${s.tier==='read-only'?'ro':'gated'}">${esc(s.tier)}</span>`;
+  if(s.host) return `<span class="ttier na" title="skill installed — host tool not found">needs ${esc(s.host)}</span>`;
+  return `<span class="ttier na">unavailable</span>`;
+}
+// Elapsed since the current round started, as a compact "47s" / "2m03s" heartbeat.
+function roundElapsed(ts){
+  const t=Date.parse(ts); if(isNaN(t)) return '';
+  const s=Math.max(0,Math.round((Date.now()-t)/1000));
+  return s<60?s+'s':Math.floor(s/60)+'m'+String(s%60).padStart(2,'0');
+}
 async function fetchReport(id){
   try{const r=await (await fetch('/api/report?id='+encodeURIComponent(id))).json();
     reportCache[id]=r;
@@ -640,7 +658,7 @@ function renderDetail(v){
       <span class="dtitle">${esc(v.id)}</span><span class="pill ${PILL[v.status]||'p-idle'}">${esc(v.status)}</span>${termBtns(v)}</div>
     <div class="dgoal">${esc(r.goal||'—')}</div>
     <div class="kv"><span>R <b>${r.round||0}/${r.maxRounds||0}</b></span><span>tier <b>${esc(r.tier||'—')}</b></span>
-      <span>${esc(r.harness||'—')} <b class="teal">${esc(r.model||'')}</b></span><span>spend <b>$${(cost.usd||0).toFixed(2)}</b></span></div>
+      <span>${esc(r.harness||'—')} <b class="teal">${esc(r.model||'')}</b></span><span>spend <b>$${(cost.usd||0).toFixed(2)}</b></span>${v.status==='running'&&r.roundStartedAt?`<span class="hb">● round ${r.round} · ${roundElapsed(r.roundStartedAt)}</span>`:''}</div>
     <div class="tabs">${tabBtn('overview','Overview')}${tabBtn('outputs','Outputs',outCount||null)}${tabBtn('ledger','Ledger',find.length)}${tabBtn('activity','Activity',evs.length)}</div>
     <div class="pane">${pane}</div>`;
   // The HTML report frame renders a document we generated; srcdoc is set as a
@@ -664,7 +682,7 @@ async function renderNewRun(){
   const caps=(cat.capabilities||[]).map(c=>{
     const open=nr.openCaps.has(c.capability);
     return `<div class="capgrp ${open?'open':''}"><div class="h" onclick="toggleCap('${c.capability}')"><span class="cn">${esc(c.capability)}</span><span class="cc">${c.skills.length}</span></div>
-      <div class="b">${c.skills.map(s=>`<div class="skrow"><span class="sn">${esc(s.name)}</span><div class="meta"><span class="ttier ${s.available?(s.tier==='read-only'?'ro':'gated'):'na'}">${s.available?esc(s.tier):'not installed'}</span></div></div>`).join('')}</div></div>`;
+      <div class="b">${c.skills.map(s=>`<div class="skrow"><span class="sn">${esc(s.name)}</span><div class="meta">${skillTag(s)}</div></div>`).join('')}</div></div>`;
   }).join('');
   const goalSection = nr.mode==='pack'
     ? (packs.length?`<div class="gp-grid">${packs.map(g=>`<button class="gp ${nr.goalpack===g.name?'on':''}" onclick="pickPack('${g.name}')"><div class="gpn">${esc(g.title||g.name)}</div><div class="gpd">${esc(g.goal||'')}</div><div class="gpm">${(g.capabilities||[]).map(esc).join(' · ')||'auto-scoped'}${g.rendersReport?' · renders report':''}</div></button>`).join('')}</div>`:`<div class="empty2">no goalpacks in $REKIT_HOME/goalpacks</div>`)
@@ -718,7 +736,7 @@ async function renderSkills(){
   try{cat=await (await fetch('/api/skills')).json();}catch(e){}
   try{harn=(await (await fetch('/api/harnesses')).json()).harnesses||[];}catch(e){}
   const caps=(cat.capabilities||[]).map(c=>`<div class="capgrp open"><div class="h"><span class="cn">${esc(c.capability)}</span><span class="cc">${c.skills.length}</span></div>
-    <div class="b">${c.skills.map(s=>`<div class="skrow"><span class="sn">${esc(s.name)}</span><div class="meta"><span style="color:var(--ink3);font-size:11px">accepts ${esc((s.accepts||[]).join(', ')||'any')}</span><span class="ttier ${s.available?(s.tier==='read-only'?'ro':'gated'):'na'}">${s.available?esc(s.tier):'not installed'}</span></div></div>`).join('')}</div></div>`).join('');
+    <div class="b">${c.skills.map(s=>`<div class="skrow"><span class="sn">${esc(s.name)}</span><div class="meta"><span style="color:var(--ink3);font-size:11px">accepts ${esc((s.accepts||[]).join(', ')||'any')}</span>${skillTag(s)}</div></div>`).join('')}</div></div>`).join('');
   const hs=harn.map(h=>`<div class="hrow"><div><div class="hn">${esc(h.name)}</div><div class="hd">${esc(h.description)}</div></div><span class="hs ${h.status}">${esc(h.status)}</span></div>`).join('');
   $('skills-view').innerHTML=`<h2>Skills · ${cat.total||0} in the rack</h2>${caps||'<div class="empty2">none discovered</div>'}
     <h2 style="margin-top:26px">Harnesses</h2>${hs}`;

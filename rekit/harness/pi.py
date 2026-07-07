@@ -226,20 +226,56 @@ class PiAdapter(HarnessAdapter):
         )
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """SIGKILL pi's whole process group, then reap. Best-effort, never raises.
+def _descendants(pid: int) -> list[int]:
+    """Every transitive child PID of ``pid`` (best-effort, via ``ps``; [] on failure).
 
-    pi may spawn its own children (the model client). Killing only the group
-    leader would leave them orphaned *and* holding the stdout/stderr pipes open,
-    so the reaping ``communicate()`` would block until they exit — defeating the
-    Stop. ``start_new_session=True`` put pi in its own group; kill the group.
+    pi can spawn workers in their *own* session/group (an agentic CLI shelling out),
+    which escape ``killpg`` on pi's group. We enumerate the process tree so those can
+    be reaped too. Collected *before* the group kill — once the leader dies its
+    children reparent to init and the ppid links break.
     """
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid,ppid"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kids: dict[int, list[int]] = {}
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            kids.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: list[int] = []
+    stack = [pid]
+    while stack:
+        for child in kids.get(stack.pop(), []):
+            found.append(child)
+            stack.append(child)
+    return found
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """SIGKILL pi's whole process group + any escaped descendants, then reap.
+
+    Best-effort, never raises. pi may spawn its own children (the model client).
+    Killing only the group leader would leave them orphaned *and* holding the
+    stdout/stderr pipes open, so the reaping ``communicate()`` would block until they
+    exit — defeating the Stop. ``start_new_session=True`` put pi in its own group;
+    kill the group, and also SIGKILL any descendant that spawned into its own group
+    (observed: pi workers surviving a Stop and burning CPU).
+    """
+    escaped = _descendants(proc.pid)
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             proc.kill()
         except Exception:  # noqa: BLE001
+            pass
+    for cpid in escaped:
+        try:
+            os.kill(cpid, signal.SIGKILL)
+        except OSError:
             pass
     try:
         proc.communicate(timeout=5)

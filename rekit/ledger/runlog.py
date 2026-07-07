@@ -92,6 +92,10 @@ class RunState:
     tokens_out: int = 0
     started_at: str = ""
     ended_at: str = ""
+    #: When the current in-flight round started (its ``round_started`` ts), or "" when
+    #: no round is running — lets the UI show "waiting on round N (Xs)" so a long brain
+    #: call reads as alive, not stuck. Cleared on round_ended / run_ended.
+    round_started_at: str = ""
     done: bool = False
     seq: int = 0
 
@@ -122,6 +126,7 @@ class RunState:
             },
             "startedAt": self.started_at,
             "endedAt": self.ended_at,
+            "roundStartedAt": self.round_started_at,
             "done": self.done,
             "seq": self.seq,
         }
@@ -147,7 +152,9 @@ def _apply(state: RunState, event: _events.Event) -> None:
         if p.get("tier"):
             state.tier = p["tier"]
         state.status = RUNNING
+        state.round_started_at = event.ts
     elif t == ROUND_ENDED:
+        state.round_started_at = ""  # the round returned — no longer in flight
         state.findings += int(p.get("findings") or 0)
         state.leads += int(p.get("leads") or 0)
         state.derivations += int(p.get("derivations") or 0)
@@ -171,6 +178,7 @@ def _apply(state: RunState, event: _events.Event) -> None:
         state.reason = p.get("reason", state.reason)
         state.status = p.get("status") or (DONE if state.done else IDLE)
         state.ended_at = event.ts
+        state.round_started_at = ""  # run is over — nothing in flight
     # else: unknown/forward-compatible type -> no-op.
     if event.seq > state.seq:
         state.seq = event.seq

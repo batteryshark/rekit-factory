@@ -35,7 +35,7 @@ from ..harness import MockAdapter, MockTurn
 from ..harness.base import HarnessAdapter
 from ..human import LedgerHumanChannel
 from ..ledger import open_project
-from ..ledger.runlog import RunLog
+from ..ledger.runlog import FAILED, RunLog
 from ..loop import run as _run
 from ..skills.registry import Registry
 
@@ -141,8 +141,19 @@ class Supervisor:
                         max_rounds=max_rounds,
                         cancel=cancel,
                     )
-            except Exception:  # noqa: BLE001 — a run thread must never crash the process.
-                pass
+            except Exception as exc:  # noqa: BLE001 — a run thread must never crash the process.
+                # The loop raised mid-round (e.g. a harness timeout) before it could
+                # write its terminal run_ended, so the run would show 'running'
+                # forever — and the pid-based reaper can't help, because the owning
+                # pid is this long-lived serve process. Terminalize it here so the
+                # card resolves to 'failed' instead of freezing.
+                try:
+                    RunLog(project.dir).run_ended(
+                        done=False, status=FAILED,
+                        reason=f"run error: {type(exc).__name__}: {exc}"[:200],
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             finally:
                 with self._lock:
                     # Only drop our own handle: a relaunch may already have replaced it.

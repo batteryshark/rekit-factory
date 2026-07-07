@@ -26,9 +26,10 @@ from pathlib import Path
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 
+from rekit.harness.base import HarnessAdapter, HarnessError  # noqa: E402
 from rekit.lab.supervisor import Supervisor  # noqa: E402
 from rekit.ledger import open_project  # noqa: E402
-from rekit.ledger.runlog import RUN_LOG_FILENAME, load_run_state  # noqa: E402
+from rekit.ledger.runlog import FAILED, RUN_LOG_FILENAME, load_run_state  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -107,6 +108,34 @@ def test_running_ids_tracks_then_clears():
         # After completion the thread unregistered itself: not running, not listed.
         assert not sup.is_running(pid)
         assert pid not in sup.running_ids()
+
+
+class _BoomAdapter(HarnessAdapter):
+    """A brain that raises mid-round — stands in for a harness timeout/error."""
+
+    name = "boom"
+
+    def invoke(self, *args, **kwargs):  # noqa: D401
+        raise HarnessError("boom: the brain call blew up")
+
+
+def test_run_that_raises_is_terminalized_not_left_running():
+    """If the loop raises mid-round (e.g. a harness timeout), the supervisor writes a
+    terminal run_ended so the run resolves to 'failed' instead of freezing at
+    'running' forever (the pid-based reaper can't help — the owning pid is serve)."""
+    with _temp_home():
+        target = _target("boom.dat")
+        sup = Supervisor()
+        sup._build_adapter = lambda harness: _BoomAdapter()  # inject a raising brain
+        pid = sup.launch(str(target), "goal that errors", harness="mock", max_rounds=3)
+
+        _await_idle(sup, pid)
+        assert not sup.is_running(pid), "the errored run's thread should have unwound"
+
+        state = load_run_state(Path(open_project(str(target)).dir) / RUN_LOG_FILENAME)
+        assert state.status == FAILED, f"a raised run must terminalize to failed, got {state.status!r}"
+        assert state.ended_at, "a terminal run_ended must be written (not stuck at round_started)"
+        assert state.round_started_at == "", "the in-flight round marker must clear on run_ended"
 
 
 def test_pi_harness_launch_never_crashes():
