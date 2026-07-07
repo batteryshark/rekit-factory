@@ -361,8 +361,10 @@ Each phase ships something usable; observe lands before control.
   → `loop.run`) and **stops** them via `loop.run`'s cooperative `cancel` Event;
   `POST /api/run` + `POST /api/stop`; the client's **New Run composer**
   (target / goal / harness / tier / rack) and Stop buttons. *Acc met:* start a run
-  from the UI with target + goal; stop it. ⏳ *later:* pause/resume, retry, launch
-  a goalpack, wiring the composer's rack selection to `requested_capabilities`.
+  from the UI with target + goal; stop it. **Re-run** relaunches a terminal card,
+  and the composer can now **launch a goalpack** (Ad-hoc / Goalpack toggle;
+  `run_goalpack` with runlog+cancel; `GET /api/goalpacks`). ⏳ *later:* true
+  pause/resume, wiring the composer's rack selection to `requested_capabilities`.
 - **E7.5 · Harness picker + sidecar.** ✅ *partial* — `lab/catalog.harnesses`
   + a harness picker in the composer + a Skills/Harness screen (`GET /api/skills`,
   `GET /api/harnesses`). *Acc met (picker):* choose pi vs mock at launch. ⏳ *later:*
