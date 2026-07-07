@@ -23,8 +23,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
 
 from rekit.harness import MockAdapter, MockTurn  # noqa: E402
 from rekit.human import post_question  # noqa: E402
-from rekit.lab import BLOCKED, SUSPENDED, fleet, health, project_detail, project_view  # noqa: E402
+from rekit.lab import (  # noqa: E402
+    BLOCKED,
+    SUSPENDED,
+    fleet,
+    health,
+    project_detail,
+    project_view,
+    reap_stale,
+)
 from rekit.ledger import open_project  # noqa: E402
+from rekit.ledger.events import Event, utc_now  # noqa: E402
 from rekit.ledger.runlog import RunLog  # noqa: E402
 from rekit.loop import run  # noqa: E402
 
@@ -139,6 +148,46 @@ def test_health_counts():
         h = health(fleet())
         assert h["total"] == 3
         assert h.get("running") == 1 and h.get("done") == 1 and h.get(BLOCKED) == 1
+
+
+def _running_project(name, pid, *, pending=None):
+    """A project frozen mid-run: a lone run_started with a chosen owning pid."""
+    ws = tempfile.mkdtemp(prefix="rekit-target-")
+    target = Path(ws) / name
+    target.write_bytes(b"bytes-" + name.encode())
+    p = open_project(str(target))
+    ev = Event(seq=1, type="run_started", ts=utc_now(),
+               payload={"goal": "g " + name, "harness": "pi", "tier": "cheap",
+                        "maxRounds": 8, "pid": pid})
+    (p.dir / "run.jsonl").write_text(ev.to_json_line(), encoding="utf-8")
+    if pending:
+        post_question(p.dir, *pending)
+    return p
+
+
+def test_reap_stale_marks_dead_pid_run_idle():
+    with _temp_home():
+        p = _running_project("zombie.bin", 0)          # no owning process
+        assert project_view(p.dir)["status"] == "running"
+        reaped = reap_stale()
+        assert p.id in reaped
+        assert project_view(p.dir)["status"] == "idle"
+
+
+def test_reap_stale_leaves_live_pid_run():
+    with _temp_home():
+        p = _running_project("live.bin", os.getpid())  # this test process is alive
+        assert reap_stale() == []
+        assert project_view(p.dir)["status"] == "running"
+
+
+def test_reap_clears_pending_of_dead_run():
+    with _temp_home():
+        p = _running_project("blk.so", 0, pending=("confirm", "allow ghidra?"))
+        assert project_view(p.dir)["status"] == BLOCKED   # pending + in flight
+        reap_stale()
+        v = project_view(p.dir)
+        assert v["status"] == "idle" and v["pending"] == []   # reaped + inbox cleared
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

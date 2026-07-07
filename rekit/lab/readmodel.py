@@ -21,6 +21,7 @@ TUI would be a second consumer. Pure stdlib.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,10 @@ def _derive_status(run_state: _runlog.RunState, pending: list[dict[str, Any]]) -
     A pending *tool* decision suspends the run; any other pending decision blocks
     it. With nothing pending, the run's own status stands.
     """
-    if pending:
+    # A pending decision only means blocked/suspended while the run is *in flight*;
+    # once it has ended (e.g. reaped after its process died) show the terminal
+    # status even if a stale question lingers.
+    if pending and not run_state.ended_at:
         if any(q.get("kind") == _inbox.KIND_TOOL for q in pending):
             return SUSPENDED
         return BLOCKED
@@ -194,3 +198,47 @@ def health(views: list[dict[str, Any]]) -> dict[str, int]:
         counts[v["status"]] = counts.get(v["status"], 0) + 1
     counts["total"] = len(views)
     return counts
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if ``pid`` names a live process (signal 0 probes without killing)."""
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, just not ours
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def reap_stale(root: str | Path | None = None) -> list[str]:
+    """Mark 'running' runs whose owning process is gone as ended — the zombie sweep.
+
+    A run interrupted by a killed server (not a graceful Stop) leaves ``run.jsonl``
+    frozen mid-round, so it shows as a 'running' card forever. This appends a
+    terminal ``run_ended`` for any run whose recorded pid is no longer alive, and
+    expires its pending decisions so the Inbox clears too. Called on server start
+    (and periodically). A genuinely live run — even a long pi call or one blocked
+    on a decision — has a live owning pid and is left untouched. Returns the reaped
+    project ids.
+    """
+    base = Path(root) if root is not None else projects_root()
+    if not base.is_dir():
+        return []
+    reaped: list[str] = []
+    for child in base.iterdir():
+        if not child.is_dir() or not (child / "project.json").exists():
+            continue
+        state = _runlog.load_run_state(child / _runlog.RUN_LOG_FILENAME)
+        if state.status == _runlog.RUNNING and not _pid_alive(state.pid):
+            _runlog.RunLog(child).run_ended(
+                done=False, status=_runlog.IDLE,
+                reason="interrupted — owning process ended")
+            for q in _inbox.pending_questions(child):
+                _inbox.answer(child, q["id"], "expired")
+            reaped.append(child.name)
+    return reaped

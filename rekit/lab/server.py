@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..human import inbox as _inbox
 from ..ledger.home import projects_root
-from .readmodel import fleet, health, project_detail
+from .readmodel import fleet, health, project_detail, reap_stale
 
 #: Default port — 7358 is "REKT" on a phone keypad, and chosen to avoid clashing
 #: with common local dashboards (e.g. opencode-ensemble on 4747). Override with --port.
@@ -185,6 +185,7 @@ def _notifier_loop(base: Path, stop: threading.Event, *, interval: float = 2.0) 
         pass
     while not stop.wait(interval):
         try:
+            reap_stale(base)  # also sweep zombies mid-session (idempotent)
             for pid, question in new_notifications(seen, fleet(base)):
                 _desktop_notify(f"rekit · {pid} needs you", question)
         except Exception:  # noqa: BLE001
@@ -240,6 +241,9 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *,
         print(f"  → or see what's there:  lsof -nP -i :{port}")
         return 1
     base = _projects_base(None)
+    reaped = reap_stale(base)  # clear zombie 'running' cards from a dead session
+    if reaped:
+        print(f"  reaped {len(reaped)} stale run(s) left by a previous session")
     stop = threading.Event()
     if notify:
         threading.Thread(target=_notifier_loop, args=(base, stop),

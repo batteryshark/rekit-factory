@@ -33,6 +33,7 @@ stdlib; a leaf the loop imports (never the reverse).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -76,6 +77,7 @@ class RunState:
     tier: str = ""
     model: str | None = None
     provider: str | None = None
+    pid: int = 0
     status: str = IDLE
     reason: str = ""
     round: int = 0
@@ -103,6 +105,7 @@ class RunState:
             "provider": self.provider,
             "status": self.status,
             "reason": self.reason,
+            "pid": self.pid,
             "round": self.round,
             "maxRounds": self.max_rounds,
             "step": self.step,
@@ -134,6 +137,7 @@ def _apply(state: RunState, event: _events.Event) -> None:
         state.harness = p.get("harness", state.harness)
         state.tier = p.get("tier", state.tier)
         state.max_rounds = int(p.get("maxRounds") or state.max_rounds or 0)
+        state.pid = int(p.get("pid") or 0)
         state.status = RUNNING
         state.started_at = state.started_at or event.ts
         if p.get("step"):
@@ -227,6 +231,7 @@ class RunLog:
         return self._append(RUN_STARTED, {
             "goal": goal, "harness": harness, "tier": tier,
             "maxRounds": max_rounds, "tools": list(tools or []), "step": step,
+            "pid": os.getpid(),  # the owning process, so a reaper can spot a zombie
         })
 
     def round_started(self, index: int, tier: str,
