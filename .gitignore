@@ -28,3 +28,10 @@ htmlcov/
 skills/*/bin/*
 !skills/*/bin/.gitkeep
 skills/*/dist/
+
+# Local ordna task board (internal planning — kept local, not published to this public repo)
+/tasks/
+/.ordna/
+
+# Full-res logo master — keep local; only the resized rekit-factory-logo.png is published
+/rekit-factory-logo-source.png

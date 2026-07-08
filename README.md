@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="rekit-logo.png" alt="rekit — Reverse Engineering System" width="380">
+  <img src="rekit-factory-logo.png" alt="rekit-factory — RE orchestration runtime" width="380">
 </div>
 
 # rekit-factory — RE orchestration runtime (the "dark factory")
