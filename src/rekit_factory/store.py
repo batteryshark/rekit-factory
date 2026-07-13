@@ -297,6 +297,44 @@ class FactoryLedger(Ledger):
             result.append(item)
         return result
 
+    def publish_dossier(self, run_id: str, *, finding_id: str, manifest_sha256: str,
+                        records: list[dict[str, Any]], metadata: dict[str, Any]) -> list[str]:
+        """Expose a fully materialized dossier and its event in one SQLite transaction."""
+        existing = self.conn.execute(
+            "select id from artifacts where run_id=? and kind='proof-bundle' "
+            "and json_extract(metadata_json,'$.manifestSha256')=?",
+            (run_id, manifest_sha256),
+        ).fetchone()
+        if existing is not None:
+            return [existing["id"]]
+        now = utcnow()
+        artifact_ids = [new_id("art") for _ in records]
+        linked = {record["kind"]: artifact_id
+                  for record, artifact_id in zip(records, artifact_ids)}
+        with self.conn:
+            for record, artifact_id in zip(records, artifact_ids):
+                record_metadata = {**metadata, **record.get("metadata", {}),
+                                   "artifactIds": linked}
+                self.conn.execute(
+                    "insert into artifacts "
+                    "(id,run_id,kind,path,logical_path,sha256,size_bytes,media_type,language,"
+                    "origin,metadata_json,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (artifact_id, run_id, record["kind"], str(record["path"]),
+                     record["logical_path"], record["sha256"], record["size_bytes"],
+                     record["media_type"], record.get("language"), "proof-dossier",
+                     json.dumps(record_metadata, sort_keys=True), now),
+                )
+            self.conn.execute(
+                "insert into factory_events "
+                "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                "values (?,?,?,?,?,?,?)",
+                (new_id("event"), run_id, None, "dossier.published",
+                 f"Proof dossier published for {finding_id}",
+                 json.dumps({"findingId": finding_id, "manifestSha256": manifest_sha256,
+                             "artifactIds": linked}, sort_keys=True), now),
+            )
+        return artifact_ids
+
     def answer_permission(self, run_id: str, qid: str, answer: str) -> str:
         if answer not in {"allow", "deny"}:
             raise ValueError("permission answer must be 'allow' or 'deny'")

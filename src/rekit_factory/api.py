@@ -16,7 +16,9 @@ import uuid
 
 from rekit_factory.control import InvestigationController, RunRequest
 from rekit_factory.evidence import EvidenceStore
+from rekit_factory.dossiers import DossierNotReady, dossier_list, verify_published_dossier
 from rekit_factory.scope import AuthorizedScope
+from rekit_factory.store import FactoryLedger
 from rekit_factory.strategies import DEFAULT_STRATEGIES
 
 
@@ -151,6 +153,41 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 snapshot = self.server.controller.snapshot(run_dir)
                 self._json(HTTPStatus.OK, {"reports": _worker_reports(snapshot)})
                 return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "dossiers":
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                with FactoryLedger(run_dir / "run.db") as ledger:
+                    dossiers = dossier_list(ledger, parts[2], run_dir=run_dir)
+                self._json(HTTPStatus.OK, {"runId": parts[2], "dossiers": dossiers})
+                return
+            if (len(parts) in {5, 6} and parts[:2] == ["api", "runs"]
+                    and parts[3] == "dossiers"):
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                snapshot = self.server.controller.snapshot(run_dir)
+                with FactoryLedger(run_dir / "run.db") as ledger:
+                    dossiers = dossier_list(ledger, parts[2], run_dir=run_dir)
+                dossier = next(
+                    (item for item in dossiers if item["id"] == parts[4]), None
+                )
+                if dossier is None:
+                    raise FileNotFoundError(f"unknown dossier {parts[4]}")
+                if not dossier["verified"]:
+                    raise DossierNotReady("dossier is stale or invalid; republish from current state")
+                dossier["runId"] = parts[2]
+                verify_published_dossier(run_dir, dossier)
+                kind = "proof-export" if len(parts) == 6 and parts[5] == "download" \
+                    else "proof-report-html" if len(parts) == 5 else None
+                if kind is None:
+                    raise FileNotFoundError("unknown dossier resource")
+                artifact_id = dossier["artifactIds"][kind]
+                artifact = next(
+                    item for item in snapshot["artifacts"] if item["id"] == artifact_id
+                )
+                path = _contained_artifact_path(run_dir, artifact)
+                if kind == "proof-report-html":
+                    self._dossier_html(path.read_bytes())
+                else:
+                    self._download(path, artifact["logical_path"])
+                return
             if (len(parts) == 5 and parts[:2] == ["api", "runs"]
                     and parts[3] == "artifacts"):
                 run_dir = _find_run(self.server.storage_root, parts[2])
@@ -160,13 +197,7 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 )
                 if artifact is None:
                     raise FileNotFoundError(f"unknown artifact {parts[4]}")
-                path = Path(artifact["path"]).resolve()
-                try:
-                    path.relative_to(run_dir.resolve())
-                except ValueError as exc:
-                    raise PermissionError("artifact path leaves its run directory") from exc
-                if not path.is_file():
-                    raise FileNotFoundError(f"artifact file is unavailable: {artifact['logical_path']}")
+                path = _contained_artifact_path(run_dir, artifact)
                 self._download(path, artifact["logical_path"])
                 return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "evidence":
@@ -189,6 +220,8 @@ class FactoryHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         except PermissionError as exc:
             self._json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+        except DossierNotReady as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except Exception as exc:
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
                        {"error": f"{type(exc).__name__}: {exc}"})
@@ -309,6 +342,17 @@ class FactoryHandler(BaseHTTPRequestHandler):
     def _html(self, body: bytes) -> None:
         self._static(body, "text/html; charset=utf-8")
 
+    def _dossier_html(self, body: bytes) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _asset(self, name: str, content_type: str) -> None:
         body = (Path(__file__).with_name("ui") / name).read_bytes()
         self._static(body, content_type)
@@ -373,6 +417,17 @@ def _after(events: list[dict[str, Any]], cursor: str | None) -> list[dict[str, A
 
 def _run_meta(run_dir: Path) -> dict[str, Any]:
     return json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+
+def _contained_artifact_path(run_dir: Path, artifact: dict[str, Any]) -> Path:
+    path = Path(artifact["path"]).resolve()
+    try:
+        path.relative_to(run_dir.resolve())
+    except ValueError as exc:
+        raise PermissionError("artifact path leaves its run directory") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"artifact file is unavailable: {artifact['logical_path']}")
+    return path
 
 
 def _run_dirs(storage_root: Path) -> list[Path]:

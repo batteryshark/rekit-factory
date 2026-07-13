@@ -39,10 +39,27 @@ class ObservationEvidence(BaseModel):
     references: list[EvidenceRef] = Field(min_length=1)
 
 
+class ReproductionStep(BaseModel):
+    action: Literal["stage-input", "invoke", "observe", "compare"]
+    description: str = Field(min_length=1, max_length=2_000)
+    tool_id: str | None = Field(default=None, max_length=128)
+    argv: list[str] = Field(default_factory=list, max_length=64)
+    environment: dict[str, str] = Field(default_factory=dict)
+    references: list[EvidenceRef] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def structured_invocation(self):
+        if self.action == "invoke" and (not self.tool_id or not self.argv):
+            raise ValueError("invoke reproduction steps require tool_id and argv")
+        if self.action != "invoke" and (self.tool_id is not None or self.argv):
+            raise ValueError("only invoke reproduction steps may carry tool_id or argv")
+        return self
+
+
 class ReproductionRecipe(BaseModel):
     schema_version: Literal[1] = 1
     id: str = Field(min_length=1, max_length=128)
-    steps: list[str] = Field(min_length=1, max_length=50)
+    steps: list[str | ReproductionStep] = Field(min_length=1, max_length=50)
     staged_inputs: list[EvidenceRef] = Field(min_length=1)
     expected_observation: str = Field(min_length=1, max_length=4_000)
     clean_environment_requirements: list[str] = Field(min_length=1, max_length=20)
@@ -93,7 +110,11 @@ class FindingProposal(BaseModel):
         material = {
             (reference.kind, reference.id)
             for observation in self.observations for reference in observation.references
-        } | {(reference.kind, reference.id) for reference in self.recipe.staged_inputs}
+        } | {(reference.kind, reference.id) for reference in self.recipe.staged_inputs} | {
+            (reference.kind, reference.id)
+            for step in self.recipe.steps if isinstance(step, ReproductionStep)
+            for reference in step.references
+        }
         if not material <= cited:
             raise ValueError("finding references must include all observation and staged-input evidence")
         return self
@@ -122,6 +143,9 @@ class ReproductionAttempt(BaseModel):
     environment_id: str = Field(min_length=1, max_length=256)
     clean_environment: bool
     model_profile: str = Field(min_length=1, max_length=128)
+    platform: str = Field(default="unknown", min_length=1, max_length=128)
+    architecture: str = Field(default="unknown", min_length=1, max_length=128)
+    isolation: str = Field(default="unknown", min_length=1, max_length=128)
     observations: list[str] = Field(min_length=1)
     environmental_differences: list[str] = Field(default_factory=list)
     references: list[EvidenceRef] = Field(min_length=1)
@@ -296,6 +320,9 @@ class FindingMemory:
         payload["environment"] = {
             "id": payload.pop("environment_id"),
             "clean": payload.pop("clean_environment"),
+            "platform": payload.pop("platform"),
+            "architecture": payload.pop("architecture"),
+            "isolation": payload.pop("isolation"),
         }
         payload["modelProfile"] = payload.pop("model_profile")
         payload["references"] = _refs(attempt.references)
