@@ -54,6 +54,26 @@ def _candidate(kind="operator-decision.waiting"):
     return next(item for item in notification_candidates(old, new) if item["kind"] == kind)
 
 
+def _transition(kind="operator-decision.waiting"):
+    common = {"workers": (), "work_items": (), "dossiers": ()}
+    old = project_outcomes(
+        run={"id": "run-1", "status": "running"}, memory={}, pending_questions=(), **common,
+    )
+    if kind == "operator-decision.waiting":
+        new = project_outcomes(
+            run={"id": "run-1", "status": "running"}, memory={},
+            pending_questions=[{"id": "question-1", "prompt": "private prose"}], **common,
+        )
+    else:
+        new = project_outcomes(
+            run={"id": "run-1", "status": "running"}, pending_questions=(),
+            memory={"findings": {
+                "finding-1": {"id": "finding-1", "status": "reproduced"},
+            }}, **common,
+        )
+    return old, new
+
+
 @pytest.fixture
 def outbox(tmp_path):
     ledger = FactoryLedger(tmp_path / "factory.sqlite")
@@ -245,3 +265,109 @@ def test_two_connections_cannot_claim_same_delivery(tmp_path):
         results = list(pool.map(claim, ("sender-a", "sender-b")))
     claims = [item for result in results for item in result]
     assert [item["id"] for item in claims] == [notification_id]
+
+
+def test_canonical_projection_boundary_hydrates_then_admits_exactly_once(tmp_path):
+    path = tmp_path / "run.db"
+    old, new = _transition()
+    first = FactoryLedger(path)
+    assert first.admit_notification_projection("run-1", old) == []
+    [notification_id] = first.admit_notification_projection("run-1", new)
+    assert first.admit_notification_projection("run-1", new) == []
+    assert first.conn.execute(
+        "select count(*) from factory_notification_outbox",
+    ).fetchone()[0] == 1
+    first.close()
+
+    reopened = FactoryLedger(path)
+    assert reopened.admit_notification_projection("run-1", new) == []
+    assert NotificationOutbox(reopened.conn).get(notification_id) is not None
+    reopened.close()
+
+
+def test_projection_and_outbox_rollback_together_at_every_boundary(tmp_path):
+    old, new = _transition("finding.reproduced")
+    for boundary in ("outbox-admitted", "baseline-advanced"):
+        path = tmp_path / f"{boundary}.db"
+        ledger = FactoryLedger(path)
+        assert ledger.admit_notification_projection("run-1", old) == []
+
+        def crash(observed):
+            if observed == boundary:
+                raise RuntimeError(f"crash after {boundary}")
+
+        with pytest.raises(RuntimeError, match=boundary):
+            ledger.admit_notification_projection(
+                "run-1", new, failure_injector=crash,
+            )
+        assert ledger.conn.execute(
+            "select count(*) from factory_notification_outbox",
+        ).fetchone()[0] == 0
+        baseline = ledger.conn.execute(
+            "select semantic_sha256 from factory_notification_projection_state where run_id=?",
+            ("run-1",),
+        ).fetchone()[0]
+        assert baseline == old["semanticSha256"]
+        assert len(ledger.admit_notification_projection("run-1", new)) == 1
+        ledger.close()
+
+
+def test_degraded_observation_does_not_erase_last_trusted_baseline(tmp_path):
+    old, new = _transition()
+    # Changing public content invalidates the semantic identity, so derive a genuinely degraded
+    # projection instead of forging one.
+    degraded = project_outcomes(
+        run={"id": "run-1", "status": "future-unsupported"}, workers=(), work_items=(),
+        memory={"findings": {}}, dossiers=(), pending_questions=(),
+    )
+    ledger = FactoryLedger(tmp_path / "run.db")
+    ledger.admit_notification_projection("run-1", old)
+    assert ledger.admit_notification_projection("run-1", degraded) == []
+    assert len(ledger.admit_notification_projection("run-1", new)) == 1
+    ledger.close()
+
+
+def test_projection_boundary_rejects_cross_run_and_corrupt_baseline_atomically(tmp_path):
+    old, new = _transition()
+    ledger = FactoryLedger(tmp_path / "run.db")
+    with pytest.raises(ValueError, match="exact run"):
+        ledger.admit_notification_projection("run-forged", old)
+    ledger.admit_notification_projection("run-1", old)
+    ledger.conn.execute(
+        "update factory_notification_projection_state set projection_json='{}' where run_id=?",
+        ("run-1",),
+    )
+    ledger.conn.commit()
+    with pytest.raises(ValueError, match="integrity"):
+        ledger.admit_notification_projection("run-1", new)
+    assert ledger.conn.execute(
+        "select count(*) from factory_notification_outbox",
+    ).fetchone()[0] == 0
+    ledger.close()
+
+
+def test_concurrent_transition_observers_converge_on_one_admission(tmp_path):
+    path = tmp_path / "run.db"
+    old, new = _transition()
+    setup = FactoryLedger(path)
+    setup.admit_notification_projection("run-1", old)
+    setup.close()
+    barrier = Barrier(2)
+
+    def observe(_):
+        ledger = FactoryLedger(path)
+        try:
+            barrier.wait()
+            return ledger.admit_notification_projection("run-1", new)
+        finally:
+            ledger.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(observe, range(2)))
+    admitted = [item for result in results for item in result]
+    verify = FactoryLedger(path)
+    assert len(admitted) == 1
+    assert verify.conn.execute(
+        "select count(*) from factory_notification_outbox",
+    ).fetchone()[0] == 1
+    verify.close()

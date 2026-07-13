@@ -198,6 +198,59 @@ class ControlPlaneTests(unittest.TestCase):
         (target / "main.py").write_text("def run(value):\n    return value + 1\n", encoding="utf-8")
         return target
 
+    def test_notification_admission_failure_never_blocks_committed_run_progress(self):
+        for failure in (
+                sqlite3.OperationalError("notification outbox is locked"),
+                ValueError("notification baseline is corrupt")):
+            with self.subTest(failure=type(failure).__name__), \
+                    tempfile.TemporaryDirectory() as tmp, patch.object(
+                        FactoryLedger, "admit_notification_projection", side_effect=failure,
+                    ):
+                controller = InvestigationController(
+                    storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                )
+                result = controller.run(RunRequest(
+                    target=self._fixture(tmp), goal="Complete despite notification failure",
+                    worker_roles=("analyst",),
+                ))
+                self.assertEqual("completed", result["run"]["status"])
+                self.assertTrue(result["workItems"])
+                self.assertTrue(all(item["status"] == "done" for item in result["workItems"]))
+
+    def test_snapshot_boundary_admits_one_committed_operator_transition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(risky=True),
+                workers=FakeBackend(),
+            )
+            run_dir = controller.create(RunRequest(
+                target=target, goal="Pause at exact permission authority",
+                tools=("exec-observe",), worker_roles=("analyst",),
+                scope=authorized_dynamic_scope(target),
+            ))
+            hydrated = controller.snapshot(run_dir)
+            self.assertEqual("running", hydrated["run"]["status"])
+            self.assertFalse(hydrated["pendingQuestions"])
+
+            waiting = asyncio.run(controller.drive(run_dir))
+            self.assertEqual("needs_input", waiting["run"]["status"])
+            self.assertEqual(1, len(waiting["pendingQuestions"]))
+            reconnected = controller.snapshot(run_dir)
+            self.assertEqual(
+                waiting["outcomeProjection"]["semanticSha256"],
+                reconnected["outcomeProjection"]["semanticSha256"],
+            )
+            with FactoryLedger(Path(run_dir) / "run.db") as ledger:
+                rows = ledger.conn.execute(
+                    "select * from factory_notification_outbox",
+                ).fetchall()
+                run = ledger.get_run(waiting["run"]["id"])
+            self.assertEqual(1, len(rows))
+            self.assertEqual("operator-decision.waiting", rows[0]["kind"])
+            self.assertEqual(waiting["pendingQuestions"][0]["id"], rows[0]["entity_id"])
+            self.assertEqual("needs_input", run["status"])
+
     def test_workers_fan_out_and_everything_is_ledgered(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = self._fixture(tmp)

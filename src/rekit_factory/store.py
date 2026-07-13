@@ -188,6 +188,14 @@ create table if not exists factory_notification_outbox (
 );
 create index if not exists idx_factory_notification_outbox_due
     on factory_notification_outbox(status, next_attempt_at, created_at);
+
+create table if not exists factory_notification_projection_state (
+    run_id             text primary key,
+    semantic_sha256    text not null,
+    projection_json    text not null,
+    projection_sha256  text not null,
+    updated_at         text not null
+);
 """
 
 
@@ -214,6 +222,84 @@ class FactoryLedger(Ledger):
                 for name, declaration in columns:
                     if name not in existing:
                         self.conn.execute(f"alter table {table} add column {name} {declaration}")
+
+    def admit_notification_projection(
+            self, run_id: str, projection: dict[str, Any], *,
+            failure_injector: Callable[[str], None] | None = None) -> list[str]:
+        """Atomically advance the trusted outcome baseline and admit notifications.
+
+        This is the sole durable boundary between Factory's canonical outcome projection and
+        its lossy notification subsystem.  Initial hydration establishes a baseline without
+        emitting.  Reconnects with the same semantic identity are no-ops.  Degraded projections
+        never replace the last trustworthy baseline, so recovery cannot invent a transition or
+        erase the last point from which a real transition can be observed.
+        """
+        from rekit_factory.notification_outbox import NotificationOutbox
+        from rekit_factory.notification_policy import notification_candidates
+
+        # This validates the supported schema, vocabulary, semantic digest, and canonical bytes
+        # even when there is no previous projection.
+        notification_candidates(None, projection)
+        run_ids = sorted(
+            item.get("entityId") for item in projection.get("entities", ())
+            if item.get("entityType") == "run"
+        )
+        if run_ids != [run_id]:
+            raise ValueError("notification projection does not bind the exact run")
+        if projection.get("degraded") is not False:
+            return []
+
+        projection_json = json.dumps(
+            projection, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        )
+        projection_sha256 = hashlib.sha256(projection_json.encode("utf-8")).hexdigest()
+        semantic_sha256 = projection["semanticSha256"]
+        admitted: list[str] = []
+        self.conn.execute("begin immediate")
+        try:
+            previous = self.conn.execute(
+                "select * from factory_notification_projection_state where run_id=?",
+                (run_id,),
+            ).fetchone()
+            if previous is not None:
+                if hashlib.sha256(previous["projection_json"].encode("utf-8")).hexdigest() \
+                        != previous["projection_sha256"]:
+                    raise ValueError(
+                        "notification projection baseline failed integrity verification"
+                    )
+                old = json.loads(previous["projection_json"])
+                if old.get("semanticSha256") != previous["semantic_sha256"]:
+                    raise ValueError(
+                        "notification projection baseline identity conflicts with content"
+                    )
+                # Revalidate stored content before it is allowed to influence policy.
+                notification_candidates(None, old)
+                if previous["semantic_sha256"] == semantic_sha256:
+                    self.conn.rollback()
+                    return []
+                candidates = notification_candidates(old, projection)
+                admitted = NotificationOutbox(self.conn).admit(candidates)
+                if failure_injector:
+                    failure_injector("outbox-admitted")
+                self.conn.execute(
+                    "update factory_notification_projection_state set semantic_sha256=?,"
+                    "projection_json=?,projection_sha256=?,updated_at=? where run_id=?",
+                    (semantic_sha256, projection_json, projection_sha256, utcnow(), run_id),
+                )
+            else:
+                self.conn.execute(
+                    "insert into factory_notification_projection_state "
+                    "(run_id,semantic_sha256,projection_json,projection_sha256,updated_at) "
+                    "values (?,?,?,?,?)",
+                    (run_id, semantic_sha256, projection_json, projection_sha256, utcnow()),
+                )
+            if failure_injector:
+                failure_injector("baseline-advanced")
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+        return admitted
 
     def set_run_status(self, run_id: str, status: str, *, error: str | None = None) -> None:
         self.conn.execute(

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import sqlite3
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
@@ -726,6 +727,27 @@ class InvestigationController:
         finally:
             # End the read snapshot without implying a write commit.
             ledger.conn.rollback()
+        outcome_projection = project_outcomes(
+            run=dict(run) if run is not None else None,
+            workers=workers,
+            work_items=work,
+            memory=memory_projection,
+            dossiers=dossiers,
+            pending_questions=pending_questions,
+            campaigns=lifecycle_source["campaigns"],
+            archives=lifecycle_source["archives"],
+            source_watermarks={
+                "factoryEventRowid": int(event_watermark_row["watermark"]),
+                "memorySequence": project_memory.last_seq,
+                "campaignLifecycleSha256": lifecycle_sha256,
+            },
+        )
+        # Notification bookkeeping is deliberately downstream of canonical state. Corrupt or
+        # temporarily locked notification tables must not make run progress or hydration fail.
+        try:
+            ledger.admit_notification_projection(paths.run_id, outcome_projection)
+        except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
         return {
             "run": dict(run) if run is not None else None,
             "meta": meta,
@@ -751,21 +773,7 @@ class InvestigationController:
             # dedicated dossier route, not the high-frequency generic/SSE snapshot path.
             "dossiers": dossiers,
             "campaignLifecycle": lifecycle_source,
-            "outcomeProjection": project_outcomes(
-                run=dict(run) if run is not None else None,
-                workers=workers,
-                work_items=work,
-                memory=memory_projection,
-                dossiers=dossiers,
-                pending_questions=pending_questions,
-                campaigns=lifecycle_source["campaigns"],
-                archives=lifecycle_source["archives"],
-                source_watermarks={
-                    "factoryEventRowid": int(event_watermark_row["watermark"]),
-                    "memorySequence": project_memory.last_seq,
-                    "campaignLifecycleSha256": lifecycle_sha256,
-                },
-            ),
+            "outcomeProjection": outcome_projection,
             "knowledgeReferences": knowledge_references,
         }
 
