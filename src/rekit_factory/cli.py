@@ -10,7 +10,12 @@ import os
 from pathlib import Path
 import sys
 
-from rekit_factory.control import InvestigationController, RunRequest, default_storage_root
+from rekit_factory.control import (
+    InvestigationController,
+    RunRequest,
+    default_storage_root,
+    enforce_model_profile_concurrency,
+)
 from rekit_factory.knowledge import KnowledgeRoot
 from rekit_factory.models import ModelProfile, PydanticWorkerBackend
 from rekit_factory.rekit_client import FederatedRekitClient
@@ -131,11 +136,7 @@ def _load_profiles(args: argparse.Namespace) -> list[ModelProfile]:
 
 
 def _enforce_concurrency(profile: ModelProfile, requested: int) -> None:
-    if requested > profile.concurrency_limit:
-        raise ValueError(
-            f"requested concurrency {requested} exceeds model profile "
-            f"{profile.name!r} ceiling {profile.concurrency_limit}"
-        )
+    enforce_model_profile_concurrency(profile, requested)
 
 
 def _load_remote_workers(args: argparse.Namespace) -> tuple[RemoteWorkerBinding, ...]:
