@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const {createTracker} = require("../src/rekit_factory/ui/mission-attention.js");
+const {createTracker, messageFor} = require("../src/rekit_factory/ui/mission-attention.js");
 
 const run = (runId, needsYou) => ({runId, needsYou});
 const tracker = createTracker();
@@ -23,5 +23,9 @@ assert.equal(tracker.claim("run-a", ["question-1", "question-2"]), false, "the s
 
 tracker.rearm("run-a");
 assert.equal(tracker.transitions([run("run-a", 1)]).length, 1, "snapshot failures can retry on a later live refresh");
+
+assert.equal(messageFor(1, 1), "A new decision is waiting in the Decision Inbox.");
+assert.equal(messageFor(1, 2), "2 new decisions are waiting across 1 investigation.");
+assert.equal(messageFor(2, 3), "3 new decisions are waiting across 2 investigations.");
 
 console.log("mission attention tracker: ok");

@@ -24,7 +24,8 @@ class MissionControlAttentionTests(unittest.TestCase):
         self.assertIn('"mission-attention.js": "text/javascript; charset=utf-8"', api)
         for behavior in (
             "state.attention.transitions(runs)", "state.attention.claim(run.runId, questionIds)",
-            "state.attention.rearm(run.runId)", "show(\"inbox\")", "dismissAttention",
+            "state.attention.rearm(run.runId)", "MissionAttention.messageFor(runCount, questionCount)",
+            "show(\"inbox\")", "dismissAttention",
         ):
             self.assertIn(behavior, script)
         announce = script[script.index("async function announceAttention"):script.index("const delay")]

@@ -95,9 +95,7 @@ function dismissAttention() {
 function showAttention(runCount, questionCount) {
   const element = $("operatorAttention");
   $("operatorAttentionTitle").textContent = runCount === 1 ? "Operator attention required" : "Multiple investigations need attention";
-  $("operatorAttentionMessage").textContent = questionCount === 1
-    ? "A new decision is waiting in the Decision Inbox."
-    : `${questionCount} new decisions are waiting across ${runCount} investigations.`;
+  $("operatorAttentionMessage").textContent = MissionAttention.messageFor(runCount, questionCount);
   element.hidden = false;
   element.classList.remove("show");
   requestAnimationFrame(() => element.classList.add("show"));

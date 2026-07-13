@@ -7,6 +7,13 @@
 })(typeof globalThis === "object" ? globalThis : this, () => {
   const countFor = run => Math.max(0, Number.isFinite(Number(run?.needsYou)) ? Number(run.needsYou) : 0);
 
+  function messageFor(runCount, questionCount) {
+    const runs = Math.max(1, Number.isFinite(Number(runCount)) ? Number(runCount) : 1);
+    const questions = Math.max(1, Number.isFinite(Number(questionCount)) ? Number(questionCount) : 1);
+    if (questions === 1) return "A new decision is waiting in the Decision Inbox.";
+    return `${questions} new decisions are waiting across ${runs} ${runs === 1 ? "investigation" : "investigations"}.`;
+  }
+
   function createTracker({seenLimit = 512} = {}) {
     const limit = Number.isInteger(seenLimit) && seenLimit > 0 ? seenLimit : 512;
     let initialized = false;
@@ -43,5 +50,5 @@
     return {claim, rearm, transitions};
   }
 
-  return {createTracker};
+  return {createTracker, messageFor};
 });
