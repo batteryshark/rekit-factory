@@ -50,7 +50,23 @@
       </section>
       <section class="view" id="view-detail">
         <div class="view-head"><div><div class="eyebrow">INVESTIGATION</div><h1 id="detailTitle">Investigation</h1><div class="sub" id="detailGoal"></div></div><div class="grow"></div><button class="btn" disabled title="Pause is not implemented yet">Pause</button><button class="btn red" disabled title="Stop is not implemented yet">Stop</button></div>
-        <div class="detail-grid"><aside class="panel"><h3>Run</h3><div class="side-kv" id="runMeta"></div><h3 class="section-title">Workers</h3><div class="workers" id="workers"></div></aside><div><div class="tabs"><button class="tab active" data-tab="activity">Activity</button><button class="tab" data-tab="artifacts">Artifacts</button><button class="tab" data-tab="decisions">Decisions</button></div><div class="tabpane active" id="tab-activity"><div class="events" id="events"></div></div><div class="tabpane" id="tab-artifacts"><div class="panel artifacts" id="artifacts"></div></div><div class="tabpane" id="tab-decisions"><div class="inbox-list" id="detailDecisions"></div></div></div></div>
+        <div class="detail-grid">
+          <aside class="panel"><h3>Run</h3><div class="side-kv" id="runMeta"></div><h3 class="section-title">Workers</h3><div class="workers" id="workers"></div></aside>
+          <div class="detail-main">
+            <div class="tabs" role="tablist" aria-label="Investigation detail">
+              <button class="tab active" role="tab" aria-selected="true" data-tab="activity">Activity <span class="tab-count" id="activityCount">0</span></button>
+              <button class="tab" role="tab" aria-selected="false" data-tab="reports">Reports <span class="tab-count" id="reportCount">0</span></button>
+              <button class="tab" role="tab" aria-selected="false" data-tab="usage">Usage <span class="tab-count" id="usageCount">0</span></button>
+              <button class="tab" role="tab" aria-selected="false" data-tab="artifacts">Artifacts <span class="tab-count" id="artifactCount">0</span></button>
+              <button class="tab" role="tab" aria-selected="false" data-tab="decisions">Decisions <span class="tab-count" id="decisionCount">0</span></button>
+            </div>
+            <div class="tabpane active" role="tabpanel" id="tab-activity"><div class="activity-summary" id="activitySummary"></div><div class="events" id="events" aria-live="polite"></div></div>
+            <div class="tabpane" role="tabpanel" id="tab-reports"><div class="report-grid" id="reports"></div></div>
+            <div class="tabpane" role="tabpanel" id="tab-usage"><div id="usage"></div></div>
+            <div class="tabpane" role="tabpanel" id="tab-artifacts"><div class="panel artifacts" id="artifacts"></div></div>
+            <div class="tabpane" role="tabpanel" id="tab-decisions"><div class="inbox-list" id="detailDecisions"></div></div>
+          </div>
+        </div>
       </section>
       <section class="view" id="view-tools"><div class="view-head"><div><div class="eyebrow">CAPABILITIES</div><h1>Tools &amp; Models</h1><div class="sub">the configured brain and Rekit rack exposed to this factory</div></div></div><div class="layout2"><div class="panel"><h3>Rekit tools</h3><div class="tools" id="toolCatalog"></div></div><div class="panel"><h3>Active model profile</h3><div id="profile"></div></div></div></section>
       <section class="view" id="view-settings"><div class="view-head"><div><div class="eyebrow">SYSTEM</div><h1>Settings</h1><div class="sub">local storage and runtime boundaries</div></div></div><div class="panel settings-panel"><h3>Factory</h3><div class="side-kv" id="settings"></div></div></section>

@@ -1,5 +1,64 @@
 "use strict";
 
+const MissionObservability = (() => {
+  const safe = value => String(value ?? "").replace(/[&<>"']/g, character => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"})[character]);
+  const first = (object, ...keys) => keys.map(key => object?.[key]).find(value => value !== undefined && value !== null);
+  const number = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const eventTone = (kind = "") => { const value = kind.toLowerCase(); if (value.includes("thinking") || value.includes("reason")) return "thinking"; if (value.includes("tool")) return "tool"; if (value.includes("retry") || value.includes("failed") || value.includes("error")) return "retry"; if (value.includes("valid") || value.includes("schema")) return "validation"; if (value.includes("model") || value.includes("worker")) return "model"; return "system"; };
+  const payloadFacts = payload => {
+    if (!payload || typeof payload !== "object") return [];
+    const labels = {attempt: "attempt", characters: "chars", toolId: "tool", tool_id: "tool", toolName: "call", tool_name: "call", toolCount: "tools", observationCount: "observations", nextActionCount: "next", inputTokens: "input", outputTokens: "output", cacheReadTokens: "cache read", cacheWriteTokens: "cache write"};
+    return Object.entries(labels).flatMap(([key, label]) => payload[key] === undefined || payload[key] === null || typeof payload[key] === "object" ? [] : [[label, payload[key]]]).slice(0, 4);
+  };
+  function renderEvent(event) {
+    const kind = String(first(event, "kind", "type") || "event"), tone = eventTone(kind), created = first(event, "created_at", "createdAt", "timestamp"), worker = first(event, "worker_id", "workerId");
+    const facts = payloadFacts(event.payload).map(([label, value]) => `<span><b>${safe(label)}</b> ${safe(value)}</span>`).join("");
+    return `<article class="event event-${tone}"><div class="event-rail"><i></i></div><time>${safe(created ? new Date(created).toLocaleTimeString() : "—")}</time><div class="event-content"><div class="event-heading"><span class="event-kind">${safe(kind.replaceAll(".", " / "))}</span>${worker ? `<span class="event-worker">${safe(worker)}</span>` : ""}</div><div class="event-message">${safe(first(event, "message", "summary") || kind)}</div>${facts ? `<div class="event-facts">${facts}</div>` : ""}</div></article>`;
+  }
+  function activitySummary(events = []) {
+    const counts = {model: 0, thinking: 0, tool: 0, validation: 0, retry: 0};
+    events.forEach(event => { const tone = eventTone(first(event, "kind", "type") || ""); if (tone in counts) counts[tone] += 1; });
+    return Object.entries(counts).map(([kind, count]) => `<div class="activity-stat ${kind}"><b>${count}</b><span>${safe(kind)}</span></div>`).join("");
+  }
+  function reports(snapshot) {
+    return (snapshot.workItems || []).flatMap(item => {
+      const result = item.result;
+      if (!result || typeof result !== "object" || !first(result, "summary", "observations", "next_actions", "nextActions")) return [];
+      return [{role: first(item.payload, "role", "workerRole") || item.category || "worker", title: item.title || "Worker report", summary: result.summary || "Report completed.", observations: result.observations || [], next: first(result, "next_actions", "nextActions") || [], status: first(result, "status_update", "statusUpdate") || item.state_label || item.status}];
+    });
+  }
+  function renderReports(snapshot) {
+    const items = reports(snapshot);
+    if (!items.length) return `<div class="empty compact"><b>No worker reports yet</b>Completed structured worker results will collect here.</div>`;
+    return items.map(report => `<article class="report-card"><header><div><span class="report-role">${safe(report.role)}</span><h3>${safe(report.title)}</h3></div><span class="report-status">${safe(report.status)}</span></header><p>${safe(report.summary)}</p>${report.observations.length ? `<div class="report-section"><b>Observations</b><ul>${report.observations.map(item => `<li>${safe(item)}</li>`).join("")}</ul></div>` : ""}${report.next.length ? `<div class="report-section next"><b>Next actions</b><ul>${report.next.map(item => `<li>${safe(item)}</li>`).join("")}</ul></div>` : ""}</article>`).join("");
+  }
+  const tokenValue = (usage, names) => { for (const name of names) if (usage?.[name] !== undefined) return number(usage[name]); return 0; };
+  function usageRows(snapshot) {
+    return (snapshot.modelCalls || []).map(call => { const usage = call.usage || {}; return {provider: call.provider || "provider", model: call.model || snapshot.meta?.modelProfile?.model || "model", purpose: call.purpose || "worker", input: tokenValue(usage, ["inputTokens", "input_tokens", "request_tokens"]), output: tokenValue(usage, ["outputTokens", "output_tokens", "response_tokens"]), cacheRead: tokenValue(usage, ["cacheReadTokens", "cache_read_tokens", "cacheReadInputTokens", "cache_read_input_tokens"]), cacheWrite: tokenValue(usage, ["cacheWriteTokens", "cache_write_tokens", "cacheCreationInputTokens", "cache_creation_input_tokens"])}; });
+  }
+  function renderUsage(snapshot) {
+    const rows = usageRows(snapshot), totals = rows.reduce((sum, row) => ({input: sum.input + row.input, output: sum.output + row.output, cacheRead: sum.cacheRead + row.cacheRead, cacheWrite: sum.cacheWrite + row.cacheWrite}), {input: 0, output: 0, cacheRead: 0, cacheWrite: 0}), format = value => new Intl.NumberFormat().format(value);
+    const summary = `<div class="usage-summary"><div><b>${rows.length}</b><span>model calls</span></div><div><b>${format(totals.input)}</b><span>input tokens</span></div><div><b>${format(totals.output)}</b><span>output tokens</span></div><div class="cache"><b>${format(totals.cacheRead)}</b><span>cache read</span></div><div class="cache"><b>${format(totals.cacheWrite)}</b><span>cache write</span></div></div>`;
+    if (!rows.length) return `${summary}<div class="empty compact"><b>No model usage yet</b>Provider-neutral call accounting will appear after the first worker turn.</div>`;
+    return `${summary}<div class="usage-table" role="table" aria-label="Model usage by call"><div class="usage-row usage-head" role="row"><span>purpose</span><span>model</span><span>input</span><span>output</span><span>cache read</span><span>cache write</span></div>${rows.map(row => `<div class="usage-row" role="row"><span><b>${safe(row.purpose)}</b><small>${safe(row.provider)}</small></span><span>${safe(row.model)}</span><span>${format(row.input)}</span><span>${format(row.output)}</span><span class="cache-value">${format(row.cacheRead)}</span><span class="cache-value">${format(row.cacheWrite)}</span></div>`).join("")}</div>`;
+  }
+  function questionVariant(question) {
+    const kind = String(first(question, "kind", "type") || "decision").toLowerCase();
+    if (kind.includes("permission") || first(question, "toolId", "tool_id", "safetyTier", "safety_tier")) return "permission";
+    if (kind.includes("missing") || kind.includes("tool")) return "missing-tool";
+    if (kind.includes("direction") || kind.includes("choice") || kind.includes("clarif")) return "direction";
+    return "decision";
+  }
+  const optionParts = option => typeof option === "object" && option ? {value: first(option, "value", "id", "answer", "label"), label: first(option, "label", "title", "value", "id")} : {value: option, label: option};
+  function renderDecision(runId, question) {
+    const variant = questionVariant(question), kind = first(question, "kind", "type") || variant, prompt = first(question, "prompt", "question", "message", "title") || "Operator input required";
+    const rawOptions = Array.isArray(question.options) ? question.options : Array.isArray(question.choices) ? question.choices : [], options = rawOptions.map(optionParts).filter(option => option.value !== undefined && option.value !== null);
+    const context = [["tool", first(question, "toolId", "tool_id")], ["safety", first(question, "safetyTier", "safety_tier")], ["reason", first(question, "reason", "description")]].filter(([, value]) => value !== undefined && value !== null);
+    return `<article class="decision decision-${variant}"><div class="decision-head"><div class="decision-icon" aria-hidden="true">${variant === "permission" ? "!" : variant === "missing-tool" ? "?" : variant === "direction" ? "↗" : "◇"}</div><div><b>${safe(String(kind).replaceAll("_", " "))}</b><span>${safe(runId)}</span></div></div><div class="decision-body"><div class="question">${safe(prompt)}</div>${context.length ? `<div class="decision-context">${context.map(([label, value]) => `<span><b>${safe(label)}</b>${safe(value)}</span>`).join("")}</div>` : ""}<div class="choices">${options.length ? options.map((option, index) => `<button class="btn ${String(option.value).toLowerCase() === "allow" ? "primary" : index === 0 && variant === "direction" ? "primary" : String(option.value).toLowerCase() === "deny" ? "red" : ""}" data-answer="${safe(option.value)}" data-run="${safe(runId)}" data-question="${safe(question.id)}">${safe(option.label)}</button>`).join("") : `<span class="decision-unavailable">No response options supplied by this question.</span>`}</div></div></article>`;
+  }
+  return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
+})();
+
 const state = {fleet: [], config: null, filter: "all", selected: null, snapshot: null, stream: null};
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -37,7 +96,11 @@ function activate(element) {
   if (answer) { resolveDecision(answer.dataset.run, answer.dataset.question, answer.dataset.answer); return true; }
   const tab = element.closest("[data-tab]");
   if (tab) {
-    document.querySelectorAll(".tab").forEach(item => item.classList.toggle("active", item === tab));
+    document.querySelectorAll(".tab").forEach(item => {
+      const active = item === tab;
+      item.classList.toggle("active", active);
+      item.setAttribute("aria-selected", String(active));
+    });
     document.querySelectorAll(".tabpane").forEach(item => item.classList.toggle("active", item.id === `tab-${tab.dataset.tab}`));
     return true;
   }
@@ -92,7 +155,7 @@ async function refreshFleet() {
 }
 
 function decisionHTML(runId, question) {
-  return `<article class="decision"><div class="decision-head"><b>${esc(question.kind)}</b><span>${esc(runId)}</span></div><div class="decision-body"><div class="question">${esc(question.prompt)}</div><div class="choices">${question.options.map(option => `<button class="btn ${option === "allow" ? "primary" : "red"}" data-answer="${esc(option)}" data-run="${esc(runId)}" data-question="${esc(question.id)}">${esc(option)}</button>`).join("")}</div></div></article>`;
+  return MissionObservability.renderDecision(runId, question);
 }
 
 async function loadInbox() {
@@ -119,13 +182,22 @@ async function openRun(runId) {
 
 function renderDetail() {
   const snapshot = state.snapshot, run = snapshot.run, meta = snapshot.meta;
+  const events = snapshot.events || [], artifacts = snapshot.artifacts || [], questions = snapshot.pendingQuestions || [];
   $("detailTitle").textContent = meta.target.split("/").pop(); $("detailGoal").textContent = meta.goal;
   $("runMeta").innerHTML = [["status", run.status], ["run", run.id], ["model", meta.modelProfile.model], ["coverage", `${snapshot.coverage.terminal}/${snapshot.coverage.workItemsTotal}`], ["target", meta.target]].map(([name, value]) => `<div class="kv"><span>${esc(name)}</span><span>${esc(value)}</span></div>`).join("");
   $("workers").innerHTML = snapshot.workers.map(worker => `<div class="worker"><div class="worker-top"><span class="worker-role">${esc(worker.role)}</span><span class="worker-status">${esc(worker.status)}</span></div><div class="worker-step">${esc(worker.current_step || "queued")}</div>${worker.error ? `<div class="worker-error">${esc(worker.error)}</div>` : ""}</div>`).join("");
-  $("events").innerHTML = snapshot.events.map(event => `<div class="event"><time>${esc(new Date(event.created_at).toLocaleTimeString())}</time><span class="kind">${esc(event.kind)}</span><span class="msg">${esc(event.message)}</span></div>`).join("") || `<div class="empty">No events yet.</div>`;
+  $("activitySummary").innerHTML = MissionObservability.activitySummary(events);
+  $("events").innerHTML = events.map(MissionObservability.renderEvent).join("") || `<div class="empty compact"><b>No activity yet</b>Semantic model and worker events will stream here.</div>`;
   $("events").scrollTop = $("events").scrollHeight;
-  $("artifacts").innerHTML = snapshot.artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span></div>`).join("") || `<div class="empty">No artifacts yet.</div>`;
-  $("detailDecisions").innerHTML = snapshot.pendingQuestions.length ? snapshot.pendingQuestions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty"><b>No pending decisions</b>This run is not waiting on you.</div>`;
+  $("reports").innerHTML = MissionObservability.renderReports(snapshot);
+  $("usage").innerHTML = MissionObservability.renderUsage(snapshot);
+  $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
+  $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;
+  $("activityCount").textContent = events.length;
+  $("reportCount").textContent = MissionObservability.reportCount(snapshot);
+  $("usageCount").textContent = (snapshot.modelCalls || []).length;
+  $("artifactCount").textContent = artifacts.length;
+  $("decisionCount").textContent = questions.length;
 }
 
 function connectEvents(runId) {
