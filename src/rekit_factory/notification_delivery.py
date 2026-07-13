@@ -170,10 +170,11 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
     run_id = _safe_id(deep_link.get("runId"), "run id")
     entity_type = _safe_id(deep_link.get("entityType"), "entity type")
     entity_id = _safe_id(deep_link.get("entityId"), "entity id")
-    expected_entity_type = "operator-decision" \
-        if kind == "operator-decision.waiting" else "finding"
-    expected_tab = "decisions" if expected_entity_type == "operator-decision" else "findings"
-    if entity_type != expected_entity_type or deep_link.get("tab") != expected_tab:
+    expected_links = ({"operator-decision": "decisions"}
+                      if kind == "operator-decision.waiting"
+                      else {"finding": "findings", "proof-bundle": "dossiers"})
+    expected_tab = expected_links.get(entity_type)
+    if expected_tab is None or deep_link.get("tab") != expected_tab:
         raise InvalidDeliveryConfiguration("delivery deep link is inconsistent")
     return {
         "schemaVersion": DELIVERY_SCHEMA_VERSION,

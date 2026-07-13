@@ -97,11 +97,14 @@ def _finding_at(entity: Mapping[str, Any] | None, facet_name: str, state: str) -
 
 
 def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
-               message: str) -> dict[str, Any]:
+               message: str, entity_type: str | None = None) -> dict[str, Any]:
+    linked_type = entity_type or (
+        "operator-decision" if kind == "operator-decision.waiting" else "finding"
+    )
     identity = {
         "policyVersion": POLICY_VERSION,
         "runId": run_id,
-        "entityType": "operator-decision" if kind == "operator-decision.waiting" else "finding",
+        "entityType": linked_type,
         "entityId": entity_id,
         "transition": kind,
     }
@@ -113,12 +116,26 @@ def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
         "kind": kind,
         "severity": severity,
         "runId": run_id,
-        "entity": {
-            "entityType": identity["entityType"],
-            "entityId": entity_id,
-        },
+        "entity": {"entityType": linked_type, "entityId": entity_id},
         "message": message,
     }
+
+
+def _exact_proof_link(
+    entities: Mapping[tuple[str, str], Mapping[str, Any]], finding_id: str,
+) -> str | None:
+    """Return one exact published proof child; ambiguity deliberately yields no guess."""
+    matches: list[str] = []
+    for (entity_type, entity_id), entity in entities.items():
+        if entity_type != "proof-bundle":
+            continue
+        parent = entity.get("parent")
+        publication = _facet(entity, "publication")
+        if (type(parent) is dict
+                and parent == {"entityType": "finding", "entityId": finding_id}
+                and publication and publication.get("state") == "published"):
+            matches.append(entity_id)
+    return matches[0] if len(matches) == 1 else None
 
 
 def notification_candidates(
@@ -165,18 +182,22 @@ def notification_candidates(
                     message="Operator decision is waiting in Mission Control.",
                 ))
         elif entity_type == "finding":
+            proof_id = _exact_proof_link(new_entities, entity_id)
+            linked_type = "proof-bundle" if proof_id is not None else "finding"
+            linked_id = proof_id or entity_id
             if (_finding_at(entity, "validation", "reproduced")
                     and not _finding_at(before, "validation", "reproduced")):
                 candidates.append(_candidate(
                     kind="finding.reproduced", severity="consequential",
-                    run_id=run_id, entity_id=entity_id,
+                    run_id=run_id, entity_id=linked_id, entity_type=linked_type,
                     message="A finding reached the reproduced threshold.",
                 ))
             if (_finding_at(entity, "acceptance", "accepted")
+                    and _finding_at(entity, "validation", "reproduced")
                     and not _finding_at(before, "acceptance", "accepted")):
                 candidates.append(_candidate(
                     kind="finding.accepted", severity="consequential",
-                    run_id=run_id, entity_id=entity_id,
+                    run_id=run_id, entity_id=linked_id, entity_type=linked_type,
                     message="A finding was accepted by the operator.",
                 ))
 

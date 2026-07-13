@@ -62,7 +62,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], campaigns: [], campaignSelected: null, campaignListRequest: 0, campaignDetailRequest: 0, campaignAction: null, campaignReturnFocus: null, config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, streamCursors: new Map(), restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
+const state = {fleet: [], campaigns: [], campaignSelected: null, campaignListRequest: 0, campaignDetailRequest: 0, campaignAction: null, campaignReturnFocus: null, config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], notifications: [], notificationRun: null, stream: null, streamCursors: new Map(), restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -220,7 +220,7 @@ function show(name) {
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === `view-${name}`));
   document.querySelectorAll(".nav").forEach(nav => nav.classList.toggle("active", nav.dataset.view === name));
   $("crumb").textContent = name.replaceAll("-", " ").toUpperCase();
-  return {generation, ready: name === "inbox" ? loadInbox() : Promise.resolve()};
+  return {generation, ready: name === "inbox" ? loadInbox() : name === "settings" ? loadNotifications() : Promise.resolve()};
 }
 
 function focusInbox() {
@@ -255,6 +255,11 @@ function activate(element) {
   if (element.closest("#themeToggle")) { toggleTheme(); return true; }
   const restart = element.closest("#restartService, [data-restart-service]");
   if (restart) { restartService(); return true; }
+  if (element.closest("[data-notification-refresh]")) { loadNotifications(); return true; }
+  const acknowledgement = element.closest("[data-notification-ack]");
+  if (acknowledgement) { acknowledgeNotification(acknowledgement); return true; }
+  const notificationLink = element.closest("[data-notification-link]");
+  if (notificationLink) { openNotificationLink(notificationLink); return true; }
   const view = element.closest("[data-view]");
   if (view) { show(view.dataset.view); return true; }
   if (element.closest("[data-attention-open]")) { openAttentionInbox(); return true; }
@@ -1100,6 +1105,47 @@ function renderConfig() {
   $("toolPicker").addEventListener("change", renderComposerState);
   applyStrategyDefaults();
   renderComposerState();
+}
+
+function renderNotifications() {
+  const list = $("notificationList");
+  $("notificationRunLabel").textContent = state.notificationRun ? `run · ${state.notificationRun}` : "no run selected";
+  if (!state.notificationRun) {
+    list.innerHTML = `<div class="empty compact"><b>No investigations yet</b>Durable delivery state will appear after a run emits a consequential transition.</div>`;
+    return;
+  }
+  list.innerHTML = state.notifications.length ? state.notifications.map(notification => {
+    const payload = notification.payload, link = payload.deepLink;
+    const canAcknowledge = notification.status === "sent";
+    return `<article class="notification-row notification-${esc(notification.status)}"><div class="notification-signal" aria-hidden="true"></div><div><span>${esc(payload.kind.replaceAll(".", " / "))}</span><b>${esc(payload.message)}</b><small>${esc(notification.status)} · ${esc(new Date(notification.updatedAt).toLocaleString())}</small>${notification.lastErrorCode ? `<code>${esc(notification.lastErrorCode)}</code>` : ""}</div><div class="notification-actions"><button class="btn" type="button" data-notification-link data-run="${esc(link.runId)}" data-tab="${esc(link.tab)}">Open ${esc(link.entityType)}</button>${canAcknowledge ? `<button class="btn primary" type="button" data-notification-ack data-notification-id="${esc(notification.id)}" data-notification-revision="${esc(notification.revision)}">Acknowledge</button>` : ""}</div></article>`;
+  }).join("") : `<div class="empty compact"><b>No delivery records</b>This run has no consequential notifications in its durable outbox.</div>`;
+}
+
+async function loadNotifications() {
+  const runId = state.selected || state.fleet[0]?.runId || state.fleet[0]?.id || null;
+  state.notificationRun = runId;
+  if (!runId) { state.notifications = []; renderNotifications(); return; }
+  try {
+    const result = await api(`/api/runs/${encodeURIComponent(runId)}/notifications`);
+    if (state.notificationRun !== runId) return;
+    state.notifications = result.notifications || [];
+    renderNotifications();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function acknowledgeNotification(button) {
+  button.disabled = true;
+  try {
+    const result = await api(`/api/runs/${encodeURIComponent(state.notificationRun)}/notifications/${encodeURIComponent(button.dataset.notificationId)}/acknowledge`, {method: "POST", body: JSON.stringify({expectedRevision: button.dataset.notificationRevision})});
+    state.notifications = state.notifications.map(item => item.id === result.notification.id ? result.notification : item);
+    renderNotifications(); toast("Notification acknowledged");
+  } catch (error) { button.disabled = false; toast(error.message, true); }
+}
+
+async function openNotificationLink(button) {
+  await openRun(button.dataset.run);
+  const tab = document.querySelector(`[role="tab"][data-tab="${CSS.escape(button.dataset.tab)}"]`);
+  if (tab) activateDetailTab(tab, {focus: true});
 }
 
 $("runForm").onsubmit = async event => {

@@ -23,6 +23,9 @@ from rekit_factory.campaign_persistence import CampaignPersistenceError
 from rekit_factory.evidence import EvidenceStore
 from rekit_factory.dossiers import DossierNotReady, dossier_list, verify_published_dossier
 from rekit_factory.outcomes import is_worker_report_result
+from rekit_factory.notification_outbox import (
+    NotificationNotFound, NotificationOutbox, NotificationStateConflict,
+)
 from rekit_factory.scope import AuthorizedScope
 from rekit_factory.store import FactoryLedger
 
@@ -193,6 +196,17 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     "vocabularyVersion": projection["vocabularyVersion"],
                     "semanticSha256": projection["semanticSha256"],
                     "reports": _worker_reports(snapshot),
+                })
+                return
+            if (len(parts) == 4 and parts[:2] == ["api", "runs"]
+                    and parts[3] == "notifications"):
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                with FactoryLedger(run_dir / "run.db") as ledger:
+                    notifications = NotificationOutbox(ledger.conn).public_records()
+                self._json(HTTPStatus.OK, {
+                    "schemaVersion": 1,
+                    "runId": parts[2],
+                    "notifications": notifications,
                 })
                 return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "dossiers":
@@ -384,6 +398,21 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     "pendingQuestions": result["pendingQuestions"],
                 })
                 return
+            if (len(parts) == 6 and parts[:2] == ["api", "runs"]
+                    and parts[3] == "notifications" and parts[5] == "acknowledge"):
+                if set(payload) != {"expectedRevision"}:
+                    raise ValueError(
+                        "notification acknowledgement body must contain only expectedRevision"
+                    )
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                with FactoryLedger(run_dir / "run.db") as ledger:
+                    notification = NotificationOutbox(ledger.conn).acknowledge_revision(
+                        parts[4], payload["expectedRevision"],
+                    )
+                self._json(HTTPStatus.OK, {
+                    "runId": parts[2], "notification": notification,
+                })
+                return
             if len(parts) == 6 and parts[:2] == ["api", "runs"] \
                     and parts[3] == "evidence":
                 run_dir = _find_run(self.server.storage_root, parts[2])
@@ -418,6 +447,12 @@ class FactoryHandler(BaseHTTPRequestHandler):
             status = (HTTPStatus.NOT_FOUND if "does not exist" in str(exc)
                       else HTTPStatus.CONFLICT)
             self._json(status, {"error": str(exc)})
+        except NotificationStateConflict as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+        except NotificationNotFound as exc:
+            self._json(HTTPStatus.NOT_FOUND, {
+                "error": f"unknown notification: {exc.args[0]}",
+            })
         except (KeyError, TypeError, ValueError, FileNotFoundError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": f"{type(exc).__name__}: {exc}"})
         except Exception as exc:

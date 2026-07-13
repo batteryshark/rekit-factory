@@ -80,7 +80,56 @@ def test_self_resolved_decision_never_emits_a_waiting_candidate():
 
     kinds = [item["kind"] for item in notification_candidates(old, resolved)]
     assert "operator-decision.waiting" not in kinds
-    assert kinds == ["finding.accepted"]
+    assert kinds == []
+
+
+def test_unproven_acceptance_is_suppressed_and_exact_proof_is_the_deep_link():
+    old = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},
+    })
+    unproven = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},
+        "finding_operator_decisions": {
+            "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                           "decision": "accepted", "_eventSeq": 1},
+        },
+    })
+    assert notification_candidates(old, unproven) == []
+
+    proven = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={
+            "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+            "finding_operator_decisions": {
+                "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                               "decision": "accepted", "_eventSeq": 1},
+            },
+        },
+        dossiers=[{"id": "dossier-1", "findingId": "finding-1",
+                   "verificationStatus": "published"}], pending_questions=(),
+    )
+    candidates = notification_candidates(old, proven)
+    assert {tuple(item["entity"].values()) for item in candidates} == {
+        ("proof-bundle", "dossier-1")
+    }
+
+
+def test_multiple_proof_children_never_guess_a_dossier_link():
+    old = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},
+    })
+    new = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={"findings": {
+            "finding-1": {"id": "finding-1", "status": "reproduced"},
+        }},
+        dossiers=[
+            {"id": "dossier-a", "findingId": "finding-1", "verificationStatus": "published"},
+            {"id": "dossier-b", "findingId": "finding-1", "verificationStatus": "published"},
+        ], pending_questions=(),
+    )
+    [candidate] = notification_candidates(old, new)
+    assert candidate["entity"] == {"entityType": "finding", "entityId": "finding-1"}
 
 
 def test_reproduced_and_accepted_finding_thresholds_are_distinct_and_deterministic():

@@ -40,7 +40,8 @@ def _candidate(kind="operator-decision.waiting"):
             memory={}, **common,
         )
     else:
-        status = "reproduced" if kind == "finding.reproduced" else "candidate"
+        status = "reproduced" if kind in {"finding.reproduced", "finding.accepted"} \
+            else "candidate"
         memory = {"findings": {"finding-1": {"id": "finding-1", "status": status}}}
         if kind == "finding.accepted":
             memory["finding_operator_decisions"] = {
@@ -105,6 +106,27 @@ def test_batch_admission_is_atomic_deduplicated_and_payload_is_redacted(outbox):
     with pytest.raises(InvalidNotificationCandidate, match="canonical redacted"):
         box.admit([_candidate("finding.accepted"), invalid])
     assert ledger.conn.execute("select count(*) from factory_notification_outbox").fetchone()[0] == 2
+
+
+def test_exact_proof_link_is_preserved_as_a_dossier_deep_link(outbox):
+    box, _, _ = outbox
+    old = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={"findings": {"finding-1": {"id": "finding-1", "status": "candidate"}}},
+        dossiers=(), pending_questions=(),
+    )
+    new = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={"findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}}},
+        dossiers=[{"id": "dossier-1", "findingId": "finding-1",
+                   "verificationStatus": "published"}], pending_questions=(),
+    )
+    [candidate] = notification_candidates(old, new)
+    [notification_id] = box.admit([candidate])
+    assert box.get(notification_id)["payload"]["deepLink"] == {
+        "view": "mission-control", "runId": "run-1", "tab": "dossiers",
+        "entityType": "proof-bundle", "entityId": "dossier-1",
+    }
 
 
 def test_admission_composes_with_caller_transaction_and_rolls_back(outbox):

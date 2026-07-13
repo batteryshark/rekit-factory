@@ -189,6 +189,42 @@ create table if not exists factory_notification_outbox (
 create index if not exists idx_factory_notification_outbox_due
     on factory_notification_outbox(status, next_attempt_at, created_at);
 
+create table if not exists factory_notification_schedules (
+    schedule_id          text primary key,
+    notification_id      text not null unique,
+    preferences_id       text not null,
+    preferences_revision text not null,
+    preferences_json     text not null,
+    preferences_sha256   text not null,
+    schedule_json        text not null,
+    schedule_sha256      text not null,
+    disposition          text not null,
+    created_at           text not null,
+    updated_at           text not null
+);
+
+create table if not exists factory_notification_deliveries (
+    id                text primary key,
+    schedule_id       text not null,
+    notification_id   text not null,
+    channel_ref       text not null,
+    phase             text not null,
+    status            text not null,
+    due_at            text,
+    attempt_count     integer not null default 0,
+    next_attempt_at   text,
+    lease_token       text,
+    lease_expires_at  text,
+    last_error_code   text,
+    created_at        text not null,
+    updated_at        text not null,
+    sent_at           text,
+    superseded_at     text,
+    unique(schedule_id, channel_ref, phase)
+);
+create index if not exists idx_factory_notification_deliveries_due
+    on factory_notification_deliveries(status, next_attempt_at, due_at, created_at);
+
 create table if not exists factory_notification_projection_state (
     run_id             text primary key,
     semantic_sha256    text not null,

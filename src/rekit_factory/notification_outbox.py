@@ -24,6 +24,7 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _KINDS = frozenset({"operator-decision.waiting", "finding.reproduced", "finding.accepted"})
 _SEVERITIES = frozenset({"action-required", "consequential"})
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+_REVISION = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class InvalidNotificationCandidate(ValueError):
@@ -32,6 +33,10 @@ class InvalidNotificationCandidate(ValueError):
 
 class NotificationStateConflict(ValueError):
     """Requested lifecycle transition conflicts with durable state."""
+
+
+class NotificationNotFound(KeyError):
+    """Requested notification identity does not exist in this outbox."""
 
 
 def _utc_now() -> datetime:
@@ -80,8 +85,9 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
     run_id = _safe_id(candidate.get("runId"), "runId")
     entity_type = _safe_id(entity.get("entityType"), "entity.entityType")
     entity_id = _safe_id(entity.get("entityId"), "entity.entityId")
-    expected_type = "operator-decision" if kind == "operator-decision.waiting" else "finding"
-    if entity_type != expected_type:
+    expected_types = ({"operator-decision"} if kind == "operator-decision.waiting"
+                      else {"finding", "proof-bundle"})
+    if entity_type not in expected_types:
         raise InvalidNotificationCandidate("candidate kind conflicts with entity type")
     messages = {
         "operator-decision.waiting": "Operator decision is waiting in Mission Control.",
@@ -97,7 +103,8 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
     expected_dedupe = "sha256:" + _digest(_canonical(identity))
     if candidate.get("dedupeKey") != expected_dedupe:
         raise InvalidNotificationCandidate("candidate dedupe identity is invalid")
-    tab = "decisions" if entity_type == "operator-decision" else "findings"
+    tab = {"operator-decision": "decisions", "finding": "findings",
+           "proof-bundle": "dossiers"}[entity_type]
     return {
         "schemaVersion": OUTBOX_SCHEMA_VERSION,
         "policyVersion": POLICY_VERSION,
@@ -231,6 +238,67 @@ class NotificationOutbox:
             "select * from factory_notification_outbox where id=?", (outbox_id,),
         ).fetchone()
         return None if row is None else self._record(row)
+
+    @staticmethod
+    def public_projection(record: Mapping[str, Any]) -> dict[str, Any]:
+        """Project an intact record for Mission Control without lease material."""
+        if type(record) is not dict:
+            raise ValueError("notification record must be an object")
+        required = {
+            "id", "status", "attemptCount", "nextAttemptAt", "lastErrorCode",
+            "createdAt", "updatedAt", "sentAt", "acknowledgedAt", "supersededAt",
+            "payload",
+        }
+        if set(record) != required:
+            raise ValueError("notification record has unsupported fields")
+        revision_document = _canonical({
+            "id": record["id"], "status": record["status"],
+            "updatedAt": record["updatedAt"],
+        })
+        return {
+            "schemaVersion": OUTBOX_SCHEMA_VERSION,
+            "id": record["id"],
+            "revision": "sha256:" + _digest(revision_document),
+            "status": record["status"],
+            "attemptCount": record["attemptCount"],
+            "nextAttemptAt": record["nextAttemptAt"],
+            "lastErrorCode": record["lastErrorCode"],
+            "createdAt": record["createdAt"],
+            "updatedAt": record["updatedAt"],
+            "sentAt": record["sentAt"],
+            "acknowledgedAt": record["acknowledgedAt"],
+            "supersededAt": record["supersededAt"],
+            "payload": record["payload"],
+        }
+
+    def public_records(self, *, limit: int = 128) -> list[dict[str, Any]]:
+        """Return a bounded newest-first read model, revalidating every stored row."""
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("limit must be between 1 and 128")
+        rows = self.connection.execute(
+            "select * from factory_notification_outbox "
+            "order by created_at desc,id desc limit ?", (limit,),
+        ).fetchall()
+        return [self.public_projection(self._record(row)) for row in rows]
+
+    def acknowledge_revision(self, outbox_id: str, expected_revision: str) -> dict[str, Any]:
+        """Acknowledge an exact sent revision; replays converge on the terminal record."""
+        _safe_id(outbox_id, "notificationId")
+        if type(expected_revision) is not str or _REVISION.fullmatch(expected_revision) is None:
+            raise ValueError("expectedRevision must be a sha256 revision")
+        with self._transaction():
+            record = self.get(outbox_id)
+            if record is None:
+                raise NotificationNotFound(outbox_id)
+            current = self.public_projection(record)
+            if current["status"] == "acknowledged":
+                return current
+            if current["revision"] != expected_revision:
+                raise NotificationStateConflict("notification revision is stale")
+            self.acknowledge(outbox_id)
+            acknowledged = self.get(outbox_id)
+            assert acknowledged is not None
+            return self.public_projection(acknowledged)
 
     def claim_due(self, worker_id: str, *, limit: int = 32) -> list[dict[str, Any]]:
         """Lease due delivery work. Expired leases are safely claimable after a crash."""
