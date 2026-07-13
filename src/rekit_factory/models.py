@@ -66,6 +66,27 @@ class ModelProfile:
     api_key: str
     api_key_source: str | None = None
     api_format: Literal["openai", "anthropic"] = "openai"
+    structured_output_mode: Literal["prompted", "native"] = "prompted"
+    concurrency_limit: int = 4
+    retry_limit: int = 2
+
+    def __post_init__(self) -> None:
+        for name in ("name", "provider", "model", "base_url", "api_key"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"model profile {name} must be a non-empty string")
+        if self.api_format not in {"openai", "anthropic"}:
+            raise ValueError("api_format must be 'openai' or 'anthropic'")
+        if self.structured_output_mode not in {"prompted", "native"}:
+            raise ValueError("structured_output_mode must be 'prompted' or 'native'")
+        if isinstance(self.concurrency_limit, bool) or not isinstance(self.concurrency_limit, int):
+            raise ValueError("concurrency_limit must be an integer")
+        if not 1 <= self.concurrency_limit <= 64:
+            raise ValueError("concurrency_limit must be between 1 and 64")
+        if isinstance(self.retry_limit, bool) or not isinstance(self.retry_limit, int):
+            raise ValueError("retry_limit must be an integer")
+        if not 0 <= self.retry_limit <= 10:
+            raise ValueError("retry_limit must be between 0 and 10")
 
     @classmethod
     def from_env(cls, prefix: str = "MINIMAX") -> "ModelProfile":
@@ -83,14 +104,26 @@ class ModelProfile:
         if missing:
             variables = ", ".join(f"{prefix}_{name.upper()}" for name in missing)
             raise ValueError(f"missing model profile variables: {variables}")
+        structured_output_mode = os.environ.get(
+            f"{prefix}_STRUCTURED_OUTPUT_MODE", "prompted"
+        ).lower()
+        if structured_output_mode not in {"prompted", "native"}:
+            raise ValueError(
+                f"{prefix}_STRUCTURED_OUTPUT_MODE must be 'prompted' or 'native', "
+                f"got {structured_output_mode!r}"
+            )
         return cls(
             name=prefix.lower(), provider=f"{api_format}-compatible",
             model=values["model"], base_url=values["base_url"], api_key=values["api_key"],
             api_key_source=f"{prefix}_API_KEY",
             api_format=api_format,
+            structured_output_mode=structured_output_mode,
+            concurrency_limit=_env_int(prefix, "CONCURRENCY_LIMIT", default=4),
+            retry_limit=_env_int(prefix, "RETRY_LIMIT", default=2),
         )
 
-    def public_dict(self) -> dict[str, str]:
+    def persistable_dict(self) -> dict[str, str | int]:
+        """Return inspectable policy and identity without credential material."""
         return {
             "name": self.name,
             "provider": self.provider,
@@ -98,7 +131,13 @@ class ModelProfile:
             "model": self.model,
             "baseUrl": self.base_url,
             "apiKeySource": self.api_key_source or f"{self.name.upper()}_API_KEY",
+            "structuredOutputMode": self.structured_output_mode,
+            "concurrencyLimit": self.concurrency_limit,
+            "retryLimit": self.retry_limit,
         }
+
+    def public_dict(self) -> dict[str, str | int]:
+        return self.persistable_dict()
 
 
 class WorkerBackend(Protocol):
@@ -130,11 +169,16 @@ class PydanticWorkerBackend:
             provider = OpenAIProvider(base_url=profile.base_url, api_key=profile.api_key)
             model = OpenAIChatModel(profile.model, provider=provider)
             model_settings = None
+        structured_output = (
+            PromptedOutput(WorkerReport)
+            if profile.structured_output_mode == "prompted"
+            else WorkerReport
+        )
         self._agent = Agent(
             model,
-            output_type=[PromptedOutput(WorkerReport), DeferredToolRequests],
+            output_type=[structured_output, DeferredToolRequests],
             model_settings=model_settings,
-            retries=2,
+            retries=profile.retry_limit,
             instructions=(
                 "You are one bounded worker inside a supervised reverse-engineering lab. "
                 "Address only the assigned role and goal using the supplied target snapshot "
@@ -240,6 +284,17 @@ class PydanticWorkerBackend:
                 "provider returned text during the mandatory evidence-tool turn"
             )
         return WorkerTurn(report=result.output, usage=usage, messages_json=serialized)
+
+
+def _env_int(prefix: str, suffix: str, *, default: int) -> int:
+    variable = f"{prefix}_{suffix}"
+    raw = os.environ.get(variable)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{variable} must be an integer, got {raw!r}") from exc
 
 
 def _tool_name(tool_id: str) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -35,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
     )
     start.add_argument("--worker", action="append", default=[])
     start.add_argument("--concurrency", type=int, default=4)
-    start.add_argument("--model-env", dest="model_envs", action="append")
+    _add_model_options(start)
     start.add_argument("--model-profile", help="named profile selected for this run")
 
     status = commands.add_parser("status", help="print a Mission Control snapshot")
@@ -43,27 +44,64 @@ def parser() -> argparse.ArgumentParser:
 
     resume = commands.add_parser("resume", help="resume a durable run")
     resume.add_argument("run_dir", type=Path)
-    resume.add_argument("--model-env", dest="model_envs", action="append")
+    _add_model_options(resume)
 
     answer = commands.add_parser("answer", help="answer a durable permission request")
     answer.add_argument("run_dir", type=Path)
     answer.add_argument("question_id")
     answer.add_argument("answer", choices=["allow", "deny"])
-    answer.add_argument("--model-env", dest="model_envs", action="append")
+    _add_model_options(answer)
     answer.add_argument("--no-resume", action="store_true")
 
     serve_cmd = commands.add_parser("serve", help="serve the loopback Mission Control API")
     serve_cmd.add_argument("--host", default="127.0.0.1")
     serve_cmd.add_argument("--port", type=int, default=8768)
-    serve_cmd.add_argument("--model-env", dest="model_envs", action="append",
-                           help="environment prefix; repeat to register several profiles")
+    _add_model_options(serve_cmd)
     return root
+
+
+def _add_model_options(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--model-env", dest="model_envs", action="append",
+        help="environment prefix; repeat to register several profiles",
+    )
+    command.add_argument(
+        "--model-structured-output", choices=("prompted", "native"),
+        help="override structured-output policy for registered profiles",
+    )
+    command.add_argument(
+        "--model-concurrency-limit", type=int,
+        help="override the declared per-profile concurrent-call ceiling",
+    )
+    command.add_argument(
+        "--model-retry-limit", type=int,
+        help="override provider/validation retries for registered profiles",
+    )
+
+
+def _load_profiles(args: argparse.Namespace) -> list[ModelProfile]:
+    prefixes = args.model_envs or ["MINIMAX"]
+    profiles = [ModelProfile.from_env(prefix) for prefix in prefixes]
+    overrides = {
+        "structured_output_mode": args.model_structured_output,
+        "concurrency_limit": args.model_concurrency_limit,
+        "retry_limit": args.model_retry_limit,
+    }
+    selected = {name: value for name, value in overrides.items() if value is not None}
+    return [replace(profile, **selected) for profile in profiles]
+
+
+def _enforce_concurrency(profile: ModelProfile, requested: int) -> None:
+    if requested > profile.concurrency_limit:
+        raise ValueError(
+            f"requested concurrency {requested} exceeds model profile "
+            f"{profile.name!r} ceiling {profile.concurrency_limit}"
+        )
 
 
 def _controller(args, *, needs_model: bool) -> InvestigationController:
     if needs_model:
-        prefixes = args.model_envs or ["MINIMAX"]
-        profiles = [ModelProfile.from_env(prefix) for prefix in prefixes]
+        profiles = _load_profiles(args)
         backends = {profile.name: PydanticWorkerBackend(profile) for profile in profiles}
     else:
         # Status never makes a model call; a non-secret placeholder keeps construction cheap.
@@ -100,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "start":
             roles = tuple(args.worker) if args.worker else ("recon", "analyst")
             controller = _controller(args, needs_model=True)
+            _enforce_concurrency(
+                controller.worker_backend(args.model_profile).profile,
+                args.concurrency,
+            )
             request = RunRequest(
                 target=args.target,
                 goal=args.goal,
