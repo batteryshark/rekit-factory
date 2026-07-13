@@ -369,6 +369,18 @@ class ControlPlaneTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "RESEARCH_API_FORMAT"):
                 ModelProfile.from_env("RESEARCH")
 
+    def test_mission_control_exposes_strategy_and_safety_composer(self):
+        ui = Path(__file__).parents[1] / "src" / "rekit_factory" / "ui"
+        page = (ui / "index.html").read_text(encoding="utf-8")
+        script = (ui / "mission-control.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="strategySelect"', page)
+        self.assertIn('id="retriesPerWorker"', page)
+        self.assertIn('value="automatic-only"', page)
+        for field in ("strategy", "concurrency", "retriesPerWorker", "costUnits", "maxWorkers"):
+            self.assertIn(field, script)
+        self.assertIn("cannot bypass server-side gates", page)
+
     def test_loopback_api_launches_exposes_and_answers_a_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = self._fixture(tmp)
@@ -389,6 +401,9 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b'/ui/mission-control.js', page)
                     self.assertIn(b'data-tab="reports"', page)
                     self.assertIn(b'data-tab="usage"', page)
+                    self.assertIn(b'id="strategySelect"', page)
+                    self.assertIn(b'id="retriesPerWorker"', page)
+                    self.assertIn(b'value="automatic-only"', page)
                 with urlopen(base + "/ui/mission-control.css", timeout=5) as response:
                     self.assertEqual("text/css; charset=utf-8", response.headers["Content-Type"])
                     self.assertIn(b"prefers-reduced-motion", response.read())
@@ -400,8 +415,13 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b"async function boot()", script)
                     self.assertIn(b"renderDecision", script)
                     self.assertIn(b"cacheReadTokens", script)
+                    self.assertIn(b"retriesPerWorker", script)
+                    self.assertIn(b"costUnits", script)
+                    self.assertIn(b"maxWorkers", script)
                 config = self._request(base + "/api/config")
                 self.assertEqual("deterministic", config["modelProfile"]["model"])
+                self.assertEqual("prompted", config["modelProfile"]["structuredOutputMode"])
+                self.assertIn("recon-analysis", {item["name"] for item in config["strategies"]})
                 self.assertEqual(2, len(config["tools"]))
                 launched = self._request(base + "/api/runs", {
                     "target": str(target),
