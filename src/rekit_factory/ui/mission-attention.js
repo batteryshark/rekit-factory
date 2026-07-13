@@ -14,6 +14,29 @@
     return `${questions} new decisions are waiting across ${runs} ${runs === 1 ? "investigation" : "investigations"}.`;
   }
 
+  function claimQuestionState(tracker, runId, pendingQuestions = []) {
+    const questionIds = pendingQuestions.map(question => question?.id).filter(Boolean);
+    if (!questionIds.length) {
+      tracker.rearm(runId);
+      return 0;
+    }
+    return tracker.claim(runId, questionIds) ? questionIds.length : 0;
+  }
+
+  function restoreFocus(element) {
+    if (!element?.isConnected || typeof element.focus !== "function") return false;
+    element.focus({preventScroll: true});
+    return true;
+  }
+
+  function focusInbox(container, heading) {
+    const action = container?.querySelector?.("[data-answer], [data-direction-input], [data-direction-submit]");
+    const target = action || heading;
+    if (typeof target?.focus !== "function") return null;
+    target.focus({preventScroll: true});
+    return target;
+  }
+
   function createTracker({seenLimit = 512} = {}) {
     const limit = Number.isInteger(seenLimit) && seenLimit > 0 ? seenLimit : 512;
     let initialized = false;
@@ -50,5 +73,5 @@
     return {claim, rearm, transitions};
   }
 
-  return {createTracker, messageFor};
+  return {claimQuestionState, createTracker, focusInbox, messageFor, restoreFocus};
 });

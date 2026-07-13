@@ -32,7 +32,7 @@
         <div class="fleet-controls"><div class="filters" id="filters"></div><label class="fleet-search" for="fleetSearch"><span aria-hidden="true">⌕</span><input id="fleetSearch" type="search" placeholder="Search target, goal, model…" autocomplete="off"></label></div><div class="fleet-health" id="fleetHealth"></div><div class="fleet" id="fleet"></div>
       </section>
       <section class="view" id="view-inbox">
-        <div class="view-head"><div><div class="eyebrow">HUMAN GATE</div><h1>Decision Inbox</h1><div class="sub">permission and direction questions waiting for your call</div></div></div>
+        <div class="view-head"><div><div class="eyebrow">HUMAN GATE</div><h1 id="inboxHeading" tabindex="-1">Decision Inbox</h1><div class="sub">permission and direction questions waiting for your call</div></div></div>
         <div class="inbox-list" id="inbox"></div>
       </section>
       <section class="view" id="view-newrun">
@@ -82,7 +82,8 @@
     </div>
   </main>
 </div>
-<aside class="operator-attention" id="operatorAttention" role="region" aria-live="assertive" aria-labelledby="operatorAttentionTitle" aria-describedby="operatorAttentionMessage" hidden>
+<div class="attention-announcer" id="operatorAttentionAnnouncer" role="status" aria-live="assertive" aria-atomic="true"></div>
+<aside class="operator-attention" id="operatorAttention" role="region" aria-labelledby="operatorAttentionTitle" aria-describedby="operatorAttentionMessage" hidden>
   <button class="attention-dismiss" type="button" data-attention-dismiss aria-label="Dismiss operator attention notification">×</button>
   <div class="attention-signal" aria-hidden="true"><i></i><span>!</span></div>
   <div class="attention-copy"><span class="eyebrow">LIVE OPERATOR GATE</span><b id="operatorAttentionTitle">Operator attention required</b><p id="operatorAttentionMessage">A new decision is waiting in the inbox.</p></div>

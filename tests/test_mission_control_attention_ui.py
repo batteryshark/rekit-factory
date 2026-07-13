@@ -16,26 +16,30 @@ class MissionControlAttentionTests(unittest.TestCase):
         api = (UI.parent / "api.py").read_text(encoding="utf-8")
 
         for marker in (
-            'id="operatorAttention"', "Open Inbox", "data-attention-later",
-            "data-attention-dismiss", 'aria-live="assertive"',
+            'id="operatorAttention"', 'id="operatorAttentionAnnouncer"',
+            'id="inboxHeading" tabindex="-1"', "Open Inbox", "data-attention-later",
+            "data-attention-dismiss", 'aria-live="assertive"', 'aria-atomic="true"',
         ):
             self.assertIn(marker, page)
         self.assertLess(page.index("/ui/mission-attention.js"), page.index("/ui/mission-control.js"))
         self.assertIn('"mission-attention.js": "text/javascript; charset=utf-8"', api)
         for behavior in (
-            "state.attention.transitions(runs)", "state.attention.claim(run.runId, questionIds)",
-            "state.attention.rearm(run.runId)", "MissionAttention.messageFor(runCount, questionCount)",
-            "show(\"inbox\")", "dismissAttention",
+            "state.attention.transitions(runs)", "MissionAttention.messageFor(runCount, questionCount)",
+            "MissionAttention.claimQuestionState", "openAttentionInbox", "focusInbox",
+            "MissionAttention.restoreFocus(previous)", "dismissAttention", "cancelAnimationFrame",
         ):
             self.assertIn(behavior, script)
         announce = script[script.index("async function announceAttention"):script.index("const delay")]
-        self.assertIn("question.id", announce)
+        attention_helper = (UI / "mission-attention.js").read_text(encoding="utf-8")
+        for helper_behavior in ("question?.id", "tracker.claim(runId, questionIds)", "tracker.rearm(runId)"):
+            self.assertIn(helper_behavior, attention_helper)
         for sensitive_detail in (
             "question.prompt", "question.message", "question.toolId", "run.target", "run.goal",
         ):
             self.assertNotIn(sensitive_detail, announce)
         self.assertIn("attention-arrive", style)
         self.assertIn("attention-ring", style)
+        self.assertIn(".attention-announcer", style)
         self.assertIn("@media(prefers-reduced-motion:reduce)", style)
 
     def test_attention_tracker_transitions_and_deduplication(self):
