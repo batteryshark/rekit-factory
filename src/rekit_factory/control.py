@@ -46,10 +46,12 @@ from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.scope import (
     ActionAuthority,
     AuthorizedScope,
+    ScopeDecision,
     ScopeRequest,
     TargetGrant,
     decide_scope,
     legacy_local_read_only_scope,
+    opaque_ref,
 )
 from rekit_factory.store import FactoryLedger
 from rekit_factory.strategies import (
@@ -386,6 +388,8 @@ class InvestigationController:
             ):
                 raw = item.pop(source)
                 item[target] = json.loads(raw) if raw else None
+            if item["payload"]:
+                item["payload"] = _redact_intent(item["payload"])
             work.append(item)
         artifacts = [dict(row) for row in ledger.conn.execute(
             "select * from artifacts where run_id=? order by created_at", (paths.run_id,)
@@ -400,7 +404,12 @@ class InvestigationController:
             "events": ledger.events(paths.run_id),
             "pendingQuestions": ledger.pending_questions(paths.run_id),
             "modelCalls": ledger.model_calls(paths.run_id),
-            "workerSessions": ledger.worker_sessions(paths.run_id),
+            "workerSessions": [
+                {**session,
+                 "pendingCalls": [_redact_intent(call)
+                                  for call in session.get("pendingCalls", [])]}
+                for session in ledger.worker_sessions(paths.run_id)
+            ],
             "toolCalls": ledger.tool_calls(paths.run_id),
             "artifacts": artifacts,
             "memory": project_memory.deterministic_dict(),
@@ -414,7 +423,25 @@ class InvestigationController:
         manifest = self.rekit.manifest(tool_id)
         scope = _load_scope(ctx.deps.paths, Path(item["target"]))
         decision = None
-        for action in _manifest_actions(manifest):
+        actions = list(_manifest_actions(manifest))
+        requested_action = payload.get("requestedAction")
+        if requested_action:
+            try:
+                actions.append(ActionAuthority(requested_action))
+            except ValueError:
+                decision = ScopeDecision(
+                    False,
+                    "scope.action_invalid",
+                    (f"scope:{scope.envelope.scope_id}:r{scope.envelope.revision}:"
+                     f"{scope.envelope.content_digest[:12]}"),
+                    TargetGrant.from_path(item["target"]).path_fingerprint,
+                    (opaque_ref("endpoint", payload["endpoint"])
+                     if payload.get("endpoint") else None),
+                    "invalid",
+                )
+        for action in dict.fromkeys(actions):
+            if decision is not None:
+                break
             candidate = decide_scope(
                 scope,
                 ScopeRequest(
@@ -644,7 +671,11 @@ class InvestigationController:
             )
             pending_calls = [
                 {"callId": call.call_id, "toolId": call.tool_id,
-                 "toolName": call.tool_name}
+                 "toolName": call.tool_name,
+                 "endpoint": call.endpoint,
+                 "accountRef": call.account_ref,
+                 "usesCredentials": call.uses_credentials,
+                 "requestedAction": call.requested_action}
                 for call in turn.deferred_calls
             ]
             ledger.save_worker_session(
@@ -670,6 +701,10 @@ class InvestigationController:
                             "workerId": worker_id,
                             "workerItemId": item["id"],
                             "safetyTier": manifest.safety_tier,
+                            "endpoint": call.endpoint,
+                            "accountRef": call.account_ref,
+                            "usesCredentials": call.uses_credentials,
+                            "requestedAction": call.requested_action,
                         },
                         state_label="model_requested",
                     )
@@ -929,6 +964,22 @@ def _manifest_actions(manifest: Any) -> tuple[ActionAuthority, ...]:
     if manifest.network not in {"none", "emulated"}:
         actions.append(ActionAuthority.NETWORK_ACCESS)
     return tuple(actions)
+
+
+def _redact_intent(payload: dict[str, Any]) -> dict[str, Any]:
+    public = dict(payload)
+    endpoint = public.pop("endpoint", None)
+    if endpoint:
+        public["endpointRef"] = opaque_ref("endpoint", str(endpoint))
+    # accountRef is required to be opaque by the scope matrix; never expose a
+    # malformed model-supplied value before that denial is resolved.
+    account = public.pop("accountRef", None)
+    if account:
+        public["accountRef"] = (
+            account if str(account).startswith("account:")
+            else opaque_ref("account", str(account))
+        )
+    return public
 
 
 def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,

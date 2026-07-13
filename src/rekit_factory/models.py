@@ -49,6 +49,10 @@ class DeferredModelToolCall:
     call_id: str
     tool_id: str
     tool_name: str
+    endpoint: str | None = None
+    account_ref: str | None = None
+    uses_credentials: bool = False
+    requested_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -221,7 +225,13 @@ class PydanticWorkerBackend:
             name = _tool_name(tool.id)
             names[name] = tool
 
-            async def request_rekit_tool() -> None:
+            async def request_rekit_tool(
+                endpoint: str | None = None,
+                account_ref: str | None = None,
+                uses_credentials: bool = False,
+                requested_action: str | None = None,
+            ) -> None:
+                """Request durable execution with explicit external-action intent."""
                 raise CallDeferred
 
             toolset.add_function(
@@ -274,10 +284,15 @@ class PydanticWorkerBackend:
                 tool = names.get(call.tool_name)
                 if tool is None:
                     raise ValueError(f"model requested unknown Rekit tool {call.tool_name!r}")
+                intent = call.args_as_dict(raise_if_invalid=False)
                 calls.append(DeferredModelToolCall(
                     call_id=call.tool_call_id,
                     tool_id=tool.id,
                     tool_name=call.tool_name,
+                    endpoint=_optional_string(intent.get("endpoint")),
+                    account_ref=_optional_string(intent.get("account_ref")),
+                    uses_credentials=intent.get("uses_credentials") is True,
+                    requested_action=_optional_string(intent.get("requested_action")),
                 ))
             return WorkerTurn(
                 report=None,
@@ -301,6 +316,10 @@ def _env_int(prefix: str, suffix: str, *, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{variable} must be an integer, got {raw!r}") from exc
+
+
+def _optional_string(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _tool_name(tool_id: str) -> str:

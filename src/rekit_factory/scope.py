@@ -109,6 +109,8 @@ class ScopeEnvelope:
                 raise ValueError("domains must be lowercase host names")
         for value in self.ip_ranges:
             ipaddress.ip_network(value, strict=True)
+        if any(not value.startswith("account:") for value in self.account_refs):
+            raise ValueError("accounts must be stored as opaque account references")
         if self.network_mode is NetworkMode.NONE and (
             self.endpoints or self.domains or self.ip_ranges or ActionAuthority.NETWORK_ACCESS in self.actions
         ):

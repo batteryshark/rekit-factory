@@ -92,6 +92,10 @@ class InvocationRequest(_Envelope):
     arguments: tuple[str, ...] = ()
     network_policy: NetworkPolicy = "none"
     approval_id: str | None = None
+    endpoint: str | None = None
+    scope_digest: str | None = None
+    scope_revision: dict[str, Any] | None = None
+    requested_actions: tuple[str, ...] = ()
     invocation_id: str = field(default_factory=lambda: f"invoke-{uuid.uuid4().hex[:12]}")
 
     def __post_init__(self) -> None:
@@ -103,6 +107,19 @@ class InvocationRequest(_Envelope):
             raise ValueError(f"unsupported network_policy: {self.network_policy}")
         if self.approval_id is not None:
             _require_text(self.approval_id, "approval_id")
+        if self.endpoint is not None:
+            _require_text(self.endpoint, "endpoint")
+        if self.scope_digest is not None and not _SHA256.fullmatch(self.scope_digest):
+            raise ValueError("scope_digest must be a lowercase SHA-256 digest")
+        if (self.scope_digest is None) != (self.scope_revision is None):
+            raise ValueError("scope_digest and scope_revision must be supplied together")
+        if self.scope_revision is not None:
+            _require_json(self.scope_revision, "scope_revision")
+            if not self.requested_actions:
+                raise ValueError("scoped remote invocation requires requested_actions")
+        if any(not isinstance(action, str) or not action.strip()
+               for action in self.requested_actions):
+            raise ValueError("requested_actions must contain non-empty action names")
         if any(not isinstance(argument, str) for argument in self.arguments):
             raise ValueError("arguments must contain only strings")
 
@@ -110,6 +127,7 @@ class InvocationRequest(_Envelope):
     def from_dict(cls, value: dict[str, Any]) -> Self:
         fields = cls._fields(value)
         fields["arguments"] = tuple(fields.get("arguments", ()))
+        fields["requested_actions"] = tuple(fields.get("requested_actions", ()))
         return cls(**fields)
 
 

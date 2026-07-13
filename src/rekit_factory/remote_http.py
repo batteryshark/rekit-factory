@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +23,13 @@ from rekit_factory.remote import (
     WorkerCapabilities,
     WorkerEvent,
     WorkerTransport,
+)
+from rekit_factory.scope import (
+    ActionAuthority,
+    AuthorizedScope,
+    NetworkMode,
+    hash_path,
+    normalize_endpoint,
 )
 
 
@@ -82,6 +90,7 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
             raise ValueError("remote target_path escapes the staged input root") from exc
         if not target.is_file():
             raise ValueError("staged target does not exist or is not a regular file")
+        self._validate_scope(request, target)
         local_request = replace(request, target_path=str(target))
         worker_id = self.worker_capabilities.worker_id
         accepted = WorkerEvent(
@@ -103,6 +112,41 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
             name=f"remote-worker-{request.invocation_id}",
             daemon=True,
         ).start()
+
+    def _validate_scope(self, request: InvocationRequest, target: Path) -> None:
+        if request.scope_revision is None:
+            if request.network_policy != "none":
+                raise PermissionError("verified scope is required for remote network access")
+            return  # compatibility for existing network-none staged invocations
+        scope = AuthorizedScope.from_dict(request.scope_revision)
+        now = datetime.now(timezone.utc).isoformat()
+        scope.validate(now=now)
+        if request.scope_digest != scope.envelope.content_digest:
+            raise PermissionError("remote scope digest does not match verified revision")
+        try:
+            actions = tuple(ActionAuthority(value) for value in request.requested_actions)
+        except ValueError as exc:
+            raise PermissionError("remote invocation contains an unknown action authority") from exc
+        if any(action not in scope.envelope.actions
+               or action in scope.envelope.prohibited_actions for action in actions):
+            raise PermissionError("remote action is outside the verified scope")
+        if request.target_sha256 is None or request.target_sha256 not in {
+            target.content_sha256 for target in scope.envelope.targets
+        }:
+            raise PermissionError("remote target hash is outside the verified scope")
+        if hash_path(target) != request.target_sha256:
+            raise PermissionError("staged remote target does not match its authorized hash")
+        if request.network_policy == "none":
+            return
+        if request.network_policy != "restricted":
+            raise PermissionError("verified scope permits only none or exact restricted egress")
+        if (scope.envelope.network_mode is not NetworkMode.EXACT_ENDPOINTS
+                or ActionAuthority.NETWORK_ACCESS not in actions):
+            raise PermissionError("verified scope does not authorize remote network access")
+        if request.endpoint is None:
+            raise PermissionError("exact endpoint is required for restricted remote egress")
+        if normalize_endpoint(request.endpoint) not in scope.envelope.endpoints:
+            raise PermissionError("remote endpoint is outside the verified scope")
 
     def _run_invocation(self, request: InvocationRequest) -> None:
         self._append_event(request, "invocation.started", "Invocation started")

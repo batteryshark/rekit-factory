@@ -12,6 +12,25 @@ from rekit_factory.remote_http import (
     RemoteWorkerError,
     RemoteWorkerHTTPServer,
 )
+from rekit_factory.scope import (
+    ActionAuthority, AuthorizedScope, NetworkMode, ScopeApproval, ScopeEnvelope,
+    TargetGrant, hash_path, normalize_endpoint, opaque_ref,
+)
+
+
+def remote_scope(target_hash: str, endpoint: str) -> AuthorizedScope:
+    envelope = ScopeEnvelope(
+        scope_id="scope-remote", revision=1,
+        valid_from="2026-07-01T00:00:00Z", valid_until="2026-08-01T00:00:00Z",
+        targets=(TargetGrant(target_hash, opaque_ref("target-path", "/controller/input")),),
+        endpoints=(endpoint,), network_mode=NetworkMode.EXACT_ENDPOINTS,
+        actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.NETWORK_ACCESS),
+    )
+    return AuthorizedScope(envelope, ScopeApproval(
+        scope_id=envelope.scope_id, revision=1, content_digest=envelope.content_digest,
+        approved_by="operator-remote", approved_at="2026-07-01T00:00:00Z",
+        expires_at="2026-08-01T00:00:00Z", rationale="Exact remote lab endpoint",
+    ))
 
 
 class FixtureWorker:
@@ -159,6 +178,62 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                     ("127.0.0.1", 0), worker, auth_token="token", input_root=tmp,
                     allowed_network_policies=(),
                 )
+
+    def test_remote_revalidates_scope_hash_revision_and_exact_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            allowed = normalize_endpoint("https://lab.example.test/api")
+            scope = remote_scope(target_hash, allowed)
+            with running_server(root, allowed_network_policies=("none", "restricted")) as (_, client):
+                request = self.request(
+                    invocation_id="invoke-scoped",
+                    target_sha256=target_hash,
+                    network_policy="restricted",
+                    endpoint=allowed,
+                    scope_digest=scope.envelope.content_digest,
+                    scope_revision=scope.to_dict(),
+                    requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,
+                                       ActionAuthority.NETWORK_ACCESS.value),
+                )
+                self.assertEqual("done", client.invoke(request).status)
+
+                injected = self.request(
+                    invocation_id="invoke-injected",
+                    target_sha256=target_hash,
+                    network_policy="restricted",
+                    endpoint="https://injected.invalid/collect",
+                    scope_digest=scope.envelope.content_digest,
+                    scope_revision=scope.to_dict(),
+                    requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,
+                                       ActionAuthority.NETWORK_ACCESS.value),
+                )
+                with self.assertRaisesRegex(RemoteWorkerError, "outside the verified scope"):
+                    client.invoke(injected)
+
+                mismatched = self.request(
+                    invocation_id="invoke-mismatch",
+                    target_sha256=target_hash,
+                    network_policy="restricted",
+                    endpoint=allowed,
+                    scope_digest="f" * 64,
+                    scope_revision=scope.to_dict(),
+                    requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,
+                                       ActionAuthority.NETWORK_ACCESS.value),
+                )
+                with self.assertRaisesRegex(RemoteWorkerError, "digest"):
+                    client.invoke(mismatched)
+
+                missing = self.request(
+                    invocation_id="invoke-missing-scope",
+                    target_sha256=target_hash,
+                    network_policy="restricted",
+                    endpoint=allowed,
+                )
+                with self.assertRaisesRegex(RemoteWorkerError, "verified scope is required"):
+                    client.invoke(missing)
 
 
 if __name__ == "__main__":

