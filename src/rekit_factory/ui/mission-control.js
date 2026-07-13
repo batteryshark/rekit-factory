@@ -147,6 +147,16 @@ function activate(element) {
     if (body) body.hidden = expanded;
     return true;
   }
+  const knowledgeToggle = element.closest("[data-knowledge-toggle]");
+  if (knowledgeToggle) {
+    const body = document.getElementById(knowledgeToggle.getAttribute("aria-controls"));
+    const expanded = knowledgeToggle.getAttribute("aria-expanded") === "true";
+    knowledgeToggle.setAttribute("aria-expanded", String(!expanded));
+    if (body) body.hidden = expanded;
+    return true;
+  }
+  const knowledgeCopy = element.closest("[data-knowledge-copy]");
+  if (knowledgeCopy) { copyText(knowledgeCopy.dataset.knowledgeCopy, "Content hash copied."); return true; }
   if (element.closest("#copyMemoryContext")) { copyMemoryContext(); return true; }
   const evidenceAction = element.closest("[data-evidence-action]");
   if (evidenceAction) { updateEvidence(evidenceAction.dataset.evidenceId, evidenceAction.dataset.evidenceAction); return true; }
@@ -182,12 +192,13 @@ document.addEventListener("keydown", event => {
     event.preventDefault();
     activate(event.target);
   }
-  if (event.target.matches(".tab") && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-    const tabs = [...event.target.closest(".tabs").querySelectorAll(".tab")];
-    const current = tabs.indexOf(event.target);
-    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
-      : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
-    event.preventDefault(); tabs[next].focus(); activate(tabs[next]);
+  if (event.target.matches('[role="tab"]') && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+    const tabs = [...event.target.closest('[role="tablist"]').querySelectorAll('[role="tab"]')];
+    let index = tabs.indexOf(event.target);
+    if (event.key === "Home") index = 0;
+    else if (event.key === "End") index = tabs.length - 1;
+    else index = (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    event.preventDefault(); tabs[index].focus(); activate(tabs[index]);
   }
 });
 
@@ -397,6 +408,63 @@ async function copyMemoryContext() {
   } catch (_error) { toast("The browser did not allow clipboard access.", true); }
 }
 
+async function copyText(value, message) {
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+    else {
+      const field = document.createElement("textarea"); field.value = value;
+      field.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+      document.body.appendChild(field); field.select(); document.execCommand("copy"); field.remove();
+    }
+    toast(message);
+  } catch (_error) { toast("The browser did not allow clipboard access.", true); }
+}
+
+function knowledgeCalls(snapshot) {
+  return (snapshot.workItems || []).filter(item => item.operation === "model-knowledge");
+}
+
+function knowledgeCallHTML(item, index) {
+  const payload = item.payload || {}, result = item.result || {};
+  const operation = payload.knowledgeOperation || result.operation || "retrieve";
+  const subject = operation === "search" ? payload.query
+    : operation === "follow" ? `${payload.root}:${payload.sourceId} → ${payload.linkTarget}`
+    : `${payload.root}:${payload.conceptId}`;
+  const description = item.error || result.description || (operation === "search"
+    ? `${(result.hits || []).length} bounded result${(result.hits || []).length === 1 ? "" : "s"}`
+    : "Selected for the worker's live context.");
+  const hits = (result.hits || []).map(hit => `<span class="knowledge-hit"><b>${esc(hit.root)}</b> · ${esc(hit.conceptId)}</span>`).join("");
+  return `<article class="knowledge-call ${esc(operation)}" style="--knowledge-order:${index}"><div class="knowledge-operation"><b>${esc(operation)}</b><span>bounded call</span></div><div class="knowledge-call-copy"><code title="${esc(subject || "knowledge request")}">${esc(subject || "knowledge request")}</code><p>${esc(description)}</p>${hits ? `<div class="knowledge-hits">${hits}</div>` : ""}</div><span class="knowledge-state ${esc(item.status)}">${esc(item.status)}</span></article>`;
+}
+
+function citationHTML(citation) {
+  const value = String(citation || "");
+  return /^https?:\/\//i.test(value)
+    ? `<a href="${esc(value)}" target="_blank" rel="noreferrer">${esc(value)}</a>`
+    : `<code>${esc(value)}</code>`;
+}
+
+function knowledgeReferenceHTML(reference, calls, index) {
+  const result = calls.map(item => item.result).find(item => item?.contentHash === reference.contentHash) || {};
+  const id = `knowledge-reference-${index}`;
+  const provenance = reference.provenance || {};
+  const route = provenance.operation === "follow"
+    ? `${provenance.sourceConceptId || "selected concept"} → ${provenance.linkTarget || reference.conceptId}`
+    : "selected from a bounded search result";
+  return `<article class="knowledge-reference" style="--knowledge-order:${index}"><button class="knowledge-reference-toggle" type="button" data-knowledge-toggle aria-expanded="false" aria-controls="${id}"><span class="knowledge-root-mark" aria-hidden="true">◇</span><span class="knowledge-reference-title"><b>${esc(result.title || reference.conceptId)}</b><span>${esc(reference.root)} · ${esc(reference.conceptId)}</span></span><i aria-hidden="true">⌄</i></button><div class="knowledge-reference-detail" id="${id}" hidden><p class="knowledge-rationale">${esc(reference.queryRationale)}</p><div class="knowledge-reference-facts"><div><span>provenance</span><code>${esc(provenance.operation || "selected")} · ${esc(route)}</code></div><div><span>content hash</span><code>${esc(reference.contentHash)}</code></div><div><span>retention</span><code>reference metadata only · concept body omitted</code></div></div>${reference.citations?.length ? `<div class="knowledge-citations">${reference.citations.map(citationHTML).join("")}</div>` : ""}<button class="btn knowledge-copy" type="button" data-knowledge-copy="${esc(reference.contentHash)}">Copy hash</button></div></article>`;
+}
+
+function renderKnowledge(snapshot) {
+  const calls = knowledgeCalls(snapshot), references = snapshot.knowledgeReferences || [];
+  const roots = snapshot.meta?.knowledgeRoots || [];
+  $("knowledgeRunRoots").innerHTML = roots.length
+    ? roots.map(root => `<span>${esc(root)}</span>`).join("")
+    : `<span>no roots configured</span>`;
+  $("knowledgeFlow").innerHTML = calls.length ? calls.map(knowledgeCallHTML).join("") : `<div class="knowledge-empty"><b>No retrieval calls yet</b>Workers will search configured indexes only when project knowledge is relevant.</div>`;
+  $("knowledgeReferences").innerHTML = references.length ? references.map((reference, index) => knowledgeReferenceHTML(reference, calls, index)).join("") : `<div class="knowledge-empty"><b>No selected references</b>Search results are not durable selections until a worker opens or follows one.</div>`;
+  $("knowledgeCount").textContent = references.length;
+}
+
 function renderDetail() {
   const snapshot = state.snapshot, run = snapshot.run, meta = snapshot.meta;
   const events = snapshot.events || [], artifacts = snapshot.artifacts || [], questions = snapshot.pendingQuestions || [];
@@ -410,6 +478,7 @@ function renderDetail() {
   $("reports").innerHTML = MissionObservability.renderReports(snapshot);
   $("usage").innerHTML = MissionObservability.renderUsage(snapshot);
   renderMemory(snapshot);
+  renderKnowledge(snapshot);
   $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
   renderEvidence();
   $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;
@@ -474,7 +543,9 @@ function renderConfig() {
   const strategies = config.strategies || [];
   $("strategySelect").innerHTML = strategies.map(strategy => `<option value="${esc(strategy.name)}">${esc(strategy.name)}</option>`).join("") + `<option value="custom-roles">custom roles</option>`;
   $("profile").innerHTML = profiles.map(profile => `<div class="profile-block"><div class="kv"><span>profile</span><span>${esc(profile.name)}</span></div><div class="kv"><span>provider</span><span>${esc(profile.provider)}</span></div><div class="kv"><span>protocol</span><span>${esc(profile.apiFormat || "openai")}</span></div><div class="kv"><span>model</span><span class="model-name">${esc(profile.model)}</span></div><div class="kv"><span>endpoint</span><span>${esc(profile.baseUrl)}</span></div><div class="kv"><span>secret</span><span>${esc(profile.apiKeySource)}</span></div></div>`).join("");
-  $("settings").innerHTML = `<div class="kv"><span>storage root</span><span>${esc(config.storageRoot)}</span></div><div class="kv"><span>API boundary</span><span>loopback only</span></div><div class="kv"><span>event transport</span><span>SSE · resumable ID</span></div><div class="kv"><span>model profiles</span><span>${profiles.length}</span></div>`;
+  const knowledgeRoots = config.knowledgeRoots || [];
+  $("knowledgeRootCatalog").innerHTML = knowledgeRoots.length ? knowledgeRoots.map(root => `<div class="knowledge-root-card"><i aria-hidden="true"></i><span><b>${esc(root.name)}</b><small>named OKF index · path withheld</small></span><em>read only</em></div>`).join("") : `<div class="hint">No knowledge roots configured.</div>`;
+  $("settings").innerHTML = `<div class="kv"><span>storage root</span><span>${esc(config.storageRoot)}</span></div><div class="kv"><span>API boundary</span><span>loopback only</span></div><div class="kv"><span>event transport</span><span>SSE · resumable ID</span></div><div class="kv"><span>model profiles</span><span>${profiles.length}</span></div><div class="kv"><span>knowledge roots</span><span>${knowledgeRoots.length} named · paths withheld</span></div>`;
   setRestartState(false);
   const tools = config.tools || [];
   const toolRow = tool => `<label class="tool"><input type="checkbox" value="${esc(tool.id)}" data-gated="${Boolean(tool.requires_permission)}"><span class="tool-name">${esc(tool.id)}<small>${esc(tool.source || "default")}</small></span><span class="tier ${tool.requires_permission ? "gated" : ""}">${tool.requires_permission ? "ask" : "auto"} · t${tool.safety_tier}</span></label>`;
@@ -510,6 +581,9 @@ $("runForm").onsubmit = async event => {
 };
 
 async function boot() {
+  document.querySelectorAll('[role="tab"]').forEach(tab => {
+    tab.tabIndex = tab.getAttribute("aria-selected") === "true" ? 0 : -1;
+  });
   try {
     state.config = await api("/api/config"); renderConfig();
     $("fleetSearch").addEventListener("input", event => { state.query = event.target.value; renderFleet(); });

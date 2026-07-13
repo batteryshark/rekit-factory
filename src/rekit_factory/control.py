@@ -749,12 +749,27 @@ class InvestigationController:
                     requested_id = _bounded_knowledge_text(
                         payload.get("conceptId"), "knowledge concept ID", 512
                     )
+                    if not _knowledge_search_disclosed(
+                        ledger, ctx.state.run_id, payload.get("workerId"), root, requested_id
+                    ):
+                        raise ValueError(
+                            "knowledge concept was not disclosed by this worker's prior search"
+                        )
                     concept = self.knowledge.get(root, requested_id, query=rationale)
-                    provenance = {"operation": "get", "toolCallId": payload.get("toolCallId")}
+                    provenance = {
+                        "operation": "get", "toolCallId": payload.get("toolCallId"),
+                        "workerId": payload.get("workerId"),
+                    }
                 else:
                     source_id = _bounded_knowledge_text(
                         payload.get("sourceId"), "knowledge source ID", 512
                     )
+                    if not _knowledge_source_selected(
+                        ledger, ctx.state.run_id, payload.get("workerId"), root, source_id
+                    ):
+                        raise ValueError(
+                            "knowledge link source was not selected by this worker"
+                        )
                     link_target = _bounded_knowledge_text(
                         payload.get("linkTarget"), "knowledge link target", 1_000
                     )
@@ -765,6 +780,7 @@ class InvestigationController:
                     provenance = {
                         "operation": "follow", "sourceConceptId": source_id,
                         "linkTarget": link_target, "toolCallId": payload.get("toolCallId"),
+                        "workerId": payload.get("workerId"),
                     }
                 if concept is None:
                     raise ValueError("knowledge concept or link is unavailable")
@@ -881,6 +897,12 @@ class InvestigationController:
                 purpose=role,
                 usage=turn.usage,
             )
+            knowledge_calls = [call for call in turn.deferred_calls
+                               if call.capability == "knowledge"]
+            if len(knowledge_calls) > 1:
+                raise ValueError(
+                    "workers may request only one progressive knowledge operation per turn"
+                )
             pending_calls = [
                 {"callId": call.call_id, "toolId": call.tool_id,
                  "toolName": call.tool_name,
@@ -1638,6 +1660,36 @@ def _knowledge_model_content(concept: KnowledgeConcept) -> str:
         **_knowledge_selection_payload(concept, "get"),
         "body": concept.body[:MAX_KNOWLEDGE_BODY],
     }, sort_keys=True)
+
+
+def _knowledge_search_disclosed(ledger: FactoryLedger, run_id: str, worker_id: Any,
+                                root: str, concept_id: str) -> bool:
+    if not isinstance(worker_id, str) or not worker_id:
+        return False
+    rows = ledger.conn.execute(
+        "select payload_json,result_json from work_items where run_id=? "
+        "and operation='model-knowledge' and status='done'", (run_id,),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        result = json.loads(row["result_json"]) if row["result_json"] else {}
+        if payload.get("workerId") != worker_id or result.get("operation") != "search":
+            continue
+        if any(hit.get("root") == root and hit.get("conceptId") == concept_id
+               for hit in result.get("hits", ()) if isinstance(hit, dict)):
+            return True
+    return False
+
+
+def _knowledge_source_selected(ledger: FactoryLedger, run_id: str, worker_id: Any,
+                               root: str, concept_id: str) -> bool:
+    if not isinstance(worker_id, str) or not worker_id:
+        return False
+    return any(
+        item["root"] == root and item["conceptId"] == concept_id
+        and item.get("provenance", {}).get("workerId") == worker_id
+        for item in ledger.knowledge_references(run_id)
+    )
 
 
 def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,

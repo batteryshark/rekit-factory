@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 import hashlib
+import json
 import os
 import re
 from typing import Any, Literal, Protocol
@@ -343,7 +344,7 @@ class PydanticWorkerBackend:
             if names and not message_history else None,
             event_stream_handler=coalesced_event_handler(event_sink) if event_sink else None,
         )
-        serialized = dump_message_history(result.all_messages())
+        serialized = _durable_message_history(result.all_messages())
         usage = _usage_dict(result.usage)
         if isinstance(result.output, DeferredToolRequests):
             calls = []
@@ -389,6 +390,47 @@ class PydanticWorkerBackend:
                 "provider returned text during the mandatory evidence-tool turn"
             )
         return WorkerTurn(report=result.output, usage=usage, messages_json=serialized)
+
+
+def _durable_message_history(messages: list[Any]) -> str:
+    """Persist provider history while replacing knowledge bodies with stable references."""
+    durable = []
+    for message in messages:
+        parts = []
+        changed = False
+        for part in getattr(message, "parts", ()):
+            if (getattr(part, "part_kind", None) == "tool-return"
+                    and str(getattr(part, "tool_name", "")).startswith("knowledge_")):
+                parts.append(replace(
+                    part, content=_compact_knowledge_return(
+                        getattr(part, "content", ""), getattr(part, "tool_name", "knowledge")
+                    ),
+                ))
+                changed = True
+            else:
+                parts.append(part)
+        durable.append(replace(message, parts=parts) if changed else message)
+    return dump_message_history(durable)
+
+
+def _compact_knowledge_return(content: Any, tool_name: str) -> str:
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        return json.dumps({
+            "operation": tool_name.removeprefix("knowledge_"),
+            "retained": "compact reference only",
+        }, sort_keys=True)
+    if payload.get("operation") == "search":
+        return json.dumps(payload, sort_keys=True)
+    allowed = {
+        "operation", "root", "conceptId", "title", "description", "type", "tags",
+        "citations", "contentHash", "links",
+    }
+    return json.dumps({key: value for key, value in payload.items() if key in allowed},
+                      sort_keys=True)
 
 
 def _env_int(prefix: str, suffix: str, *, default: int) -> int:
