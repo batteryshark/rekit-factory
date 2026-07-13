@@ -387,6 +387,8 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b"Mission Control", page)
                     self.assertIn(b'/ui/mission-control.css', page)
                     self.assertIn(b'/ui/mission-control.js', page)
+                    self.assertIn(b'data-tab="reports"', page)
+                    self.assertIn(b'data-tab="usage"', page)
                 with urlopen(base + "/ui/mission-control.css", timeout=5) as response:
                     self.assertEqual("text/css; charset=utf-8", response.headers["Content-Type"])
                     self.assertIn(b"prefers-reduced-motion", response.read())
@@ -394,7 +396,10 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertEqual(
                         "text/javascript; charset=utf-8", response.headers["Content-Type"]
                     )
-                    self.assertIn(b"async function boot()", response.read())
+                    script = response.read()
+                    self.assertIn(b"async function boot()", script)
+                    self.assertIn(b"renderDecision", script)
+                    self.assertIn(b"cacheReadTokens", script)
                 config = self._request(base + "/api/config")
                 self.assertEqual("deterministic", config["modelProfile"]["model"])
                 self.assertEqual(2, len(config["tools"]))
