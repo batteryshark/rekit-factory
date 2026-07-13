@@ -571,7 +571,17 @@ class InvestigationController:
             tool_id,
             Path(item["target"]),
             allow_dynamic=manifest.requires_permission and answer == "allow",
+            expected_manifest_digest=payload["manifestDigest"],
         )
+        if result.manifest_digest != payload["manifestDigest"]:
+            result = type(result)(
+                exit_code=5,
+                stdout=result.stdout,
+                stderr=(result.stderr + "\n" if result.stderr else "")
+                + "rekit: execution-time manifest digest was not verified",
+                command_label=result.command_label,
+                manifest_digest=None,
+            )
         captured_at = utcnow()
         evidence = EvidenceStore(ctx.deps.paths.run_dir / "evidence")
         outcome = evidence.capture_tool_output(
@@ -628,7 +638,8 @@ class InvestigationController:
                 "truncated": evidence_record.truncated,
                 "retentionClass": evidence_record.retention_class.value,
                 "capturePolicy": evidence_record.capture_policy,
-                "effectiveManifestDigest": manifest.effective_manifest_digest,
+                "effectiveManifestDigest": payload["manifestDigest"],
+                "verifiedManifestDigest": result.manifest_digest,
                 "declaredActions": [action.value for action in manifest.actions],
                 "credentialUse": manifest.credential_use,
                 "provenance": asdict(evidence_record.provenance),
@@ -638,7 +649,7 @@ class InvestigationController:
             ledger.resolve(
                 item["id"],
                 result={"toolId": tool_id, "output": str(output_path),
-                        "manifestDigest": manifest.effective_manifest_digest},
+                        "manifestDigest": result.manifest_digest},
                 evidence=str(output_path),
                 state_label="completed",
             )

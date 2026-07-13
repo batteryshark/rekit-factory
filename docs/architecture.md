@@ -57,6 +57,12 @@ permission, tool-call, and evidence/proof metadata. Static offline legacy manife
 `read_local_target`; risky legacy or contradictory declarations are unavailable pending
 review.
 
+The execution boundary also receives the run-pinned digest. Local and federated Rekit
+clients invoke `rekit run --expected-manifest-digest SHA256`; the owning dispatcher
+recomputes the contract from the exact in-memory entry used to construct the command and
+returns before process launch on mismatch. Tool and remote-worker results separately cite
+the verified digest; absence or disagreement is a failed execution, never success proof.
+
 ## Durable permission invariant
 
 A tool manifest determines whether permission is required. When a gated tool reaches

@@ -175,6 +175,11 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
             )
             if actual != expected:
                 raise ValueError("worker result provenance does not match the leased invocation")
+            if (request.expected_manifest_digest is not None
+                    and result.manifest_digest != request.expected_manifest_digest):
+                raise ValueError(
+                    "worker result manifest digest does not match the leased invocation"
+                )
         except Exception as exc:
             result = InvocationResult(
                 invocation_id=request.invocation_id,
@@ -190,7 +195,7 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
             request,
             f"invocation.{result.status}",
             f"Invocation {result.status}",
-            {"exitCode": result.exit_code},
+            {"exitCode": result.exit_code, "manifestDigest": result.manifest_digest},
         )
         with self._lock:
             self._results[request.invocation_id] = result
@@ -355,7 +360,13 @@ class HTTPWorkerTransport:
         while time.monotonic() < deadline:
             status, value = self._request("GET", path, expected=(200, 202))
             if status == 200:
-                return InvocationResult.from_dict(value)
+                result = InvocationResult.from_dict(value)
+                if (result.status == "done" and request.expected_manifest_digest is not None
+                        and result.manifest_digest != request.expected_manifest_digest):
+                    raise RemoteWorkerError(
+                        "remote result manifest digest does not match the leased invocation"
+                    )
+                return result
             time.sleep(self.poll_interval)
         raise TimeoutError(f"timed out waiting for invocation {request.invocation_id}")
 

@@ -103,12 +103,14 @@ class ToolResult:
     stdout: str
     stderr: str
     command_label: str
+    manifest_digest: str | None = None
 
 
 class RekitAdapter(Protocol):
     def manifest(self, tool_id: str) -> ToolManifest: ...
     def list_tools(self) -> list[ToolManifest]: ...
-    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False) -> ToolResult: ...
+    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False,
+            expected_manifest_digest: str | None = None) -> ToolResult: ...
 
 
 class RekitClient:
@@ -147,9 +149,11 @@ class RekitClient:
     def list_tools(self) -> list[ToolManifest]:
         return [self.manifest(tool_id) for tool_id in sorted(self._registry)]
 
-    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False) -> ToolResult:
+    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False,
+            expected_manifest_digest: str | None = None) -> ToolResult:
         item = self._registry[tool_id]
-        command = [str(self.binary), "run"]
+        expected = expected_manifest_digest or self.manifest(tool_id).effective_manifest_digest
+        command = [str(self.binary), "run", "--expected-manifest-digest", expected]
         if allow_dynamic:
             command.append("--allow-dynamic")
         command.extend([tool_id, str(target)])
@@ -164,6 +168,7 @@ class RekitClient:
             stdout=proc.stdout,
             stderr=proc.stderr,
             command_label=f"rekit run {tool_id} <target>",
+            manifest_digest=(expected if proc.returncode != 5 else None),
         )
 
 
@@ -211,12 +216,16 @@ class FederatedRekitClient:
     def list_tools(self) -> list[ToolManifest]:
         return [manifest for client in self._clients for manifest in client.list_tools()]
 
-    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False) -> ToolResult:
+    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False,
+            expected_manifest_digest: str | None = None) -> ToolResult:
         try:
             owner = self._owners[tool_id]
         except KeyError as exc:
             raise KeyError(f"unknown Rekit tool {tool_id!r}") from exc
-        return owner.run(tool_id, target, allow_dynamic=allow_dynamic)
+        return owner.run(
+            tool_id, target, allow_dynamic=allow_dynamic,
+            expected_manifest_digest=expected_manifest_digest,
+        )
 
 
 def _source_label(value: str) -> str:

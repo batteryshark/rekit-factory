@@ -144,24 +144,31 @@ class FakeRekit:
     def list_tools(self):
         return [self.manifest("fixture-scan"), self.manifest("exec-observe")]
 
-    def run(self, tool_id, target, *, allow_dynamic=False):
+    def run(self, tool_id, target, *, allow_dynamic=False,
+            expected_manifest_digest=None):
         self.calls.append((tool_id, Path(target), allow_dynamic))
         return ToolResult(
             exit_code=0,
             stdout='{"ok": true}',
             stderr="",
             command_label=f"rekit run {tool_id} <target>",
+            manifest_digest=expected_manifest_digest,
         )
 
 
 class SecretOutputRekit(FakeRekit):
-    def run(self, tool_id, target, *, allow_dynamic=False):
-        result = super().run(tool_id, target, allow_dynamic=allow_dynamic)
+    def run(self, tool_id, target, *, allow_dynamic=False,
+            expected_manifest_digest=None):
+        result = super().run(
+            tool_id, target, allow_dynamic=allow_dynamic,
+            expected_manifest_digest=expected_manifest_digest,
+        )
         return ToolResult(
             exit_code=result.exit_code,
             stdout="api_key=fixture-secret-value\nproof: ok",
             stderr="Authorization: Bearer fixture-bearer-token",
             command_label=result.command_label,
+            manifest_digest=result.manifest_digest,
         )
 
 

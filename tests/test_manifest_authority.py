@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -36,8 +38,17 @@ class Rekit:
     def list_tools(self):
         return [self.value]
 
-    def run(self, tool_id, target, *, allow_dynamic=False):
-        return ToolResult(0, "ok", "", "fixture")
+    def run(self, tool_id, target, *, allow_dynamic=False,
+            expected_manifest_digest=None):
+        return ToolResult(0, "ok", "", "fixture", expected_manifest_digest)
+
+
+class DriftAtExecutionRekit(Rekit):
+    def run(self, tool_id, target, *, allow_dynamic=False,
+            expected_manifest_digest=None):
+        return ToolResult(
+            5, "", "effective manifest digest mismatch", "fixture", None,
+        )
 
 
 class WideningBackend(Backend):
@@ -129,6 +140,13 @@ def test_registry_contract_is_versioned_hashed_and_contains_no_source_path(tmp_p
     changed_manifest = RekitClient(root, source="private").manifest("scan")
     assert changed_manifest.source_manifest_digest != manifest.source_manifest_digest
     assert changed_manifest.effective_manifest_digest != manifest.effective_manifest_digest
+    with mock.patch("rekit_factory.rekit_client.subprocess.run") as execute:
+        execute.return_value = SimpleNamespace(returncode=0, stdout="ok", stderr="")
+        result = RekitClient(root, source="private").run("scan", tmp_path / "target")
+    command = execute.call_args.args[0]
+    assert command[1:3] == ["run", "--expected-manifest-digest"]
+    assert command[3] == changed_manifest.effective_manifest_digest
+    assert result.manifest_digest == changed_manifest.effective_manifest_digest
 
 
 def test_risky_legacy_and_contradictory_high_impact_declarations_fail_closed(tmp_path):
@@ -251,6 +269,27 @@ def test_catalog_change_after_creation_fails_closed_on_pinned_digest(tmp_path):
     result = __import__("asyncio").run(controller.drive(run_dir))
     tool = next(item for item in result["workItems"] if item["operation"] == "rekit-tool")
     assert tool["result"]["reasonCode"] == "manifest.digest_changed"
+
+
+def test_unverified_execution_boundary_cannot_produce_success_proof(tmp_path):
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"fixture")
+    manifest = ToolManifest(
+        id="scan", name="Scan", description="fixture", safety_tier=0,
+        executes_input="no", network="none",
+        actions=(ActionAuthority.READ_LOCAL_TARGET,),
+    )
+    controller = InvestigationController(
+        storage_root=tmp_path / "runs", rekit=DriftAtExecutionRekit(manifest),
+        workers=Backend(),
+    )
+    result = controller.run(RunRequest(target, "scan", tools=("scan",)))
+    tool = next(item for item in result["workItems"] if item["operation"] == "rekit-tool")
+    assert tool["state_label"] == "failed"
+    artifact = next(item for item in result["artifacts"] if item["kind"] == "tool-output")
+    metadata = json.loads(artifact["metadata_json"])
+    assert metadata["effectiveManifestDigest"] == manifest.effective_manifest_digest
+    assert metadata["verifiedManifestDigest"] is None
 
 
 def test_deferred_model_call_uses_run_bound_contract_and_rejects_catalog_drift(tmp_path):

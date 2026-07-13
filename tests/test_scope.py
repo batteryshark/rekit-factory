@@ -197,9 +197,10 @@ class FakeRekit:
     def list_tools(self):
         return [self._manifest]
 
-    def run(self, tool_id, target, *, allow_dynamic=False):
+    def run(self, tool_id, target, *, allow_dynamic=False,
+            expected_manifest_digest=None):
         self.calls += 1
-        return ToolResult(0, "ok", "", "fixture")
+        return ToolResult(0, "ok", "", "fixture", expected_manifest_digest)
 
 
 class InjectedIntentBackend(FakeBackend):
