@@ -161,13 +161,16 @@ class KnowledgeCatalog:
         concept = self.get(root_name, concept_id)
         return concept.links if concept else ()
 
-    def follow(self, root_name: str, source_id: str, link: KnowledgeLink) -> KnowledgeConcept | None:
+    def follow(self, root_name: str, source_id: str, link: KnowledgeLink, *,
+               expected_source_hash: str | None = None) -> KnowledgeConcept | None:
         """Follow one already-discovered bundle link on demand."""
         if link.external or not link.exists or link.concept_id is None:
             return None
         # Re-resolve from the source so callers cannot manufacture an escaping link.
         source = self.get(root_name, source_id)
-        if source is None or link not in source.links:
+        if (source is None or link not in source.links
+                or (expected_source_hash is not None
+                    and source.content_hash != expected_source_hash)):
             return None
         return self.get(root_name, link.concept_id)
 

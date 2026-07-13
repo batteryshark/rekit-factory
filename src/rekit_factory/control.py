@@ -749,13 +749,18 @@ class InvestigationController:
                     requested_id = _bounded_knowledge_text(
                         payload.get("conceptId"), "knowledge concept ID", 512
                     )
-                    if not _knowledge_search_disclosed(
+                    disclosed_hash = _knowledge_search_disclosed_hash(
                         ledger, ctx.state.run_id, payload.get("workerId"), root, requested_id
-                    ):
+                    )
+                    if disclosed_hash is None:
                         raise ValueError(
                             "knowledge concept was not disclosed by this worker's prior search"
                         )
                     concept = self.knowledge.get(root, requested_id, query=rationale)
+                    if concept is not None and concept.content_hash != disclosed_hash:
+                        raise ValueError(
+                            "knowledge concept changed after search; search again before opening it"
+                        )
                     provenance = {
                         "operation": "get", "toolCallId": payload.get("toolCallId"),
                         "workerId": payload.get("workerId"),
@@ -764,9 +769,10 @@ class InvestigationController:
                     source_id = _bounded_knowledge_text(
                         payload.get("sourceId"), "knowledge source ID", 512
                     )
-                    if not _knowledge_source_selected(
+                    selected_hash = _knowledge_selected_hash(
                         ledger, ctx.state.run_id, payload.get("workerId"), root, source_id
-                    ):
+                    )
+                    if selected_hash is None:
                         raise ValueError(
                             "knowledge link source was not selected by this worker"
                         )
@@ -776,7 +782,15 @@ class InvestigationController:
                     links = self.knowledge.related(root, source_id)
                     link = next((candidate for candidate in links
                                  if candidate.target == link_target), None)
-                    concept = self.knowledge.follow(root, source_id, link) if link else None
+                    concept = self.knowledge.follow(
+                        root, source_id, link, expected_source_hash=selected_hash,
+                    ) if link else None
+                    if link is not None and concept is None:
+                        current = self.knowledge.get(root, source_id)
+                        if current is not None and current.content_hash != selected_hash:
+                            raise ValueError(
+                                "knowledge link source changed after selection; open it again"
+                            )
                     provenance = {
                         "operation": "follow", "sourceConceptId": source_id,
                         "linkTarget": link_target, "toolCallId": payload.get("toolCallId"),
@@ -1662,10 +1676,10 @@ def _knowledge_model_content(concept: KnowledgeConcept) -> str:
     }, sort_keys=True)
 
 
-def _knowledge_search_disclosed(ledger: FactoryLedger, run_id: str, worker_id: Any,
-                                root: str, concept_id: str) -> bool:
+def _knowledge_search_disclosed_hash(ledger: FactoryLedger, run_id: str, worker_id: Any,
+                                     root: str, concept_id: str) -> str | None:
     if not isinstance(worker_id, str) or not worker_id:
-        return False
+        return None
     rows = ledger.conn.execute(
         "select payload_json,result_json from work_items where run_id=? "
         "and operation='model-knowledge' and status='done'", (run_id,),
@@ -1675,21 +1689,24 @@ def _knowledge_search_disclosed(ledger: FactoryLedger, run_id: str, worker_id: A
         result = json.loads(row["result_json"]) if row["result_json"] else {}
         if payload.get("workerId") != worker_id or result.get("operation") != "search":
             continue
-        if any(hit.get("root") == root and hit.get("conceptId") == concept_id
-               for hit in result.get("hits", ()) if isinstance(hit, dict)):
-            return True
-    return False
+        for hit in result.get("hits", ()):
+            if (isinstance(hit, dict) and hit.get("root") == root
+                    and hit.get("conceptId") == concept_id):
+                digest = hit.get("contentHash")
+                return digest if isinstance(digest, str) and len(digest) == 64 else None
+    return None
 
 
-def _knowledge_source_selected(ledger: FactoryLedger, run_id: str, worker_id: Any,
-                               root: str, concept_id: str) -> bool:
+def _knowledge_selected_hash(ledger: FactoryLedger, run_id: str, worker_id: Any,
+                             root: str, concept_id: str) -> str | None:
     if not isinstance(worker_id, str) or not worker_id:
-        return False
-    return any(
-        item["root"] == root and item["conceptId"] == concept_id
-        and item.get("provenance", {}).get("workerId") == worker_id
-        for item in ledger.knowledge_references(run_id)
-    )
+        return None
+    for item in reversed(ledger.knowledge_references(run_id)):
+        if (item["root"] == root and item["conceptId"] == concept_id
+                and item.get("provenance", {}).get("workerId") == worker_id):
+            digest = item.get("contentHash")
+            return digest if isinstance(digest, str) and len(digest) == 64 else None
+    return None
 
 
 def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,

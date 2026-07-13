@@ -187,6 +187,64 @@ class _LineageBackend(_KnowledgeBackend):
         )
 
 
+class _MutationBackend(_KnowledgeBackend):
+    def __init__(self, source: Path, mode: str):
+        super().__init__()
+        self.source = source
+        self.mode = mode
+
+    async def analyze(self, *, tool_results=(), knowledge_available=False, **kwargs):
+        assert knowledge_available
+        self.turns += 1
+        if self.turns == 1:
+            return WorkerTurn(
+                report=None, usage={}, messages_json='[{"turn":1}]',
+                deferred_calls=(DeferredModelToolCall(
+                    call_id="search", tool_id="knowledge.search",
+                    tool_name="knowledge_search", capability="knowledge",
+                    query="debugger instrumentation", limit=4,
+                ),),
+            )
+        if self.turns == 2:
+            assert not tool_results[0].denied
+            if self.mode == "get":
+                self.source.write_text(
+                    self.source.read_text(encoding="utf-8") + "\nChanged after search.\n",
+                    encoding="utf-8",
+                )
+            return WorkerTurn(
+                report=None, usage={}, messages_json='[{"turn":2}]',
+                deferred_calls=(DeferredModelToolCall(
+                    call_id="get", tool_id="knowledge.get", tool_name="knowledge_get",
+                    capability="knowledge", root="primary",
+                    concept_id="protections/debugger", rationale="Open the disclosed result.",
+                ),),
+            )
+        if self.turns == 3 and self.mode == "follow":
+            assert not tool_results[0].denied
+            self.source.write_text(
+                self.source.read_text(encoding="utf-8") + "\nChanged after selection.\n",
+                encoding="utf-8",
+            )
+            return WorkerTurn(
+                report=None, usage={}, messages_json='[{"turn":3}]',
+                deferred_calls=(DeferredModelToolCall(
+                    call_id="follow", tool_id="knowledge.follow",
+                    tool_name="knowledge_follow", capability="knowledge", root="primary",
+                    source_id="protections/debugger",
+                    link_target="/techniques/instrumentation.md",
+                    rationale="Follow a link from the selected source.",
+                ),),
+            )
+        assert tool_results[0].denied
+        return WorkerTurn(
+            report=WorkerReport(
+                summary="Changed knowledge was rejected", observations=[tool_results[0].content],
+                next_actions=[], status_update="complete",
+            ), usage={}, messages_json='[{"complete":true}]',
+        )
+
+
 def test_deferred_knowledge_round_trip_is_durable_bounded_and_restart_safe(tmp_path):
     target = tmp_path / "target"
     target.mkdir()
@@ -280,3 +338,28 @@ def test_get_and_follow_require_worker_progressive_disclosure_lineage(tmp_path):
         assert len(failed) == 1
         assert expected in failed[0]["error"]
         assert result["knowledgeReferences"] == []
+
+
+def test_get_and_follow_bind_the_exact_disclosed_content_hash(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    _write(target / "fixture.txt", "authorized")
+
+    for mode, expected in (
+        ("get", "changed after search"),
+        ("follow", "changed after selection"),
+    ):
+        primary = _bundle(tmp_path / f"primary-{mode}")
+        backend = _MutationBackend(primary / "protections" / "debugger.md", mode)
+        controller = InvestigationController(
+            storage_root=tmp_path / f"runs-mutated-{mode}",
+            rekit=_NoopRekit(), workers=backend,
+            knowledge_roots=(KnowledgeRoot.at(primary, name="primary"),),
+        )
+        result = controller.run(RunRequest(
+            target, f"Reject changed knowledge during {mode}", worker_roles=("analyst",),
+        ))
+        failed = [item for item in result["workItems"]
+                  if item["operation"] == "model-knowledge" and item["status"] == "failed"]
+        assert len(failed) == 1
+        assert expected in failed[0]["error"]

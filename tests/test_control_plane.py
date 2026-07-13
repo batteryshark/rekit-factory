@@ -468,7 +468,8 @@ class ControlPlaneTests(unittest.TestCase):
 
         for behavior in ("elapsedLabel", "targetKind", "coverage-track", "attention-cue",
                          "fleetSearch", "fleetHealth", "state.query",
-                         '"ArrowLeft"', '"ArrowRight"', 'event.target.matches(".tab")'):
+                         '"ArrowLeft"', '"ArrowRight"',
+                         "event.target.matches('[role=\"tab\"]')"):
             self.assertIn(behavior, script)
         for responsive in (".target-kind", ".card-foot", ".attention-cue", ".fleet-search",
                            "@media(max-width:560px)", ".health{display:none}"):
