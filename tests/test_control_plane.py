@@ -21,6 +21,8 @@ from rekit_factory.models import (
 )
 from rekit_factory.rekit_client import ToolManifest, ToolResult
 from rekit_factory.remote import InvocationRequest, LocalRekitWorker
+from rekit_factory.store import FactoryLedger
+from muster import resolve_run_dir
 
 
 class FakeBackend:
@@ -464,16 +466,57 @@ class ControlPlaneTests(unittest.TestCase):
                 qid = suspended["pendingQuestions"][0]["id"]
                 answered = self._request(
                     base + f"/api/runs/{run_id}/answers",
-                    {"questionId": qid, "answer": "deny"},
+                    {"questionId": qid, "answer": "allow"},
                     expected=202,
                 )
                 self.assertTrue(answered["started"])
                 completed = self._wait_status(base, run_id, "completed")
                 self.assertEqual(0, completed["coverage"]["pending"])
+                reports = self._request(base + f"/api/runs/{run_id}/reports")
+                self.assertEqual(1, len(reports["reports"]))
+                self.assertEqual("analyst", reports["reports"][0]["role"])
+                self.assertEqual(1, len(completed["artifacts"]))
+                artifact = completed["artifacts"][0]
+                with urlopen(
+                    base + f"/api/runs/{run_id}/artifacts/{artifact['id']}", timeout=5
+                ) as response:
+                    self.assertIn("attachment", response.headers["Content-Disposition"])
+                    self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
+                    self.assertIn(b"stdout", response.read())
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+    def test_general_direction_answer_is_bounded_and_durable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend()
+            )
+            run_dir = controller.create(RunRequest(
+                target=target, goal="Wait for operator direction", worker_roles=("analyst",)
+            ))
+            paths = resolve_run_dir(run_dir)
+            with FactoryLedger(paths.db_path) as ledger:
+                ledger.ask_question(
+                    paths.run_id, qid="direction-fixture", node="Strategy",
+                    kind="direction", prompt="Which component should be prioritized?",
+                )
+            snapshot = controller.answer(
+                run_dir, "direction-fixture", "Prioritize the parser boundary.", resume=False
+            )
+            self.assertEqual([], snapshot["pendingQuestions"])
+            self.assertTrue(any(
+                event["kind"] == "direction.resolved" for event in snapshot["events"]
+            ))
+            with self.assertRaisesRegex(ValueError, "must not be empty"):
+                with FactoryLedger(paths.db_path) as ledger:
+                    ledger.ask_question(
+                        paths.run_id, qid="empty-direction", node="Strategy",
+                        kind="direction", prompt="Anything else?",
+                    )
+                controller.answer(run_dir, "empty-direction", "   ", resume=False)
 
     def test_event_cursor_returns_only_events_after_last_id(self):
         events = [{"id": "a"}, {"id": "b"}, {"id": "c"}]

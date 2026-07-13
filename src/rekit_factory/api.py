@@ -139,6 +139,29 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 run_dir = _find_run(self.server.storage_root, parts[2])
                 self._json(HTTPStatus.OK, self.server.controller.snapshot(run_dir))
                 return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "reports":
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                snapshot = self.server.controller.snapshot(run_dir)
+                self._json(HTTPStatus.OK, {"reports": _worker_reports(snapshot)})
+                return
+            if (len(parts) == 5 and parts[:2] == ["api", "runs"]
+                    and parts[3] == "artifacts"):
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                snapshot = self.server.controller.snapshot(run_dir)
+                artifact = next(
+                    (item for item in snapshot["artifacts"] if item["id"] == parts[4]), None
+                )
+                if artifact is None:
+                    raise FileNotFoundError(f"unknown artifact {parts[4]}")
+                path = Path(artifact["path"]).resolve()
+                try:
+                    path.relative_to(run_dir.resolve())
+                except ValueError as exc:
+                    raise PermissionError("artifact path leaves its run directory") from exc
+                if not path.is_file():
+                    raise FileNotFoundError(f"artifact file is unavailable: {artifact['logical_path']}")
+                self._download(path, artifact["logical_path"])
+                return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events":
                 run_dir = _find_run(self.server.storage_root, parts[2])
                 after = parse_qs(parsed.query).get("after", [None])[0]
@@ -148,6 +171,8 @@ class FactoryHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except FileNotFoundError as exc:
             self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+        except PermissionError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
         except Exception as exc:
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
                        {"error": f"{type(exc).__name__}: {exc}"})
@@ -241,6 +266,18 @@ class FactoryHandler(BaseHTTPRequestHandler):
         body = (Path(__file__).with_name("ui") / name).read_bytes()
         self._static(body, content_type)
 
+    def _download(self, path: Path, logical_path: str) -> None:
+        body = path.read_bytes()
+        filename = Path(logical_path).name.replace('"', "") or "artifact.bin"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _static(self, body: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -326,6 +363,27 @@ def _fleet(controller: InvestigationController) -> list[dict[str, Any]]:
             "latestEvent": snapshot["events"][-1] if snapshot["events"] else None,
         })
     return cards
+
+
+def _worker_reports(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    reports = []
+    for item in snapshot.get("workItems", []):
+        result = item.get("result")
+        if not isinstance(result, dict) or not any(
+                key in result for key in ("summary", "observations", "next_actions")):
+            continue
+        payload = item.get("payload") or {}
+        reports.append({
+            "id": item["id"],
+            "role": payload.get("role") or item.get("category") or "worker",
+            "title": item.get("title") or "Worker report",
+            "summary": result.get("summary") or "Report completed.",
+            "observations": result.get("observations") or [],
+            "nextActions": result.get("next_actions") or result.get("nextActions") or [],
+            "status": result.get("status_update") or result.get("statusUpdate")
+                      or item.get("state_label") or item.get("status"),
+        })
+    return reports
 
 
 def serve(controller: InvestigationController, *, host: str = "127.0.0.1",

@@ -276,13 +276,38 @@ class InvestigationController:
                *, resume: bool = True) -> dict[str, Any]:
         paths = resolve_run_dir(run_dir)
         with FactoryLedger(paths.db_path) as ledger:
-            work_item_id = ledger.answer_permission(paths.run_id, question_id, answer)
-            ledger.event_log(
-                paths.run_id,
-                "permission.resolved",
-                f"Operator answered {answer}",
-                payload={"questionId": question_id, "workItemId": work_item_id},
-            )
+            question = ledger.conn.execute(
+                "select kind from questions where id=? and run_id=?",
+                (question_id, paths.run_id),
+            ).fetchone()
+            if question is None:
+                raise KeyError(question_id)
+            permission = ledger.conn.execute(
+                "select work_item_id from factory_permissions "
+                "where question_id=? and run_id=?",
+                (question_id, paths.run_id),
+            ).fetchone()
+            if permission is not None:
+                work_item_id = ledger.answer_permission(paths.run_id, question_id, answer)
+                ledger.event_log(
+                    paths.run_id,
+                    "permission.resolved",
+                    f"Operator answered {answer}",
+                    payload={"questionId": question_id, "workItemId": work_item_id},
+                )
+            else:
+                response = answer.strip()
+                if not response:
+                    raise ValueError("direction answer must not be empty")
+                if len(response) > 8_000:
+                    raise ValueError("direction answer must be at most 8000 characters")
+                ledger.record_answer(paths.run_id, question_id, response)
+                ledger.event_log(
+                    paths.run_id,
+                    "direction.resolved",
+                    "Operator supplied direction",
+                    payload={"questionId": question_id, "kind": question["kind"]},
+                )
             ledger.set_run_status(paths.run_id, "queued")
             _write_status(paths, "queued")
         if resume:

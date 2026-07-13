@@ -21,6 +21,10 @@ const MissionObservability = (() => {
     return Object.entries(counts).map(([kind, count]) => `<div class="activity-stat ${kind}"><b>${count}</b><span>${safe(kind)}</span></div>`).join("");
   }
   function reports(snapshot) {
+    if (Array.isArray(snapshot.workerReports)) return snapshot.workerReports.map(report => ({
+      role: report.role, title: report.title, summary: report.summary,
+      observations: report.observations || [], next: report.nextActions || [], status: report.status,
+    }));
     return (snapshot.workItems || []).flatMap(item => {
       const result = item.result;
       if (!result || typeof result !== "object" || !first(result, "summary", "observations", "next_actions", "nextActions")) return [];
@@ -54,7 +58,8 @@ const MissionObservability = (() => {
     const variant = questionVariant(question), kind = first(question, "kind", "type") || variant, prompt = first(question, "prompt", "question", "message", "title") || "Operator input required";
     const rawOptions = Array.isArray(question.options) ? question.options : Array.isArray(question.choices) ? question.choices : [], options = rawOptions.map(optionParts).filter(option => option.value !== undefined && option.value !== null);
     const context = [["tool", first(question, "toolId", "tool_id")], ["safety", first(question, "safetyTier", "safety_tier")], ["reason", first(question, "reason", "description")]].filter(([, value]) => value !== undefined && value !== null);
-    return `<article class="decision decision-${variant}"><div class="decision-head"><div class="decision-icon" aria-hidden="true">${variant === "permission" ? "!" : variant === "missing-tool" ? "?" : variant === "direction" ? "↗" : "◇"}</div><div><b>${safe(String(kind).replaceAll("_", " "))}</b><span>${safe(runId)}</span></div></div><div class="decision-body"><div class="question">${safe(prompt)}</div>${context.length ? `<div class="decision-context">${context.map(([label, value]) => `<span><b>${safe(label)}</b>${safe(value)}</span>`).join("")}</div>` : ""}<div class="choices">${options.length ? options.map((option, index) => `<button class="btn ${String(option.value).toLowerCase() === "allow" ? "primary" : index === 0 && variant === "direction" ? "primary" : String(option.value).toLowerCase() === "deny" ? "red" : ""}" data-answer="${safe(option.value)}" data-run="${safe(runId)}" data-question="${safe(question.id)}">${safe(option.label)}</button>`).join("") : `<span class="decision-unavailable">No response options supplied by this question.</span>`}</div></div></article>`;
+    const choices = options.length ? options.map((option, index) => `<button class="btn ${String(option.value).toLowerCase() === "allow" ? "primary" : index === 0 && variant === "direction" ? "primary" : String(option.value).toLowerCase() === "deny" ? "red" : ""}" data-answer="${safe(option.value)}" data-run="${safe(runId)}" data-question="${safe(question.id)}">${safe(option.label)}</button>`).join("") : variant === "direction" || variant === "decision" ? `<div class="direction-response"><label><span>Your direction</span><textarea data-direction-input maxlength="8000" placeholder="Give the investigation concrete direction…"></textarea></label><button class="btn primary" data-direction-submit data-run="${safe(runId)}" data-question="${safe(question.id)}">Send direction</button></div>` : `<span class="decision-unavailable">No response options supplied by this question.</span>`;
+    return `<article class="decision decision-${variant}"><div class="decision-head"><div class="decision-icon" aria-hidden="true">${variant === "permission" ? "!" : variant === "missing-tool" ? "?" : variant === "direction" ? "↗" : "◇"}</div><div><b>${safe(String(kind).replaceAll("_", " "))}</b><span>${safe(runId)}</span></div></div><div class="decision-body"><div class="question">${safe(prompt)}</div>${context.length ? `<div class="decision-context">${context.map(([label, value]) => `<span><b>${safe(label)}</b>${safe(value)}</span>`).join("")}</div>` : ""}<div class="choices">${choices}</div></div></article>`;
   }
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
@@ -137,6 +142,14 @@ function activate(element) {
   if (card) { openRun(card.dataset.run); return true; }
   const answer = element.closest("[data-answer]");
   if (answer) { resolveDecision(answer.dataset.run, answer.dataset.question, answer.dataset.answer); return true; }
+  const direction = element.closest("[data-direction-submit]");
+  if (direction) {
+    const input = direction.closest(".decision").querySelector("[data-direction-input]");
+    const value = input.value.trim();
+    if (!value) { input.focus(); toast("Add direction before sending", true); return true; }
+    resolveDecision(direction.dataset.run, direction.dataset.question, value);
+    return true;
+  }
   const tab = element.closest("[data-tab]");
   if (tab) {
     document.querySelectorAll(".tab").forEach(item => {
@@ -219,7 +232,15 @@ async function resolveDecision(runId, questionId, answer) {
 }
 
 async function openRun(runId) {
-  try { state.selected = runId; state.snapshot = await api(`/api/runs/${encodeURIComponent(runId)}`); renderDetail(); show("detail"); connectEvents(runId); }
+  try {
+    state.selected = runId;
+    const [snapshot, reportPayload] = await Promise.all([
+      api(`/api/runs/${encodeURIComponent(runId)}`),
+      api(`/api/runs/${encodeURIComponent(runId)}/reports`),
+    ]);
+    snapshot.workerReports = reportPayload.reports;
+    state.snapshot = snapshot; renderDetail(); show("detail"); connectEvents(runId);
+  }
   catch (error) { toast(error.message, true); }
 }
 
@@ -234,7 +255,7 @@ function renderDetail() {
   $("events").scrollTop = $("events").scrollHeight;
   $("reports").innerHTML = MissionObservability.renderReports(snapshot);
   $("usage").innerHTML = MissionObservability.renderUsage(snapshot);
-  $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
+  $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
   $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;
   $("activityCount").textContent = events.length;
   $("reportCount").textContent = MissionObservability.reportCount(snapshot);
@@ -246,7 +267,7 @@ function renderDetail() {
 function connectEvents(runId) {
   if (state.stream) state.stream.close();
   state.stream = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
-  state.stream.onmessage = async () => { if (state.selected === runId) { state.snapshot = await api(`/api/runs/${encodeURIComponent(runId)}`); renderDetail(); } refreshFleet(); };
+  state.stream.onmessage = async () => { if (state.selected === runId) { const [snapshot, reportPayload] = await Promise.all([api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/reports`)]); snapshot.workerReports = reportPayload.reports; state.snapshot = snapshot; renderDetail(); } refreshFleet(); };
   state.stream.addEventListener("heartbeat", () => refreshFleet());
   state.stream.onerror = () => { state.stream.close(); setTimeout(() => state.selected === runId && connectEvents(runId), 1500); };
 }
