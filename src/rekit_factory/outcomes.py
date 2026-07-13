@@ -198,6 +198,82 @@ def _disposition(raw: Any, mapping: Mapping[str, str], *, terminal_raw: set[str]
          owner=owner, diagnostics=diagnostics)
 
 
+def _diagnostic_sort_key(value: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        str(value.get("entityType", "")), str(value.get("entityId", "")),
+        str(value.get("facet", "")), str(value.get("code", "")),
+        json.dumps(value.get("raw"), allow_nan=False, ensure_ascii=False,
+                   separators=(",", ":"), sort_keys=True),
+    )
+
+
+def _source_diagnostics(run: Mapping[str, Any] | None,
+                        memory: Mapping[str, Any]) -> list[dict[str, Any]]:
+    run_id = str((run or {}).get("id", "missing-run"))
+    values: list[dict[str, Any]] = []
+    memory_diagnostics = sorted({str(value) for value in memory.get("diagnostics") or []})
+    if memory.get("degraded") and not memory_diagnostics:
+        memory_diagnostics = ["Project-memory replay reported degraded state without detail."]
+    values.extend({
+        "code": "project-memory-source-degraded",
+        "entityType": "project-memory",
+        "entityId": run_id,
+        "source": "project-memory",
+        "message": message,
+    } for message in memory_diagnostics)
+    if run is None:
+        values.append({
+            "code": "missing-run", "entityType": "run", "entityId": run_id,
+            "message": "Canonical run row is absent; child state is not promoted.",
+        })
+    return values
+
+
+def _finalize_outcome_projection(*, entities: Iterable[Mapping[str, Any]],
+                                 source_diagnostics: Iterable[Mapping[str, Any]],
+                                 source_watermarks: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Materialize shared public meaning from already folded intrinsic entities."""
+    materialized = [_json_snapshot(dict(item)) for item in entities]
+    materialized.sort(key=lambda value: (value["entityType"], value["entityId"]))
+    diagnostics = [_json_snapshot(dict(value)) for value in source_diagnostics]
+    diagnostics.extend(
+        _json_snapshot(value) for item in materialized for value in item["diagnostics"]
+    )
+    known_entities = {(item["entityType"], item["entityId"]) for item in materialized}
+    for item in materialized:
+        parent = item.get("parent")
+        if parent and (parent["entityType"], parent["entityId"]) not in known_entities:
+            diagnostic = {
+                "code": "dangling-parent", "entityType": item["entityType"],
+                "entityId": item["entityId"], "parent": parent,
+                "message": "Parent is absent; child state is preserved without promotion.",
+            }
+            item["diagnostics"].append(diagnostic)
+            diagnostics.append(diagnostic)
+        item["diagnostics"].sort(key=_diagnostic_sort_key)
+    diagnostics.sort(key=_diagnostic_sort_key)
+    projection = {
+        "schemaVersion": SCHEMA_VERSION,
+        "vocabularyVersion": VOCABULARY_VERSION,
+        "facets": list(FACETS),
+        "authorities": {key: AUTHORITIES[key] for key in sorted(AUTHORITIES)},
+        "entities": materialized,
+        "diagnostics": diagnostics,
+        "degraded": bool(diagnostics),
+        "sourceWatermarks": dict(source_watermarks or {}),
+        "consistency": {
+            "mode": "canonical-source-state",
+            "sourceRead": "external-to-projection",
+            "crossStoreRevision": "not-claimed",
+            "watermarksAreProjectionIdentity": False,
+            "incrementalParity": "in-memory-reference",
+        },
+    }
+    detached = _json_snapshot(projection)
+    detached[SEMANTIC_IDENTITY_FIELD] = outcome_semantic_sha256(detached)
+    return detached
+
+
 def project_outcomes(*, run: Mapping[str, Any] | None,
                      workers: Iterable[Mapping[str, Any]],
                      work_items: Iterable[Mapping[str, Any]],
@@ -210,23 +286,7 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
     diagnostics: list[dict[str, Any]] = []
     run_id = str((run or {}).get("id", "missing-run"))
     run_parent = {"entityType": "run", "entityId": run_id}
-    memory_diagnostics = sorted({str(value) for value in memory.get("diagnostics") or []})
-    if memory.get("degraded") and not memory_diagnostics:
-        memory_diagnostics = ["Project-memory replay reported degraded state without detail."]
-    diagnostics.extend({
-        "code": "project-memory-source-degraded",
-        "entityType": "project-memory",
-        "entityId": run_id,
-        "source": "project-memory",
-        "message": message,
-    } for message in memory_diagnostics)
-
-    if run is None:
-        diagnostics.append({
-            "code": "missing-run", "entityType": "run", "entityId": run_id,
-            "message": "Canonical run row is absent; child state is not promoted.",
-        })
-    else:
+    if run is not None:
         item = _entity("run", run_id)
         raw = run.get("status")
         run_terminal = {"completed", "partial", "failed", "blocked", "cancelled", "canceled"}
@@ -397,56 +457,13 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
             "rawState": raw,
             "state": ({"accepted": "successful", "rejected": "failed", "waived": "needs-review"}
                       .get(str(raw), "unknown")),
-            "known": raw in _ACCEPTANCE, "terminal": raw in _ACCEPTANCE, "owner": "operator",
+            "known": str(raw) in _ACCEPTANCE, "terminal": str(raw) in _ACCEPTANCE,
+            "owner": "operator",
         }
         entities.append(item)
 
-    entities.sort(key=lambda value: (value["entityType"], value["entityId"]))
-    diagnostics.sort(key=lambda value: (
-        value.get("entityType", ""), value.get("entityId", ""), value.get("facet", ""),
-        value.get("code", ""), str(value.get("raw", "")),
-    ))
-    for item in entities:
-        item["diagnostics"].sort(key=lambda value: (
-            value.get("facet", ""), value.get("code", ""), str(value.get("raw", "")),
-        ))
-    known_entities = {(item["entityType"], item["entityId"]) for item in entities}
-    for item in entities:
-        parent = item.get("parent")
-        if parent and (parent["entityType"], parent["entityId"]) not in known_entities:
-            diagnostic = {
-                "code": "dangling-parent", "entityType": item["entityType"],
-                "entityId": item["entityId"], "parent": parent,
-                "message": "Parent is absent; child state is preserved without promotion.",
-            }
-            item["diagnostics"].append(diagnostic)
-            diagnostics.append(diagnostic)
-        item["diagnostics"].sort(key=lambda value: (
-            value.get("facet", ""), value.get("code", ""), str(value.get("raw", "")),
-        ))
-    diagnostics.sort(key=lambda value: (
-        value.get("entityType", ""), value.get("entityId", ""), value.get("facet", ""),
-        value.get("code", ""), str(value.get("raw", "")),
-    ))
-    projection = {
-        "schemaVersion": SCHEMA_VERSION,
-        "vocabularyVersion": VOCABULARY_VERSION,
-        "facets": list(FACETS),
-        "authorities": {key: AUTHORITIES[key] for key in sorted(AUTHORITIES)},
-        "entities": entities,
-        "diagnostics": diagnostics,
-        "degraded": bool(diagnostics),
-        "sourceWatermarks": dict(source_watermarks or {}),
-        "consistency": {
-            "mode": "full-fold", "ledgerRead": "single-read-transaction",
-            "projectMemoryRead": "external-replay",
-            "watermarksAreProjectionIdentity": False,
-            "incrementalProjection": "deferred",
-        },
-    }
-    # Snapshot first so mutable canonical inputs cannot change the returned meaning after
-    # the identity is computed. The returned object remains ordinary public JSON; a caller
-    # mutation is intentionally detectable by the standalone verifier.
-    detached = _json_snapshot(projection)
-    detached[SEMANTIC_IDENTITY_FIELD] = outcome_semantic_sha256(detached)
-    return detached
+    return _finalize_outcome_projection(
+        entities=entities,
+        source_diagnostics=_source_diagnostics(run, memory),
+        source_watermarks=source_watermarks,
+    )

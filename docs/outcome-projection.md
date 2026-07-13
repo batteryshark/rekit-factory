@@ -49,6 +49,72 @@ The helper never removes fields from its caller, and the projector snapshots JSO
 attaching the identity so later mutation of input containers cannot invalidate the returned
 projection. Mutating a returned semantic field is detectable because the verifier then fails.
 
+### Incremental parity reference
+
+`rekit_factory.outcome_incremental` provides a pure in-memory parity reference. It is a
+genuine source accumulator: accepted changes update a detached canonical source snapshot,
+identify affected entity relationships, and refold only those intrinsic entities with the
+same facet/entity primitives used by the full projector. Global ordering, source diagnostics,
+dangling-parent diagnostics, degradation, consistency semantics, and `semanticSha256` are then
+materialized by the shared finalizer. The incremental path never calls `project_outcomes`.
+
+The strict change domain is `factory-outcome-source-change/v1`:
+
+```json
+{
+  "schemaVersion": 1,
+  "sourceVersion": "factory-outcome-source-change/v1",
+  "changeId": "worker-a-r2",
+  "sourceKind": "worker",
+  "sourceId": "worker-a",
+  "sourceRevision": 2,
+  "operation": "upsert",
+  "value": {"id": "worker-a", "status": "done"}
+}
+```
+
+`sourceKind` is exactly one of `run`, `worker`, `work-item`, `project-memory`, `dossier`, or
+`pending-decision`; `operation` is `upsert` or `remove`, and removals carry a null `value`.
+Run and project-memory are singleton streams with source IDs `run` and `project-memory`.
+Every other source ID must exactly match `value.id`. Finding-scoped attempts, decisions, and
+dossiers carry a valid `findingId`; a missing parent remains valid and becomes a public
+`dangling-parent` diagnostic rather than being invented or discarded.
+
+`changeId` binds exact canonical envelope bytes. Reusing it for different content fails closed,
+while an exact retry is a no-op. `sourceRevision` is a positive, monotonic revision within one
+source stream. A newly observed older revision is receipted but cannot rewind the canonical
+head; conflicting reuse of the same stream revision fails closed. Batches are applied
+transactionally in deterministic stream/revision/change order, so batch and arrival ordering
+cannot change the converged source state. Removal followed by a higher-revision re-add is an
+ordinary lifecycle of the source record, not a new database or second state machine.
+
+`IncrementalOutcomeFold.source_snapshot()` emits the complete canonical
+`factory-outcome-source-state/v1` JSON boundary: run, sorted workers and work items, complete
+project-memory projection, sorted dossiers and pending decisions, and diagnostic source
+watermarks. It also records the deterministic current revision head for each source stream so
+a restarted accumulator cannot be rewound by a late stale change. `from_source_snapshot()`
+rebuilds the in-memory accumulator and its intrinsic
+entity materialization without calling the full projector. Change receipts are intentionally
+ephemeral in this slice; the source snapshot is sufficient to reproduce public meaning and
+identity, not to claim durable delivery acknowledgement.
+
+The shared public `consistency` object is deliberately derivation-path neutral:
+
+```json
+{
+  "mode": "canonical-source-state",
+  "sourceRead": "external-to-projection",
+  "crossStoreRevision": "not-claimed",
+  "watermarksAreProjectionIdentity": false,
+  "incrementalParity": "in-memory-reference"
+}
+```
+
+It describes the common projection guarantee and does not pretend the incremental reference
+performed a full fold, SQLite transaction, or project-memory replay. The controller still
+obtains its SQLite inputs under its explicit read transaction, as described below; that is a
+producer boundary outside the pure outcome projection.
+
 Each entity has six orthogonal facets:
 
 | Facet | Question answered | Representative normalized states |
@@ -128,13 +194,15 @@ rowid and project-memory sequence. They are diagnostic source positions only: ot
 tables can change without either value changing, so watermark equality **must not** be used as
 full projection identity, an ETag, or a change-detection cursor.
 
-`semanticSha256` identifies only the outcome meaning present in one completed full-fold response.
+`semanticSha256` identifies only the outcome meaning present in one completed canonical-source
+projection.
 It does **not** claim an atomic revision across SQLite and project memory, identify every ledger
 table or run-snapshot field, bind unprojected proof bytes, replace artifact digests, or certify
 that two observations read the sources at the same instant. Because it excludes observation
 metadata and carries no HTTP cache semantics, it is not advertised as an ETag or incremental
-cursor. A cross-store revision and incremental fold remain deferred. Clients obtain current
-state by fetching and replacing the complete versioned projection.
+cursor. A cross-store revision and production incremental fold remain deferred. Clients obtain
+current state by fetching and replacing the complete versioned projection.
 
-This first slice does not migrate Mission Control, exports, notifications, or reports. Those
-consumers continue using their backward-compatible fields while parity is established.
+The in-memory incremental reference is not a production cache, durable accumulator, SSE source,
+or consumer migration. Mission Control, exports, notifications, and reports continue using
+their existing paths until a separate production design adopts the proven parity boundary.
