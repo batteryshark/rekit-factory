@@ -58,6 +58,7 @@
             <section class="mission-ribbon" id="memoryRibbon" aria-label="Durable project memory"><div class="mission-signal" aria-hidden="true"><i></i><span>◆</span></div><div class="mission-copy"><span>Current durable goal</span><b id="memoryGoal">No project goal recorded</b></div><div class="mission-metrics" id="memorySummary"></div></section>
             <div class="tabs" role="tablist" aria-label="Investigation detail">
               <button class="tab active" id="tab-button-activity" role="tab" aria-selected="true" aria-controls="tab-activity" data-tab="activity">Activity <span class="tab-count" id="activityCount">0</span></button>
+              <button class="tab" id="tab-button-outcomes" role="tab" aria-selected="false" aria-controls="tab-outcomes" tabindex="-1" data-tab="outcomes">Outcomes <span class="tab-count" id="outcomeCount">0</span></button>
               <button class="tab" id="tab-button-memory" role="tab" aria-selected="false" aria-controls="tab-memory" tabindex="-1" data-tab="memory">Memory <span class="tab-count" id="memoryCount">0</span></button>
               <button class="tab" id="tab-button-knowledge" role="tab" aria-selected="false" aria-controls="tab-knowledge" tabindex="-1" data-tab="knowledge">Knowledge <span class="tab-count" id="knowledgeCount">0</span></button>
               <button class="tab" id="tab-button-reports" role="tab" aria-selected="false" aria-controls="tab-reports" tabindex="-1" data-tab="reports">Reports <span class="tab-count" id="reportCount">0</span></button>
@@ -67,6 +68,23 @@
               <button class="tab" id="tab-button-decisions" role="tab" aria-selected="false" aria-controls="tab-decisions" tabindex="-1" data-tab="decisions">Decisions <span class="tab-count" id="decisionCount">0</span></button>
             </div>
             <div class="tabpane active" role="tabpanel" id="tab-activity"><div class="activity-summary" id="activitySummary"></div><div class="events" id="events" aria-live="polite"></div></div>
+            <div class="tabpane" role="tabpanel" aria-labelledby="tab-button-outcomes" id="tab-outcomes">
+              <section class="outcome-stage" aria-labelledby="outcomeHeading">
+                <header class="outcome-stage-head"><div><span class="eyebrow">ORTHOGONAL OUTCOME READ MODEL</span><h2 id="outcomeHeading" tabindex="-1">Outcomes</h2><p>Execution, completion, disposition, validation, acceptance, and publication remain separate.</p></div><div class="outcome-orbit" aria-hidden="true"><i></i><span>6</span><small>facets</small></div></header>
+                <div class="outcome-integrity" id="outcomeIntegrity" role="status"></div>
+                <div class="outcome-summary" id="outcomeSummary"></div>
+                <div class="sr-only" id="outcomeAnnouncement" role="status" aria-live="polite" aria-atomic="true"></div>
+                <form class="outcome-controls" id="outcomeFilters" role="search" aria-label="Filter canonical outcomes">
+                  <label class="outcome-search" for="outcomeSearch"><span aria-hidden="true">⌕</span><input id="outcomeSearch" name="query" type="search" aria-label="Search outcomes" placeholder="Search entity, state, owner…" autocomplete="off"><kbd aria-hidden="true">/</kbd></label>
+                  <label><span>Type</span><select id="outcomeType" name="type"><option value="all">All types</option></select></label>
+                  <label><span>State</span><select id="outcomeState" name="state"><option value="all">All states</option></select></label>
+                  <label><span>Owner</span><select id="outcomeOwner" name="owner"><option value="all">All owners</option></select></label>
+                  <label><span>Terminal</span><select id="outcomeTerminal" name="terminal"><option value="all">Any</option><option value="terminal">Has terminal facet</option><option value="nonterminal">No terminal facet</option></select></label>
+                  <button class="btn" id="outcomeReset" type="reset">Reset</button>
+                </form>
+                <div class="outcome-results" id="outcomeResults" aria-busy="false"></div>
+              </section>
+            </div>
             <div class="tabpane" role="tabpanel" id="tab-memory"><div class="memory-board"><div class="memory-primary"><div class="memory-board-head"><div><span class="eyebrow">DURABLE REASONING</span><h2>Project memory</h2></div><button class="btn" id="copyMemoryContext" type="button">Copy resume context</button></div><div id="memoryDegraded"></div><div class="memory-groups" id="memoryGroups"></div></div><aside class="memory-context-panel"><div><span class="eyebrow">BOUNDED PROJECTION</span><b>Worker resume context</b></div><pre id="memoryContext"></pre></aside></div></div>
             <div class="tabpane" role="tabpanel" aria-labelledby="tab-button-knowledge" id="tab-knowledge"><div class="knowledge-console"><section class="knowledge-main"><div class="knowledge-head"><div><span class="eyebrow">PROGRESSIVE DISCLOSURE</span><h2>Knowledge relay</h2><p>Workers search a small ranked set, open one concept, then follow only disclosed links.</p><div class="knowledge-run-roots" id="knowledgeRunRoots" aria-label="Named knowledge roots for this run"></div></div><div class="knowledge-posture"><i aria-hidden="true">◇</i><span><b>Read only</b>Root paths and concept bodies are never retained here.</span></div></div><div class="knowledge-flow" id="knowledgeFlow" aria-live="polite"></div></section><aside class="knowledge-ledger"><div class="knowledge-ledger-head"><span class="eyebrow">DURABLE REFERENCES</span><b>Selected concepts</b></div><div class="knowledgeReferences" id="knowledgeReferences"></div></aside></div></div>
             <div class="tabpane" role="tabpanel" id="tab-reports"><div class="report-grid" id="reports"></div></div>
@@ -91,6 +109,7 @@
 </aside>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script src="/ui/mission-attention.js" defer></script>
+<script src="/ui/mission-outcomes.js" defer></script>
 <script src="/ui/mission-control.js" defer></script>
 </body>
 </html>
