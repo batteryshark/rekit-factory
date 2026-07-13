@@ -105,7 +105,8 @@ server exposes authenticated capability discovery, asynchronous invocation
 submission, ordered event retrieval with an `after` cursor, and terminal result
 retrieval. The matching client implements `WorkerTransport`, polls the bounded
 result endpoint, exposes resumable events, and supports explicit setup/reset/
-teardown leases plus content-addressed artifact download.
+teardown leases, authenticated cancellation and attach requests, plus
+content-addressed artifact download.
 
 The server requires an explicit bearer token and staged input root. Networked
 requests may name only regular files beneath that root; absolute paths and parent
@@ -117,15 +118,47 @@ invocation before a result becomes visible.
 
 Bearer authentication does not provide transport encryption. A deployment beyond
 loopback must terminate TLS with a pinned/private trust configuration or place the
-endpoint inside an authenticated tunnel. Token rotation, rate limiting, durable
-server-side event storage, target upload/content-hash verification,
-adapter-specific cancellation, and interactive attachment remain deployment work.
-Lease state is written atomically under the configured worker input root. On
-restart every previously non-closed disposition is conservatively loaded as dirty;
-only closed remains closed.
-The
-in-memory HTTP proof must not be treated as the Windows worker proof or as an
-isolation boundary.
+endpoint inside an authenticated tunnel. Token rotation, rate limiting, target
+upload/content-hash verification, and machine-specific cancellation/attachment
+implementations remain deployment work.
+
+The server requires a dedicated state root separate from the staged input root;
+both roots and every staged target path reject symlink traversal. A bounded,
+versioned journal atomically retains lease authority, exact request envelopes,
+ordered events, cancellation outcome, and terminal results. The directory is
+created mode `0700`, its device/inode identity is pinned for the server lifetime,
+and state reads and atomic replacements use non-following directory descriptors;
+the journal is mode `0600`. It can contain bounded raw tool stdout/stderr and must
+therefore be treated as potentially sensitive run data; bearer tokens and returned
+attach URLs are never written to it.
+
+The current secure journal backend is POSIX-only and fails explicitly on native
+Windows. Its directory-descriptor, non-following-open, file/directory flush, and
+permission-mode guarantees must not be approximated with ordinary Windows paths or
+`chmod`. A native Windows worker needs a handle-based backend that rejects reparse
+points, pins file identity, atomically replaces and flushes the journal, applies a
+restricted DACL, and passes a Windows lifecycle/restart CI gate. Until then, a POSIX
+controller or proxy can exercise this transport contract, but cannot count as the
+required native Windows worker proof.
+
+An exact duplicate invocation submission attaches to the existing durable record
+and resumes result polling. Reusing an invocation ID with any request-envelope
+drift fails closed. After restart, terminal results and events remain queryable;
+formerly running work receives an `interrupted_unknown` terminal record and keeps
+its lease dirty until explicit reset. Cancellation outcome and attach attempts are
+audited, while the possibly secret attach URL exists only in the authenticated
+response. Only adapter-confirmed cancellation creates a cancelled terminal result
+and releases active ownership for cleanup.
+
+Result streams and event counts are individually bounded. When the journal reaches
+its configured limit, it deterministically evicts the lexicographically earliest
+terminal invocation history first, followed only by unreferenced closed leases.
+Active invocations and dirty lease authority are never eviction candidates. New
+admission rolls back if its authority plus durable record cannot fit; oversized
+results become a small terminal failure so the server remains usable.
+
+This HTTP proof must not be treated as the Windows worker proof or as an isolation
+boundary.
 
 ### Controller routing
 
