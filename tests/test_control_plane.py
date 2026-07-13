@@ -461,6 +461,20 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn("memory-scan", style)
         self.assertNotIn("state.memory", script)
 
+    def test_mission_control_fleet_keeps_e7_operational_cadence_and_keyboard_tabs(self):
+        ui = Path(__file__).parents[1] / "src" / "rekit_factory" / "ui"
+        script = (ui / "mission-control.js").read_text(encoding="utf-8")
+        style = (ui / "mission-control.css").read_text(encoding="utf-8")
+
+        for behavior in ("elapsedLabel", "targetKind", "coverage-track", "attention-cue",
+                         "fleetSearch", "fleetHealth", "state.query",
+                         '"ArrowLeft"', '"ArrowRight"', 'event.target.matches(".tab")'):
+            self.assertIn(behavior, script)
+        for responsive in (".target-kind", ".card-foot", ".attention-cue", ".fleet-search",
+                           "@media(max-width:560px)", ".health{display:none}"):
+            self.assertIn(responsive, style)
+        self.assertIn("@media(prefers-reduced-motion:reduce)", style)
+
     def test_loopback_service_restart_is_explicit_and_stops_the_server(self):
         with tempfile.TemporaryDirectory() as tmp:
             controller = InvestigationController(
@@ -544,6 +558,8 @@ class ControlPlaneTests(unittest.TestCase):
 
                 fleet = self._request(base + "/api/fleet")
                 self.assertEqual(1, fleet["runs"][0]["needsYou"])
+                for field in ("createdAt", "updatedAt", "completedAt", "iteration", "maxIterations"):
+                    self.assertIn(field, fleet["runs"][0])
                 qid = suspended["pendingQuestions"][0]["id"]
                 answered = self._request(
                     base + f"/api/runs/{run_id}/answers",

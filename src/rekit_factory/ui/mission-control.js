@@ -64,8 +64,9 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", selected: null, snapshot: null, evidence: [], stream: null, restarting: false};
+const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false};
 const $ = id => document.getElementById(id);
+const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
 })[character]);
@@ -167,6 +168,7 @@ function activate(element) {
       const active = item === tab;
       item.classList.toggle("active", active);
       item.setAttribute("aria-selected", String(active));
+      item.tabIndex = active ? 0 : -1;
     });
     document.querySelectorAll(".tabpane").forEach(item => item.classList.toggle("active", item.id === `tab-${tab.dataset.tab}`));
     return true;
@@ -180,6 +182,13 @@ document.addEventListener("keydown", event => {
     event.preventDefault();
     activate(event.target);
   }
+  if (event.target.matches(".tab") && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+    const tabs = [...event.target.closest(".tabs").querySelectorAll(".tab")];
+    const current = tabs.indexOf(event.target);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+      : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    event.preventDefault(); tabs[next].focus(); activate(tabs[next]);
+  }
 });
 
 function statusRank(status) {
@@ -191,6 +200,22 @@ function latestStep(run) {
   return active?.current_step || run.latestEvent?.message || "awaiting work";
 }
 
+function elapsedLabel(run, now = Date.now()) {
+  const start = Date.parse(run.createdAt), terminal = ["completed", "partial", "failed", "blocked", "canceled"].includes(run.status);
+  const end = terminal ? Date.parse(run.completedAt || run.updatedAt) : now;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return run.status === "queued" ? "queued" : "time unavailable";
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+}
+
+function targetKind(target) {
+  const name = target.split("/").pop() || "target", suffix = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  const known = {exe: "PE", dll: "PE", apk: "APK", ipa: "IPA", asar: "ASAR", zip: "ZIP", jar: "JAR", wasm: "WASM", elf: "ELF", dylib: "MACH"};
+  return {label: known[suffix] || (suffix ? suffix.slice(0, 4).toUpperCase() : "TREE"), icon: suffix ? "◇" : "⌘"};
+}
+
 function renderFleet() {
   const runs = [...state.fleet].sort((left, right) => statusRank(left.status) - statusRank(right.status));
   const counts = {all: runs.length};
@@ -199,16 +224,29 @@ function renderFleet() {
     `<button class="chip ${state.filter === key ? "active" : ""}" data-filter="${key}">${key.replace("_", " ")} · ${counts[key] || 0}</button>`
   ).join("");
   document.querySelectorAll("[data-filter]").forEach(button => { button.onclick = () => { state.filter = button.dataset.filter; renderFleet(); }; });
-  const shown = runs.filter(run => state.filter === "all" || run.status === state.filter);
-  $("fleet").innerHTML = shown.length ? shown.map(run => `
+  const query = state.query.trim().toLowerCase();
+  const shown = runs.filter(run => (state.filter === "all" || run.status === state.filter) && (!query || [
+    run.target, run.goal, run.projectId, run.status, run.modelProfile?.model, latestStep(run),
+  ].some(value => String(value || "").toLowerCase().includes(query))));
+  $("fleet").innerHTML = shown.length ? shown.map(run => {
+    const kind = targetKind(run.target), total = Math.max(0, numeric(run.coverage.workItemsTotal));
+    const terminal = Math.max(0, numeric(run.coverage.terminal));
+    const progress = total ? Math.min(100, Math.round(terminal / total * 100)) : 0;
+    return `
     <article class="card ${esc(run.status)}" data-run="${esc(run.runId)}" tabindex="0" role="button" aria-label="Open ${esc(run.target.split("/").pop())}">
-      <div class="card-top"><div class="target">${esc(run.target.split("/").pop())}</div><div class="pill ${esc(run.status)}">${esc(run.status.replace("_", " "))}</div></div>
+      <div class="card-top"><div class="target-kind" aria-hidden="true"><i>${kind.icon}</i><span>${esc(kind.label)}</span></div><div class="target-block"><div class="target">${esc(run.target.split("/").pop())}</div><small>${esc(run.projectId)}</small></div><div class="pill ${esc(run.status)}">${esc(run.status.replace("_", " "))}</div></div>
       <div class="goal">${esc(run.goal)}</div><div class="step">${esc(latestStep(run))}</div>
-      <div class="card-meta"><span class="tag"><strong>${esc(run.modelProfile.model)}</strong></span><span class="tag">${run.workers.length} workers</span>${run.needsYou ? `<span class="tag warn">${run.needsYou} needs you</span>` : ""}</div>
+      <div class="card-meta"><span class="tag"><strong>${esc(run.modelProfile.model)}</strong></span><span class="tag">${run.workers.length} workers</span><span class="tag">pass ${numeric(run.iteration)} / ${numeric(run.maxIterations)}</span>${run.needsYou ? `<span class="tag warn">▲ ${run.needsYou} needs you</span>` : ""}</div>
       <div class="counts"><div class="count"><b>${run.coverage.done}</b><span>done</span></div><div class="count"><b>${run.coverage.pending}</b><span>pending</span></div><div class="count"><b>${run.coverage.failed}</b><span>failed</span></div></div>
-    </article>`).join("") : `<div class="empty"><b>No investigations here</b>Launch a run or change the filter.</div>`;
+      <div class="card-foot"><span>${terminal}/${total} terminal</span><div class="coverage-track" role="progressbar" aria-label="Run coverage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><i style="width:${progress}%"></i></div><time>${esc(elapsedLabel(run))}</time></div>${run.needsYou ? `<div class="attention-cue"><span>Operator decision waiting</span><b>Open investigation →</b></div>` : ""}
+    </article>`;
+  }).join("") : `<div class="empty"><b>${query ? "No matching investigations" : "No investigations here"}</b>${query ? "Try a target, goal, model, status, or current step." : "Launch a run or change the filter."}</div>`;
   const running = runs.filter(run => run.status === "running").length;
   const needs = runs.reduce((total, run) => total + run.needsYou, 0);
+  const terminal = runs.reduce((total, run) => total + numeric(run.coverage.terminal), 0);
+  const workItems = runs.reduce((total, run) => total + numeric(run.coverage.workItemsTotal), 0);
+  const models = new Set(runs.map(run => run.modelProfile?.model).filter(Boolean));
+  $("fleetHealth").innerHTML = `<span class="live"><i></i>${running} active</span><span><b>${terminal}/${workItems}</b> work terminal</span><span><b>${models.size}</b> models</span><span class="${needs ? "attention" : ""}"><b>${needs}</b> decisions waiting</span><span class="fleet-health-spacer"></span><span>${shown.length} shown</span>`;
   $("fleetSub").textContent = `${runs.length} investigations · ${running} running · ${needs} awaiting your call`;
   $("stats").innerHTML = `<span class="stat"><b>${runs.length}</b> runs</span><span class="stat"><b>${runs.reduce((total, run) => total + run.workers.length, 0)}</b> workers</span>`;
   $("healthText").textContent = `${running} active · local`;
@@ -472,7 +510,11 @@ $("runForm").onsubmit = async event => {
 };
 
 async function boot() {
-  try { state.config = await api("/api/config"); renderConfig(); await refreshFleet(); setInterval(refreshFleet, 2500); }
+  try {
+    state.config = await api("/api/config"); renderConfig();
+    $("fleetSearch").addEventListener("input", event => { state.query = event.target.value; renderFleet(); });
+    await refreshFleet(); setInterval(refreshFleet, 2500);
+  }
   catch (error) { toast(error.message, true); }
 }
 
