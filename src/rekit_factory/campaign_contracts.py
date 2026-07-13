@@ -554,6 +554,57 @@ class CheckpointSource:
 
 
 @dataclass(frozen=True)
+class CampaignRiskMeasurement:
+    """One explicit, source-bound campaign risk score; never inferred from prose."""
+
+    campaign_id: str
+    sequence: int
+    score: int
+    source: CheckpointSource
+
+    def __post_init__(self) -> None:
+        _identifier(self.campaign_id, "campaign_id")
+        _integer(self.sequence, "risk measurement sequence", 1)
+        if not 0 <= _integer(self.score, "risk score") <= 100:
+            raise ValueError("risk score must not exceed 100")
+        if type(self.source) is not CheckpointSource:
+            raise ValueError("risk measurement requires a canonical source reference")
+
+    def _identity_dict(self) -> dict[str, object]:
+        return {
+            "campaignId": self.campaign_id,
+            "schemaVersion": SCHEMA_VERSION,
+            "score": self.score,
+            "sequence": self.sequence,
+            "source": self.source.to_dict(),
+        }
+
+    @property
+    def measurement_id(self) -> str:
+        return f"risk-{_sha256(self._identity_dict())}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {"measurementId": self.measurement_id, **self._identity_dict()}
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        raw = _strict(value, "campaign risk measurement", {
+            "campaignId", "measurementId", "schemaVersion", "score", "sequence", "source",
+        })
+        if raw["schemaVersion"] != SCHEMA_VERSION:
+            raise ValueError("unsupported campaign risk measurement version")
+        result = cls(
+            raw["campaignId"],
+            _integer(raw["sequence"], "risk measurement sequence", 1),
+            _integer(raw["score"], "risk score"),
+            CheckpointSource.from_dict(raw["source"]),
+        )
+        if raw["measurementId"] != result.measurement_id:
+            raise ValueError("risk measurement identity does not match canonical content")
+        return result
+
+
+@dataclass(frozen=True)
 class CampaignCheckpoint:
     campaign_id: str
     epoch_id: str

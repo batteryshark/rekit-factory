@@ -15,7 +15,10 @@ import re
 from typing import Any, Mapping
 
 from rekit_factory.notification_outbox import InvalidNotificationCandidate, _payload
-from rekit_factory.notification_policy import CANDIDATE_SCHEMA_VERSION
+from rekit_factory.notification_policy import (
+    CANDIDATE_SCHEMA_VERSION,
+    STALE_DECISION_POLICY_VERSION,
+)
 from rekit_factory.campaign_notification_policy import POLICY_VERSION as CAMPAIGN_POLICY_VERSION
 
 
@@ -228,20 +231,35 @@ def _validated_record(record: Mapping[str, Any]) -> tuple[str, str, datetime]:
                 "entity": {"entityType": "campaign", "entityId": campaign_id},
                 "message": payload["message"], "deepLink": payload["deepLink"],
             }
+        elif payload.get("policyVersion") == STALE_DECISION_POLICY_VERSION:
+            candidate = {
+                "schemaVersion": CANDIDATE_SCHEMA_VERSION,
+                "policyVersion": payload["policyVersion"],
+                "policyRevision": payload["policyRevision"],
+                "thresholdSeconds": payload["thresholdSeconds"],
+                "dedupeKey": payload["dedupeKey"], "kind": payload["kind"],
+                "severity": payload["severity"], "runId": payload["deepLink"]["runId"],
+                "entity": {"entityType": payload["deepLink"]["entityType"],
+                           "entityId": payload["deepLink"]["entityId"]},
+                "message": payload["message"],
+            }
         else:
+            source_run_id = payload.get("sourceRunId", payload["deepLink"]["runId"])
             candidate = {
                 "schemaVersion": CANDIDATE_SCHEMA_VERSION,
                 "policyVersion": payload["policyVersion"],
                 "dedupeKey": payload["dedupeKey"],
                 "kind": payload["kind"],
                 "severity": payload["severity"],
-                "runId": payload["deepLink"]["runId"],
+                "runId": source_run_id,
                 "entity": {
                     "entityType": payload["deepLink"]["entityType"],
                     "entityId": payload["deepLink"]["entityId"],
                 },
                 "message": payload["message"],
             }
+            if payload["deepLink"]["runId"] != source_run_id:
+                candidate["deepLinkRunId"] = payload["deepLink"]["runId"]
         canonical_payload = _payload(candidate)
     except (KeyError, TypeError, InvalidNotificationCandidate) as exc:
         raise InvalidOutboxRecord("outbox payload is invalid") from exc

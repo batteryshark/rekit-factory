@@ -15,7 +15,11 @@ import re
 import sqlite3
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
-from rekit_factory.notification_policy import CANDIDATE_SCHEMA_VERSION, POLICY_VERSION
+from rekit_factory.notification_policy import (
+    CANDIDATE_SCHEMA_VERSION,
+    POLICY_VERSION,
+    STALE_DECISION_POLICY_VERSION,
+)
 from rekit_factory.campaign_notification_policy import POLICY_VERSION as CAMPAIGN_POLICY_VERSION
 
 
@@ -27,7 +31,8 @@ _SEVERITIES = frozenset({"action-required", "consequential"})
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _REVISION = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CAMPAIGN_KINDS = frozenset({
-    "campaign.budget-threshold", "campaign.terminal", "campaign.infrastructure-action",
+    "campaign.budget-threshold", "campaign.risk-threshold", "campaign.terminal",
+    "campaign.infrastructure-action",
 })
 
 
@@ -72,11 +77,13 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
         raise InvalidNotificationCandidate("candidate must be a JSON object")
     if candidate.get("policyVersion") == CAMPAIGN_POLICY_VERSION:
         return _campaign_payload(candidate)
+    if candidate.get("policyVersion") == STALE_DECISION_POLICY_VERSION:
+        return _stale_decision_payload(candidate)
     exact = {
         "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "runId",
         "entity", "message",
     }
-    if set(candidate) != exact:
+    if set(candidate) not in (exact, exact | {"deepLinkRunId"}):
         raise InvalidNotificationCandidate("candidate has unsupported fields")
     if candidate.get("schemaVersion") != CANDIDATE_SCHEMA_VERSION \
             or candidate.get("policyVersion") != POLICY_VERSION:
@@ -89,6 +96,9 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
     if type(entity) is not dict or set(entity) != {"entityType", "entityId"}:
         raise InvalidNotificationCandidate("candidate entity is invalid")
     run_id = _safe_id(candidate.get("runId"), "runId")
+    deep_link_run_id = _safe_id(
+        candidate.get("deepLinkRunId", run_id), "deepLinkRunId",
+    )
     entity_type = _safe_id(entity.get("entityType"), "entity.entityType")
     entity_id = _safe_id(entity.get("entityId"), "entity.entityId")
     expected_types = ({"operator-decision"} if kind == "operator-decision.waiting"
@@ -111,7 +121,7 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
         raise InvalidNotificationCandidate("candidate dedupe identity is invalid")
     tab = {"operator-decision": "decisions", "finding": "findings",
            "proof-bundle": "dossiers"}[entity_type]
-    return {
+    payload = {
         "schemaVersion": OUTBOX_SCHEMA_VERSION,
         "policyVersion": POLICY_VERSION,
         "dedupeKey": expected_dedupe,
@@ -119,8 +129,49 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "severity": severity,
         "message": messages[kind],
         "deepLink": {
-            "view": "mission-control", "runId": run_id, "tab": tab,
+            "view": "mission-control", "runId": deep_link_run_id, "tab": tab,
             "entityType": entity_type, "entityId": entity_id,
+        },
+    }
+    if deep_link_run_id != run_id:
+        payload["sourceRunId"] = run_id
+    return payload
+
+
+def _stale_decision_payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    exact = {
+        "schemaVersion", "policyVersion", "policyRevision", "thresholdSeconds",
+        "dedupeKey", "kind", "severity", "runId", "entity", "message",
+    }
+    if set(candidate) != exact or candidate.get("schemaVersion") != CANDIDATE_SCHEMA_VERSION:
+        raise InvalidNotificationCandidate("stale-decision candidate has an invalid schema")
+    run_id = _safe_id(candidate.get("runId"), "runId")
+    entity = candidate.get("entity")
+    if type(entity) is not dict or set(entity) != {"entityType", "entityId"} \
+            or entity.get("entityType") != "operator-decision":
+        raise InvalidNotificationCandidate("stale-decision candidate entity is invalid")
+    entity_id = _safe_id(entity.get("entityId"), "entity.entityId")
+    threshold = candidate.get("thresholdSeconds")
+    if type(threshold) is not int or not 1 <= threshold <= 31_536_000:
+        raise InvalidNotificationCandidate("stale-decision threshold is invalid")
+    from rekit_factory.notification_policy import stale_operator_decision_candidate
+    expected = stale_operator_decision_candidate(
+        run_id=run_id, question_id=entity_id, threshold_seconds=threshold,
+    )
+    if candidate != expected:
+        raise InvalidNotificationCandidate("stale-decision candidate content is not canonical")
+    return {
+        "schemaVersion": OUTBOX_SCHEMA_VERSION,
+        "policyVersion": STALE_DECISION_POLICY_VERSION,
+        "policyRevision": expected["policyRevision"],
+        "thresholdSeconds": threshold,
+        "dedupeKey": expected["dedupeKey"],
+        "kind": expected["kind"],
+        "severity": expected["severity"],
+        "message": expected["message"],
+        "deepLink": {
+            "view": "mission-control", "runId": run_id, "tab": "decisions",
+            "entityType": "operator-decision", "entityId": entity_id,
         },
     }
 
@@ -137,10 +188,14 @@ def _campaign_payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
     kind, severity = candidate.get("kind"), candidate.get("severity")
     if kind not in _CAMPAIGN_KINDS or severity not in _SEVERITIES:
         raise InvalidNotificationCandidate("campaign candidate kind or severity is unsupported")
-    expected_severity = ("action-required" if kind == "campaign.infrastructure-action"
+    expected_severity = ("action-required" if kind in {
+                            "campaign.infrastructure-action", "campaign.risk-threshold",
+                         }
                          else "consequential")
     messages = {
         "campaign.budget-threshold": "A configured campaign budget threshold was crossed.",
+        "campaign.risk-threshold":
+            "A canonical campaign risk measurement crossed the configured threshold.",
         "campaign.terminal": "A campaign reached a terminal outcome.",
         "campaign.infrastructure-action":
             "A campaign infrastructure failure requires operator attention.",
@@ -208,11 +263,12 @@ class NotificationOutbox:
 
     def admit(self, candidates: Iterable[Mapping[str, Any]]) -> list[str]:
         """Atomically admit a batch, returning stable ids in input order."""
+        candidates = list(candidates)
         payloads = [_payload(candidate) for candidate in candidates]
         ids: list[str] = []
         now = _timestamp(self.clock())
         with self._transaction():
-            for payload in payloads:
+            for candidate, payload in zip(candidates, payloads, strict=True):
                 payload_json = _canonical(payload)
                 payload_sha = _digest(payload_json)
                 dedupe_key = payload["dedupeKey"]
@@ -229,7 +285,11 @@ class NotificationOutbox:
                     ids.append(outbox_id)
                     continue
                 deep_link = payload["deepLink"]
-                routing_id = deep_link.get("runId", deep_link.get("entityId"))
+                routing_id = (_safe_id(candidate.get("runId"), "runId")
+                              if payload["policyVersion"] in {
+                                  POLICY_VERSION, STALE_DECISION_POLICY_VERSION,
+                              }
+                              else deep_link["entityId"])
                 self.connection.execute(
                     "insert into factory_notification_outbox "
                     "(id,dedupe_key,run_id,kind,severity,entity_type,entity_id,payload_json,"
@@ -260,21 +320,40 @@ class NotificationOutbox:
                 "entity": {"entityType": "campaign", "entityId": campaign_id},
                 "message": payload["message"], "deepLink": payload["deepLink"],
             }
+        elif payload.get("policyVersion") == STALE_DECISION_POLICY_VERSION:
+            candidate = {
+                "schemaVersion": CANDIDATE_SCHEMA_VERSION,
+                "policyVersion": payload["policyVersion"],
+                "policyRevision": payload["policyRevision"],
+                "thresholdSeconds": payload["thresholdSeconds"],
+                "dedupeKey": payload["dedupeKey"], "kind": payload["kind"],
+                "severity": payload["severity"], "runId": payload["deepLink"]["runId"],
+                "entity": {"entityType": "operator-decision",
+                           "entityId": payload["deepLink"]["entityId"]},
+                "message": payload["message"],
+            }
         else:
+            source_run_id = payload.get("sourceRunId", row["run_id"])
             candidate = {
                 "schemaVersion": CANDIDATE_SCHEMA_VERSION,
                 "policyVersion": payload["policyVersion"], "dedupeKey": payload["dedupeKey"],
                 "kind": payload["kind"], "severity": payload["severity"],
-                "runId": payload["deepLink"]["runId"],
+                "runId": source_run_id,
                 "entity": {"entityType": payload["deepLink"]["entityType"],
                            "entityId": payload["deepLink"]["entityId"]},
                 "message": payload["message"],
             }
+            if payload["deepLink"]["runId"] != source_run_id:
+                candidate["deepLinkRunId"] = payload["deepLink"]["runId"]
         if _payload(candidate) != payload:
             raise ValueError("notification outbox payload is not canonical")
         deep_link = payload["deepLink"]
         expected_id = "notification-" + payload["dedupeKey"].removeprefix("sha256:")
-        routing_id = deep_link.get("runId", deep_link.get("entityId"))
+        routing_id = (payload.get("sourceRunId", deep_link.get("runId"))
+                      if payload["policyVersion"] in {
+                          POLICY_VERSION, STALE_DECISION_POLICY_VERSION,
+                      }
+                      else deep_link["entityId"])
         columns = (
             (row["id"], expected_id), (row["dedupe_key"], payload["dedupeKey"]),
             (row["run_id"], routing_id), (row["kind"], payload["kind"]),

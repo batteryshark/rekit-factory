@@ -80,8 +80,34 @@ def _state(value: Mapping[str, Any]) -> dict[str, Any]:
                                  or terminal.get("status") != status
                                  or type(terminal.get("reasonCode")) is not str):
         raise InvalidCampaignNotificationState("campaign terminal authority is inconsistent")
+    risk_policy, measured_risk = value.get("riskPolicy"), value.get("measuredRisk")
+    risk_threshold = None
+    if risk_policy is not None:
+        if type(risk_policy) is not dict \
+                or set(risk_policy) != {"continueAfterThresholdRequiresApproval", "threshold"} \
+                or risk_policy.get("continueAfterThresholdRequiresApproval") is not True \
+                or type(risk_policy.get("threshold")) is not int \
+                or not 0 <= risk_policy["threshold"] <= 100:
+            raise InvalidCampaignNotificationState("campaign risk policy is invalid")
+        risk_threshold = risk_policy["threshold"]
+    elif measured_risk is not None:
+        raise InvalidCampaignNotificationState("measured risk requires an explicit policy")
+    risk_score = None
+    if measured_risk is not None:
+        if (type(measured_risk) is not dict
+                or measured_risk.get("campaignId") != campaign_id
+                or type(measured_risk.get("sequence")) is not int
+                or measured_risk["sequence"] < 1
+                or type(measured_risk.get("score")) is not int
+                or not 0 <= measured_risk["score"] <= 100
+                or type(measured_risk.get("measurementId")) is not str
+                or type(measured_risk.get("source")) is not dict):
+            raise InvalidCampaignNotificationState("campaign measured risk is invalid")
+        _safe_id(measured_risk["measurementId"], "risk measurementId")
+        risk_score = measured_risk["score"]
     return {"campaignId": campaign_id, "projectId": project_id, "revision": revision,
-            "status": status, "ratios": ratios, "terminal": terminal}
+            "status": status, "ratios": ratios, "terminal": terminal,
+            "riskScore": risk_score, "riskThreshold": risk_threshold}
 
 
 def _candidate(campaign_id: str, kind: str, severity: str, message: str, marker: str) -> dict[str, Any]:
@@ -112,6 +138,22 @@ def campaign_notification_candidates(
             or current["revision"] < previous["revision"]:
         raise InvalidCampaignNotificationState("campaign observation identity regressed")
     candidates: list[dict[str, Any]] = []
+    if previous["riskThreshold"] is not None \
+            and current["riskThreshold"] != previous["riskThreshold"]:
+        raise InvalidCampaignNotificationState("campaign risk policy changed across observation")
+    before_risk = 0 if previous["riskScore"] is None else previous["riskScore"]
+    after_risk = current["riskScore"]
+    threshold = current["riskThreshold"]
+    crossed_risk = threshold is not None and after_risk is not None and (
+        before_risk <= 0 < after_risk if threshold == 0
+        else before_risk < threshold <= after_risk
+    )
+    if crossed_risk:
+        candidates.append(_candidate(
+            current["campaignId"], "campaign.risk-threshold", "action-required",
+            "A canonical campaign risk measurement crossed the configured threshold.",
+            f"risk:{threshold}",
+        ))
     for resource, values in configured.items():
         before, after = previous["ratios"].get(resource), current["ratios"].get(resource)
         if before is None or after is None or after < before:

@@ -26,6 +26,18 @@ from rekit_factory.scope import ActionAuthority, author_scope
 from rekit_factory.tool_routing import RemoteWorkerBinding
 
 
+def _stale_decision_threshold(value: str) -> int:
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("stale-decision threshold must be an integer") from exc
+    if not 1 <= seconds <= 31_536_000:
+        raise argparse.ArgumentTypeError(
+            "stale-decision threshold must be 1..31536000 seconds"
+        )
+    return seconds
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="rekit-factory")
     root.add_argument(
@@ -73,6 +85,10 @@ def parser() -> argparse.ArgumentParser:
     serve_cmd = commands.add_parser("serve", help="serve the loopback Mission Control API")
     serve_cmd.add_argument("--host", default="127.0.0.1")
     serve_cmd.add_argument("--port", type=int, default=8768)
+    serve_cmd.add_argument(
+        "--stale-operator-decision-after-seconds", type=_stale_decision_threshold,
+        help="notify when a pending decision exceeds this threshold (default: disabled)",
+    )
     _add_model_options(serve_cmd)
 
     authorize = commands.add_parser(
@@ -269,13 +285,26 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "serve":
             from rekit_factory.api import serve
+            from rekit_factory.campaign_proof import CampaignOwnedProofResolver
+            from rekit_factory.notification_configuration import NotificationConfigurationStore
             controller = _controller(args, needs_model=True)
+            notification_configuration = NotificationConfigurationStore(
+                controller.notification_configuration.path,
+                stale_operator_decision_after_seconds=(
+                    args.stale_operator_decision_after_seconds
+                ),
+            )
+            controller.notification_configuration = notification_configuration
             campaigns = _campaign_control(args)
+            controller.notification_proof_resolver = CampaignOwnedProofResolver(
+                campaigns, controller,
+            )
             print(f"Rekit Factory API: http://{args.host}:{args.port}", flush=True)
             try:
                 restart = serve(
                     controller, host=args.host, port=args.port,
                     campaign_controller=campaigns,
+                    notification_configuration=notification_configuration,
                 )
             finally:
                 campaigns.persistence.close()

@@ -1022,13 +1022,15 @@ def _worker_reports(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
 
 def serve(controller: InvestigationController, *, host: str = "127.0.0.1",
           port: int = 8768,
-          campaign_controller: CampaignController | None = None) -> bool:
+          campaign_controller: CampaignController | None = None,
+          notification_configuration: NotificationConfigurationStore | None = None) -> bool:
     """Serve until stopped, returning true when the CLI should re-exec itself."""
     from rekit_factory.notification_supervisor import MacOSDesktopTransport
 
     server = FactoryServer(
         (host, port), controller, allow_restart=True,
         campaign_controller=campaign_controller,
+        notification_configuration=notification_configuration,
         notification_desktop_transport=MacOSDesktopTransport(),
     )
     try:

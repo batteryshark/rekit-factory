@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -115,6 +116,10 @@ MAX_KNOWLEDGE_BODY = 12_000
 MAX_PROFILE_ERROR_NAME = 96
 MAX_ERROR_CONCURRENCY = 999_999
 
+
+def _notification_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
 TERMINAL_PUBLICATION_BOUNDARIES = (
     "terminal-run-commit",
     "terminal-event",
@@ -223,6 +228,9 @@ class InvestigationController:
                  knowledge_roots: Iterable[KnowledgeRoot | str | Path] = (),
                  safety_policies: SafetyPolicyCatalog | None = None,
                  notification_configuration: NotificationConfigurationStore | None = None,
+                 notification_proof_resolver:
+                     Callable[[str, str], tuple[str, str] | None] | None = None,
+                 notification_clock: Callable[[], datetime] = _notification_utc_now,
                  terminal_fault_injector: TerminalFaultInjector | None = None,
                  creation_fault_injector: Callable[[str], None] | None = None,
                  worker_semantic_fault_injector: WorkerSemanticFaultInjector | None = None):
@@ -234,6 +242,8 @@ class InvestigationController:
         self.notification_configuration = notification_configuration or NotificationConfigurationStore(
             self.storage_root.parent / ".factory" / "notification-configuration.sqlite3"
         )
+        self.notification_proof_resolver = notification_proof_resolver
+        self.notification_clock = notification_clock
         configured_knowledge = tuple(knowledge_roots)
         self.knowledge = KnowledgeCatalog(configured_knowledge) if configured_knowledge else None
         if isinstance(workers, dict):
@@ -670,12 +680,13 @@ class InvestigationController:
             return asyncio.run(self.drive(paths.run_dir))
         return self.snapshot(paths.run_dir)
 
-    def snapshot(self, run_dir: str | Path) -> dict[str, Any]:
+    def snapshot(self, run_dir: str | Path, *, admit_notifications: bool = True) -> dict[str, Any]:
         paths = resolve_run_dir(run_dir)
         with FactoryLedger(paths.db_path) as ledger:
-            return self._snapshot_open(ledger, paths)
+            return self._snapshot_open(ledger, paths, admit_notifications=admit_notifications)
 
-    def _snapshot_open(self, ledger: FactoryLedger, paths: RunPaths) -> dict[str, Any]:
+    def _snapshot_open(self, ledger: FactoryLedger, paths: RunPaths, *,
+                       admit_notifications: bool = True) -> dict[str, Any]:
         # Project memory and campaign lifecycle are separately fsynced sources. Observe both
         # before opening the SQLite read transaction; the resulting watermarks are independent
         # diagnostics and explicitly do not form one atomic cross-source revision.
@@ -750,19 +761,31 @@ class InvestigationController:
         )
         # Notification bookkeeping is deliberately downstream of canonical state. Corrupt or
         # temporarily locked notification tables must not make run progress or hydration fail.
-        try:
-            ledger.admit_notification_projection(paths.run_id, outcome_projection)
-        except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            pass
-        try:
-            preference, channel_refs = self.notification_configuration.selected_delivery()
-            supervisor = NotificationDeliverySupervisor(ledger.conn)
-            supervisor.schedule_unscheduled(
-                preference, project_id=meta["projectId"], campaign_id="no-campaign",
-                channel_refs=channel_refs, routing_id=paths.run_id,
-            )
-        except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            pass
+        if admit_notifications:
+            try:
+                ledger.admit_notification_projection(
+                    paths.run_id, outcome_projection,
+                    proof_resolver=self.notification_proof_resolver,
+                )
+                stale_after = (
+                    self.notification_configuration.stale_operator_decision_after_seconds
+                )
+                if stale_after is not None:
+                    ledger.reconcile_stale_operator_decisions(
+                        paths.run_id, threshold_seconds=stale_after,
+                        clock=self.notification_clock,
+                    )
+            except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                pass
+            try:
+                preference, channel_refs = self.notification_configuration.selected_delivery()
+                supervisor = NotificationDeliverySupervisor(ledger.conn)
+                supervisor.schedule_unscheduled(
+                    preference, project_id=meta["projectId"], campaign_id="no-campaign",
+                    channel_refs=channel_refs, routing_id=paths.run_id,
+                )
+            except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                pass
         return {
             "run": dict(run) if run is not None else None,
             "meta": meta,

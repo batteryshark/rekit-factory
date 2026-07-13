@@ -87,11 +87,18 @@ class NotificationConfigurationStore:
 
     def __init__(self, path: Path, *,
                  preferences: Mapping[str, NotificationPreferences] | None = None,
-                 channels: Mapping[str, DesktopChannel | WebhookChannel] | None = None):
+                 channels: Mapping[str, DesktopChannel | WebhookChannel] | None = None,
+                 stale_operator_decision_after_seconds: int | None = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.preferences = dict(preferences or default_preferences())
         self.channels = dict(channels or {"desktop-primary": DesktopChannel("desktop-primary")})
+        if stale_operator_decision_after_seconds is not None and (
+                type(stale_operator_decision_after_seconds) is not int
+                or not 1 <= stale_operator_decision_after_seconds <= 31_536_000):
+            raise ValueError("stale-decision threshold must be 1..31536000 seconds")
+        # None is an explicit disabled state: no elapsed-time transition is guessed.
+        self.stale_operator_decision_after_seconds = stale_operator_decision_after_seconds
         if not 1 <= len(self.preferences) <= MAX_PRESETS:
             raise ValueError("notification preference catalog must be bounded and non-empty")
         if not 1 <= len(self.channels) <= MAX_CHANNELS:

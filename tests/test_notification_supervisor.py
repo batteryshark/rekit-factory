@@ -6,7 +6,9 @@ import socket
 
 import pytest
 
-from rekit_factory.notification_delivery import DesktopChannel, WebhookChannel, WebhookRequest
+from rekit_factory.notification_delivery import (
+    DesktopChannel, WebhookChannel, WebhookRequest, delivery_preview,
+)
 from rekit_factory.notification_outbox import NotificationOutbox
 from rekit_factory.notification_outbox import NotificationStateConflict
 from rekit_factory.notification_policy import notification_candidates
@@ -55,6 +57,39 @@ def _admit(ledger, clock):
     )
     [candidate] = notification_candidates(old, new)
     return NotificationOutbox(ledger.conn, clock=clock).admit([candidate])[0]
+
+
+def test_cross_run_campaign_proof_schedules_by_source_and_delivers_exact_link(tmp_path):
+    clock = FakeClock(datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc))
+    ledger = FactoryLedger(tmp_path / "run.db")
+    common = {"workers": (), "work_items": (), "dossiers": (), "pending_questions": ()}
+    old = project_outcomes(
+        run={"id": "run-source", "status": "running"},
+        memory={"findings": {"finding-a": {"id": "finding-a", "status": "candidate"}}},
+        **common,
+    )
+    new = project_outcomes(
+        run={"id": "run-source", "status": "running"},
+        memory={"findings": {"finding-a": {"id": "finding-a", "status": "reproduced"}}},
+        **common,
+    )
+    [candidate] = notification_candidates(
+        old, new,
+        proof_resolver=lambda _run, _finding: ("run-proof", "dossier-exact"),
+    )
+    [notification_id] = NotificationOutbox(ledger.conn, clock=clock).admit([candidate])
+    supervisor = NotificationDeliverySupervisor(ledger.conn, clock=clock)
+    schedules = supervisor.schedule_unscheduled(
+        _preferences(), project_id="project-a", campaign_id="campaign-a",
+        channel_refs=["desktop-local"], routing_id="run-source",
+    )
+    assert len(schedules) == 1 and schedules[0]["notificationId"] == notification_id
+    [work] = supervisor.claim_due("sender")
+    assert delivery_preview(work["record"])["deepLink"] == {
+        "view": "mission-control", "runId": "run-proof", "tab": "dossiers",
+        "entityType": "proof-bundle", "entityId": "dossier-exact",
+    }
+    ledger.close()
 
 
 class RecordingDesktop:

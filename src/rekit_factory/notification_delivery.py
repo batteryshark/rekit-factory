@@ -19,7 +19,11 @@ from typing import Any, Literal, Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from rekit_factory.campaign_notification_policy import POLICY_VERSION as CAMPAIGN_POLICY_VERSION
-from rekit_factory.notification_policy import POLICY_VERSION
+from rekit_factory.notification_policy import (
+    POLICY_VERSION,
+    STALE_DECISION_POLICY_VERSION,
+    stale_operator_decision_candidate,
+)
 
 
 DELIVERY_SCHEMA_VERSION = 1
@@ -28,11 +32,14 @@ _DEDUPE_KEY = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CREDENTIAL_REF = re.compile(r"^credential:[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$")
 _ALLOWED_KINDS = frozenset({
     "operator-decision.waiting", "finding.reproduced", "finding.accepted",
+    "operator-decision.stale",
     "campaign.budget-threshold", "campaign.terminal", "campaign.infrastructure-action",
 })
 _ALLOWED_SEVERITIES = frozenset({"action-required", "consequential"})
 _CANONICAL_MESSAGES = {
     "operator-decision.waiting": "Operator decision is waiting in Mission Control.",
+    "operator-decision.stale":
+        "An operator decision has exceeded its configured response threshold.",
     "finding.reproduced": "A finding reached the reproduced threshold.",
     "finding.accepted": "A finding was accepted by the operator.",
     "campaign.budget-threshold": "A configured campaign budget threshold was crossed.",
@@ -42,6 +49,7 @@ _CANONICAL_MESSAGES = {
 }
 _TITLES = {
     "operator-decision.waiting": "Rekit Factory needs you",
+    "operator-decision.stale": "Operator decision overdue",
     "finding.reproduced": "Finding reproduced",
     "finding.accepted": "Finding accepted",
     "campaign.budget-threshold": "Campaign budget threshold",
@@ -160,6 +168,8 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
         raise InvalidDeliveryConfiguration("delivery record payload is invalid")
     if payload.get("policyVersion") == POLICY_VERSION:
         value = _outcome_delivery(payload)
+    elif payload.get("policyVersion") == STALE_DECISION_POLICY_VERSION:
+        value = _stale_decision_delivery(payload)
     elif payload.get("policyVersion") == CAMPAIGN_POLICY_VERSION:
         value = _campaign_delivery(payload)
     else:
@@ -173,10 +183,11 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _outcome_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
-    if set(payload) != {
+    exact = {
         "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "message",
         "deepLink",
-    }:
+    }
+    if set(payload) not in (exact, exact | {"sourceRunId"}):
         raise InvalidDeliveryConfiguration("delivery record payload is invalid")
     kind = payload.get("kind")
     severity = payload.get("severity")
@@ -191,6 +202,10 @@ def _outcome_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
             or deep_link.get("view") != "mission-control":
         raise InvalidDeliveryConfiguration("delivery deep link is invalid")
     run_id = _safe_id(deep_link.get("runId"), "run id")
+    if "sourceRunId" in payload:
+        source_run_id = _safe_id(payload.get("sourceRunId"), "source run id")
+        if source_run_id == run_id:
+            raise InvalidDeliveryConfiguration("redundant delivery source run is invalid")
     entity_type = _safe_id(deep_link.get("entityType"), "entity type")
     entity_id = _safe_id(deep_link.get("entityId"), "entity id")
     expected_links = ({"operator-decision": "decisions"}
@@ -253,6 +268,44 @@ def _campaign_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
         "idempotencyKey": dedupe_key, "kind": kind, "severity": severity,
         "title": _TITLES[kind], "message": _CANONICAL_MESSAGES[kind],
         "deepLink": dict(deep_link),
+    }
+
+
+def _stale_decision_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if set(payload) != {
+        "schemaVersion", "policyVersion", "policyRevision", "thresholdSeconds",
+        "dedupeKey", "kind", "severity", "message", "deepLink",
+    }:
+        raise InvalidDeliveryConfiguration("delivery record payload is invalid")
+    deep_link = payload.get("deepLink")
+    if type(deep_link) is not dict or set(deep_link) != {
+        "view", "runId", "tab", "entityType", "entityId",
+    }:
+        raise InvalidDeliveryConfiguration("delivery deep link is invalid")
+    run_id = _safe_id(deep_link.get("runId"), "run id")
+    question_id = _safe_id(deep_link.get("entityId"), "entity id")
+    threshold = payload.get("thresholdSeconds")
+    if type(threshold) is not int:
+        raise InvalidDeliveryConfiguration("delivery payload is not canonical")
+    try:
+        expected = stale_operator_decision_candidate(
+            run_id=run_id, question_id=question_id, threshold_seconds=threshold,
+        )
+    except ValueError as exc:
+        raise InvalidDeliveryConfiguration("delivery payload is not canonical") from exc
+    if (deep_link.get("view") != "mission-control" or deep_link.get("tab") != "decisions"
+            or deep_link.get("entityType") != "operator-decision"
+            or payload.get("policyRevision") != expected["policyRevision"]
+            or payload.get("dedupeKey") != expected["dedupeKey"]
+            or payload.get("kind") != expected["kind"]
+            or payload.get("severity") != expected["severity"]
+            or payload.get("message") != expected["message"]):
+        raise InvalidDeliveryConfiguration("delivery payload is not canonical")
+    return {
+        "schemaVersion": DELIVERY_SCHEMA_VERSION,
+        "idempotencyKey": expected["dedupeKey"], "kind": expected["kind"],
+        "severity": expected["severity"], "title": _TITLES[expected["kind"]],
+        "message": expected["message"], "deepLink": dict(deep_link),
     }
 
 

@@ -129,6 +129,25 @@ def test_exact_proof_link_is_preserved_as_a_dossier_deep_link(outbox):
     }
 
 
+def test_campaign_owned_proof_keeps_source_routing_and_links_the_exact_proof_run(outbox):
+    box, _, ledger = outbox
+    old, new = _transition("finding.reproduced")
+    [candidate] = notification_candidates(
+        old, new,
+        proof_resolver=lambda _run_id, _finding_id: ("run-proof", "dossier-campaign"),
+    )
+    [notification_id] = box.admit([candidate])
+
+    assert box.get(notification_id)["payload"]["deepLink"] == {
+        "view": "mission-control", "runId": "run-proof", "tab": "dossiers",
+        "entityType": "proof-bundle", "entityId": "dossier-campaign",
+    }
+    row = ledger.conn.execute(
+        "select run_id from factory_notification_outbox where id=?", (notification_id,),
+    ).fetchone()
+    assert row[0] == "run-1"
+
+
 def test_admission_composes_with_caller_transaction_and_rolls_back(outbox):
     box, _, ledger = outbox
     ledger.conn.execute("begin")

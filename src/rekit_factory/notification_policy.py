@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from rekit_factory.outcomes import (
     SCHEMA_VERSION,
@@ -21,6 +21,7 @@ from rekit_factory.outcomes import (
 
 
 POLICY_VERSION = "factory-notification-policy/v1"
+STALE_DECISION_POLICY_VERSION = "factory-stale-decision-policy/v1"
 CANDIDATE_SCHEMA_VERSION = 1
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -97,7 +98,8 @@ def _finding_at(entity: Mapping[str, Any] | None, facet_name: str, state: str) -
 
 
 def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
-               message: str, entity_type: str | None = None) -> dict[str, Any]:
+               message: str, entity_type: str | None = None,
+               deep_link_run_id: str | None = None) -> dict[str, Any]:
     linked_type = entity_type or (
         "operator-decision" if kind == "operator-decision.waiting" else "finding"
     )
@@ -109,7 +111,7 @@ def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
         "transition": kind,
     }
     canonical = json.dumps(identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return {
+    candidate = {
         "schemaVersion": CANDIDATE_SCHEMA_VERSION,
         "policyVersion": POLICY_VERSION,
         "dedupeKey": f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}",
@@ -119,12 +121,63 @@ def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
         "entity": {"entityType": linked_type, "entityId": entity_id},
         "message": message,
     }
+    if deep_link_run_id is not None and deep_link_run_id != run_id:
+        candidate["deepLinkRunId"] = deep_link_run_id
+    return candidate
+
+
+def stale_operator_decision_candidate(
+    *, run_id: str, question_id: str, threshold_seconds: int,
+) -> dict[str, Any]:
+    """Return the one redacted candidate authorized by an explicit stale threshold.
+
+    Time comparison deliberately lives at the ledger boundary where the canonical question
+    creation timestamp and injected clock are available.  This function only content-addresses
+    the configured policy and transition; it never reads a clock or guesses a threshold.
+    """
+    safe_run = _safe_id(run_id)
+    safe_question = _safe_id(question_id)
+    if safe_run is None or safe_question is None:
+        raise ValueError("stale-decision identities must be safe stable identifiers")
+    if type(threshold_seconds) is not int or not 1 <= threshold_seconds <= 31_536_000:
+        raise ValueError("stale-decision threshold must be 1..31536000 seconds")
+    policy_document = {
+        "policyVersion": STALE_DECISION_POLICY_VERSION,
+        "thresholdSeconds": threshold_seconds,
+    }
+    policy_canonical = json.dumps(
+        policy_document, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    )
+    policy_revision = "sha256:" + hashlib.sha256(policy_canonical.encode("utf-8")).hexdigest()
+    identity = {
+        "policyRevision": policy_revision,
+        "runId": safe_run,
+        "entityType": "operator-decision",
+        "entityId": safe_question,
+        "transition": "operator-decision.stale",
+    }
+    canonical = json.dumps(identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return {
+        "schemaVersion": CANDIDATE_SCHEMA_VERSION,
+        "policyVersion": STALE_DECISION_POLICY_VERSION,
+        "policyRevision": policy_revision,
+        "thresholdSeconds": threshold_seconds,
+        "dedupeKey": f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}",
+        "kind": "operator-decision.stale",
+        "severity": "action-required",
+        "runId": safe_run,
+        "entity": {"entityType": "operator-decision", "entityId": safe_question},
+        "message": "An operator decision has exceeded its configured response threshold.",
+    }
+
+
+ProofResolver = Callable[[str, str], tuple[str, str] | None]
 
 
 def _exact_proof_link(
     entities: Mapping[tuple[str, str], Mapping[str, Any]], finding_id: str,
-) -> str | None:
-    """Return one exact published proof child; ambiguity deliberately yields no guess."""
+) -> tuple[str | None, bool]:
+    """Return one exact published proof child and whether local ownership is ambiguous."""
     matches: list[str] = []
     for (entity_type, entity_id), entity in entities.items():
         if entity_type != "proof-bundle":
@@ -135,12 +188,31 @@ def _exact_proof_link(
                 and parent == {"entityType": "finding", "entityId": finding_id}
                 and publication and publication.get("state") == "published"):
             matches.append(entity_id)
-    return matches[0] if len(matches) == 1 else None
+    return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
+
+
+def _proof_target(
+    entities: Mapping[tuple[str, str], Mapping[str, Any]], *, run_id: str,
+    finding_id: str, proof_resolver: ProofResolver | None,
+) -> tuple[str, str] | None:
+    local_id, ambiguous = _exact_proof_link(entities, finding_id)
+    if local_id is not None:
+        return run_id, local_id
+    # Multiple run-owned proof children are already contradictory.  A campaign association
+    # must never be used to hide that ambiguity or pick a preferred dossier.
+    if ambiguous or proof_resolver is None:
+        return None
+    resolved = proof_resolver(run_id, finding_id)
+    if (type(resolved) is not tuple or len(resolved) != 2
+            or _safe_id(resolved[0]) is None or _safe_id(resolved[1]) is None):
+        return None
+    return resolved
 
 
 def notification_candidates(
     old: Mapping[str, Any] | None,
     new: Mapping[str, Any],
+    *, proof_resolver: ProofResolver | None = None,
 ) -> list[dict[str, Any]]:
     """Return stable redacted candidates for consequential canonical transitions.
 
@@ -182,14 +254,18 @@ def notification_candidates(
                     message="Operator decision is waiting in Mission Control.",
                 ))
         elif entity_type == "finding":
-            proof_id = _exact_proof_link(new_entities, entity_id)
-            linked_type = "proof-bundle" if proof_id is not None else "finding"
-            linked_id = proof_id or entity_id
+            proof = _proof_target(
+                new_entities, run_id=run_id, finding_id=entity_id,
+                proof_resolver=proof_resolver,
+            )
+            linked_type = "proof-bundle" if proof is not None else "finding"
+            linked_run_id, linked_id = proof if proof is not None else (run_id, entity_id)
             if (_finding_at(entity, "validation", "reproduced")
                     and not _finding_at(before, "validation", "reproduced")):
                 candidates.append(_candidate(
                     kind="finding.reproduced", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
+                    deep_link_run_id=linked_run_id,
                     message="A finding reached the reproduced threshold.",
                 ))
             if (_finding_at(entity, "acceptance", "accepted")
@@ -198,6 +274,7 @@ def notification_candidates(
                 candidates.append(_candidate(
                     kind="finding.accepted", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
+                    deep_link_run_id=linked_run_id,
                     message="A finding was accepted by the operator.",
                 ))
 
@@ -207,6 +284,7 @@ def notification_candidates(
 def notification_supersession_ids(
     old: Mapping[str, Any] | None,
     new: Mapping[str, Any],
+    *, proof_resolver: ProofResolver | None = None,
 ) -> list[str]:
     """Return previously admitted notification ids that no longer require delivery.
 
@@ -248,14 +326,18 @@ def notification_supersession_ids(
                     message="Operator decision is waiting in Mission Control.",
                 ))
         elif entity_type == "finding":
-            proof_id = _exact_proof_link(old_entities, entity_id)
-            linked_type = "proof-bundle" if proof_id is not None else "finding"
-            linked_id = proof_id or entity_id
+            proof = _proof_target(
+                old_entities, run_id=run_id, finding_id=entity_id,
+                proof_resolver=proof_resolver,
+            )
+            linked_type = "proof-bundle" if proof is not None else "finding"
+            linked_run_id, linked_id = proof if proof is not None else (run_id, entity_id)
             if (_finding_at(before, "validation", "reproduced")
                     and not _finding_at(after, "validation", "reproduced")):
                 candidates.append(_candidate(
                     kind="finding.reproduced", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
+                    deep_link_run_id=linked_run_id,
                     message="A finding reached the reproduced threshold.",
                 ))
             if (_finding_at(before, "acceptance", "accepted")
@@ -265,6 +347,7 @@ def notification_supersession_ids(
                 candidates.append(_candidate(
                     kind="finding.accepted", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
+                    deep_link_run_id=linked_run_id,
                     message="A finding was accepted by the operator.",
                 ))
         superseded.extend(

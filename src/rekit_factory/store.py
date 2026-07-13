@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -261,6 +262,7 @@ class FactoryLedger(Ledger):
 
     def admit_notification_projection(
             self, run_id: str, projection: dict[str, Any], *,
+            proof_resolver: Callable[[str, str], tuple[str, str] | None] | None = None,
             failure_injector: Callable[[str], None] | None = None) -> list[str]:
         """Atomically advance the trusted outcome baseline and admit notifications.
 
@@ -316,8 +318,12 @@ class FactoryLedger(Ledger):
                 if previous["semantic_sha256"] == semantic_sha256:
                     self.conn.rollback()
                     return []
-                candidates = notification_candidates(old, projection)
-                supersession_ids = notification_supersession_ids(old, projection)
+                candidates = notification_candidates(
+                    old, projection, proof_resolver=proof_resolver,
+                )
+                supersession_ids = notification_supersession_ids(
+                    old, projection, proof_resolver=proof_resolver,
+                )
                 outbox = NotificationOutbox(self.conn)
                 admitted = outbox.admit(candidates)
                 if failure_injector:
@@ -365,6 +371,96 @@ class FactoryLedger(Ledger):
                 )
             if failure_injector:
                 failure_injector("baseline-advanced")
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+        return admitted
+
+    def reconcile_stale_operator_decisions(
+            self, run_id: str, *, threshold_seconds: int,
+            clock: Callable[[], datetime],
+            failure_injector: Callable[[str], None] | None = None) -> list[str]:
+        """Admit due stale decisions and atomically retire no-longer-actionable ones.
+
+        The question ledger owns both creation and pending/resolved truth.  The caller owns the
+        explicit threshold and clock.  Consequently replay and restart can re-evaluate elapsed
+        policy time without mutating the canonical outcome projection or consulting wall time.
+        """
+        from rekit_factory.notification_outbox import NotificationOutbox
+        from rekit_factory.notification_policy import stale_operator_decision_candidate
+
+        if type(threshold_seconds) is not int or not 1 <= threshold_seconds <= 31_536_000:
+            raise ValueError("stale-decision threshold must be 1..31536000 seconds")
+        now = clock()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("stale-decision clock must return a timezone-aware datetime")
+        now = now.astimezone(timezone.utc)
+        now_text = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        def derive() -> tuple[list[dict[str, Any]], set[str]]:
+            candidates: list[dict[str, Any]] = []
+            active_question_ids: set[str] = set()
+            rows = self.conn.execute(
+                "select q.id,q.created_at,a.id as answer_id from questions q "
+                "left join answers a on a.id=q.id where q.run_id=? order by q.created_at,q.id",
+                (run_id,),
+            ).fetchall()
+            for row in rows:
+                raw_created = row["created_at"]
+                if type(raw_created) is not str:
+                    raise ValueError("question creation timestamp is invalid")
+                try:
+                    created = datetime.fromisoformat(raw_created.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise ValueError("question creation timestamp is invalid") from exc
+                if created.tzinfo is None or created.utcoffset() is None:
+                    raise ValueError("question creation timestamp must be timezone-aware")
+                if row["answer_id"] is None and now >= (
+                        created.astimezone(timezone.utc) + timedelta(seconds=threshold_seconds)):
+                    active_question_ids.add(row["id"])
+                    candidates.append(stale_operator_decision_candidate(
+                        run_id=run_id, question_id=row["id"],
+                        threshold_seconds=threshold_seconds,
+                    ))
+            return candidates, active_question_ids
+
+        admitted: list[str] = []
+        self.conn.execute("begin immediate")
+        try:
+            candidates, active_question_ids = derive()
+            outbox = NotificationOutbox(self.conn, clock=lambda: now)
+            admitted = outbox.admit(candidates)
+            if failure_injector:
+                failure_injector("stale-decisions-admitted")
+            active_ids = set(admitted)
+            stale_rows = self.conn.execute(
+                "select id,status,entity_id from factory_notification_outbox "
+                "where run_id=? and kind='operator-decision.stale'",
+                (run_id,),
+            ).fetchall()
+            for row in stale_rows:
+                if row["id"] in active_ids and row["entity_id"] in active_question_ids:
+                    continue
+                delivered = self.conn.execute(
+                    "select 1 from factory_notification_deliveries "
+                    "where notification_id=? and status='sent' limit 1", (row["id"],),
+                ).fetchone()
+                if row["status"] in {"queued", "failed"} and delivered is None:
+                    self.conn.execute(
+                        "update factory_notification_outbox set status='superseded',"
+                        "next_attempt_at=null,lease_token=null,lease_expires_at=null,"
+                        "superseded_at=?,updated_at=? where id=? and status in ('queued','failed')",
+                        (now_text, now_text, row["id"]),
+                    )
+                self.conn.execute(
+                    "update factory_notification_deliveries set status='superseded',"
+                    "next_attempt_at=null,lease_token=null,lease_expires_at=null,"
+                    "superseded_at=?,updated_at=? where notification_id=? "
+                    "and status in ('queued','failed')",
+                    (now_text, now_text, row["id"]),
+                )
+            if failure_injector:
+                failure_injector("stale-decisions-reconciled")
             self.conn.commit()
         except BaseException:
             self.conn.rollback()

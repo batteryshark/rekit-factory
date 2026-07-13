@@ -11,8 +11,8 @@ import threading
 from typing import Callable, Protocol
 
 from .campaign_contracts import (
-    CampaignCheckpoint, CampaignContract, CheckpointSource, EpochContract, EpochResult,
-    ProgressSignal, ResourceUsage, ScopeBinding, TerminalOutcome,
+    CampaignCheckpoint, CampaignContract, CampaignRiskMeasurement, CheckpointSource,
+    EpochContract, EpochResult, ProgressSignal, ResourceUsage, ScopeBinding, TerminalOutcome,
 )
 from .campaign_lifecycle import CAMPAIGN_AUTHORITY, CampaignLifecycleStore
 from .notification_configuration import NotificationConfigurationStore
@@ -295,6 +295,16 @@ class CampaignController:
             )
         self._lifecycle_start(contract.campaign_id)
         return self.snapshot(contract.campaign_id)
+
+    @_serialized
+    def record_risk_measurement(
+        self, measurement: CampaignRiskMeasurement, *, operation_id: str,
+    ) -> CampaignSnapshot:
+        """Accept only an explicit source-bound score at the campaign authority boundary."""
+        self.persistence.record_risk_measurement(
+            measurement, operation_id=operation_id, failure_injector=self.fault_injector,
+        )
+        return self.snapshot(measurement.campaign_id)
 
     @_serialized
     def launch(self, epoch: EpochContract, reservation: ResourceUsage) -> EpochLaunch:
@@ -900,6 +910,30 @@ class CampaignController:
         return tuple(row[0] for row in rows)
 
     @_serialized
+    def notification_proof_contexts(self, source_run_id: str) -> tuple[dict[str, object], ...]:
+        """Return exact, bounded handoff ownership for one Factory run.
+
+        A truncated handoff cannot prove that an older omitted run does not own a competing
+        proof child, so it is deliberately ineligible for notification link qualification.
+        """
+        if type(source_run_id) is not str or not source_run_id:
+            return ()
+        contexts: list[dict[str, object]] = []
+        for campaign_id in self.campaign_ids():
+            handoff = self.handoff(campaign_id)
+            if (handoff.factory_run_count > len(handoff.factory_run_ids)
+                    or source_run_id not in handoff.factory_run_ids):
+                continue
+            contract = self._contract(campaign_id)
+            contexts.append({
+                "campaignId": campaign_id,
+                "projectId": contract.project_id,
+                "scope": contract.scope.to_dict(),
+                "factoryRunIds": list(handoff.factory_run_ids),
+            })
+        return tuple(contexts)
+
+    @_serialized
     def public_state(self, campaign_id: str) -> dict[str, object]:
         """Bounded Mission Control projection; never includes logs, paths, or transcripts."""
         snapshot = self.snapshot(campaign_id)
@@ -980,6 +1014,13 @@ class CampaignController:
             },
             "latestCheckpointId": snapshot.latest_checkpoint_id,
             "cumulativeUsage": usage.to_dict(),
+            "measuredRisk": (None if projection.measured_risk is None
+                             else projection.measured_risk.to_dict()),
+            "riskPolicy": {
+                "continueAfterThresholdRequiresApproval":
+                    contract.operator_policy.continue_after_risk_requires_approval,
+                "threshold": contract.operator_policy.risk_threshold,
+            },
             "budget": {
                 "epoch": contract.epoch_budget.to_dict(),
                 "cumulative": contract.cumulative_budget.to_dict(),

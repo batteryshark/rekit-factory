@@ -152,6 +152,63 @@ def test_multiple_proof_children_never_guess_a_dossier_link():
     assert candidate["entity"] == {"entityType": "finding", "entityId": "finding-1"}
 
 
+def test_exact_campaign_owned_proof_qualifies_existing_run_candidate_without_duplication():
+    old = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},
+    })
+    new = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+    })
+    resolver = lambda run_id, finding_id: (
+        ("run-proof", "dossier-campaign")
+        if (run_id, finding_id) == ("run-1", "finding-1") else None
+    )
+
+    [candidate] = notification_candidates(old, new, proof_resolver=resolver)
+    assert candidate["runId"] == "run-1"
+    assert candidate["deepLinkRunId"] == "run-proof"
+    assert candidate["entity"] == {
+        "entityType": "proof-bundle", "entityId": "dossier-campaign",
+    }
+    assert notification_candidates(old, new, proof_resolver=resolver) == [candidate]
+
+
+def test_local_proof_ownership_wins_and_local_ambiguity_never_calls_campaign_resolver():
+    old = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},
+    })
+    calls = []
+    resolver = lambda *args: calls.append(args) or ("run-other", "dossier-other")
+    exact = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={"findings": {
+            "finding-1": {"id": "finding-1", "status": "reproduced"},
+        }},
+        dossiers=[{"id": "dossier-local", "findingId": "finding-1",
+                   "verificationStatus": "published"}], pending_questions=(),
+    )
+    [candidate] = notification_candidates(old, exact, proof_resolver=resolver)
+    assert candidate["runId"] == "run-1"
+    assert candidate["entity"]["entityId"] == "dossier-local"
+    assert calls == []
+
+    ambiguous = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={"findings": {
+            "finding-1": {"id": "finding-1", "status": "reproduced"},
+        }},
+        dossiers=[
+            {"id": "dossier-a", "findingId": "finding-1",
+             "verificationStatus": "published"},
+            {"id": "dossier-b", "findingId": "finding-1",
+             "verificationStatus": "published"},
+        ], pending_questions=(),
+    )
+    [fallback] = notification_candidates(old, ambiguous, proof_resolver=resolver)
+    assert fallback["entity"] == {"entityType": "finding", "entityId": "finding-1"}
+    assert calls == []
+
+
 def test_reproduced_and_accepted_finding_thresholds_are_distinct_and_deterministic():
     old = _projection(memory={
         "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},

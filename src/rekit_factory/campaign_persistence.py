@@ -20,6 +20,7 @@ from .campaign_contracts import (
     CampaignChangeRequest,
     CampaignCheckpoint,
     CampaignContract,
+    CampaignRiskMeasurement,
     CampaignStatus,
     CampaignAuthority,
     EpochContract,
@@ -68,6 +69,7 @@ class CampaignProjection:
     terminal: TerminalOutcome | None
     degraded: bool = False
     problems: tuple[str, ...] = ()
+    measured_risk: CampaignRiskMeasurement | None = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +322,13 @@ create table if not exists factory_campaign_checkpoints (
     checkpoint_json text not null,
     unique (campaign_id, sequence)
 );
+create table if not exists factory_campaign_risk_measurements (
+    measurement_id text primary key,
+    campaign_id text not null,
+    sequence integer not null,
+    measurement_json text not null,
+    unique (campaign_id, sequence)
+);
 create table if not exists factory_campaign_decisions (
     campaign_id text not null,
     request_id text not null,
@@ -493,10 +502,21 @@ class CampaignPersistence:
             "terminal": None if live["terminal_json"] is None
                         else json.loads(live["terminal_json"]),
         }
+        risk_row = self.conn.execute(
+            "select measurement_json from factory_campaign_risk_measurements "
+            "where campaign_id=? order by sequence desc limit 1", (campaign_id,),
+        ).fetchone()
+        expected_risk = None if risk_row is None else json.loads(risk_row[0])
         if (state.get("revision") != expected["revision"]
                 or state.get("status") != expected["status"]
                 or state.get("cumulativeUsage") != expected["usage"]
                 or state.get("terminal") != expected["terminal"]
+                or state.get("measuredRisk") != expected_risk
+                or state.get("riskPolicy") != {
+                    "continueAfterThresholdRequiresApproval":
+                        contract["operatorPolicy"]["continueAfterRiskRequiresApproval"],
+                    "threshold": contract["operatorPolicy"]["riskThreshold"],
+                }
                 or state.get("schemaVersion") != 1
                 or state.get("projectId") != contract["projectId"]
                 or state.get("scope") != contract["scope"]
@@ -826,6 +846,55 @@ class CampaignPersistence:
             )
             self._fault(failure_injector, "checkpoint-projected")
         return self.campaign(checkpoint.campaign_id)
+
+    def record_risk_measurement(
+        self, measurement: CampaignRiskMeasurement, *, operation_id: str,
+        failure_injector: FailureInjector | None = None,
+    ) -> CampaignProjection:
+        """Record an explicit canonical risk fact without deriving or interpreting it."""
+        if type(measurement) is not CampaignRiskMeasurement:
+            raise CampaignPersistenceError("risk measurement must be a typed canonical fact")
+        operation_id = _operation(operation_id)
+        payload = _json(measurement.to_dict())
+        with self.conn:
+            if self._existing_operation(measurement.campaign_id, operation_id,
+                                        "campaign.risk-measured", payload):
+                return self.campaign(measurement.campaign_id)
+            campaign = self._campaign_row(measurement.campaign_id)
+            if campaign["status"] in {
+                "completed", "exhausted", "blocked", "stopped", "policy-stopped", "failed",
+            }:
+                raise CampaignPersistenceError("terminal campaigns cannot accept risk measurements")
+            prior = self.conn.execute(
+                "select measurement_json from factory_campaign_risk_measurements "
+                "where campaign_id=? order by sequence desc limit 1",
+                (measurement.campaign_id,),
+            ).fetchone()
+            expected_sequence = 1
+            if prior is not None:
+                previous = CampaignRiskMeasurement.from_dict(json.loads(prior[0]))
+                expected_sequence = previous.sequence + 1
+                if measurement.source.source != previous.source.source:
+                    raise CampaignPersistenceError("risk measurement source authority changed")
+                if measurement.source.revision <= previous.source.revision:
+                    raise CampaignPersistenceError("risk measurement source revision regressed")
+            if measurement.sequence != expected_sequence:
+                raise CampaignPersistenceError("risk measurement sequence must be contiguous")
+            self._append_event(measurement.campaign_id, operation_id,
+                               "campaign.risk-measured", payload)
+            self._fault(failure_injector, "event-appended")
+            self.conn.execute(
+                "insert into factory_campaign_risk_measurements "
+                "(measurement_id,campaign_id,sequence,measurement_json) values (?,?,?,?)",
+                (measurement.measurement_id, measurement.campaign_id,
+                 measurement.sequence, payload),
+            )
+            self.conn.execute(
+                "update factory_campaigns set revision=revision+1,updated_at=? where campaign_id=?",
+                (utcnow(), measurement.campaign_id),
+            )
+            self._fault(failure_injector, "campaign-projected")
+        return self.campaign(measurement.campaign_id)
 
     def record_health_rollup(self, rollup: CampaignHealthRollup, *, policy_input_json: str,
                              recommendation_json: str,
@@ -1237,6 +1306,10 @@ class CampaignPersistence:
 
     def campaign(self, campaign_id: str) -> CampaignProjection:
         row = self._campaign_row(campaign_id)
+        risk_row = self.conn.execute(
+            "select measurement_json from factory_campaign_risk_measurements "
+            "where campaign_id=? order by sequence desc limit 1", (campaign_id,),
+        ).fetchone()
         return CampaignProjection(
             campaign_id, row["status"], row["revision"], row["current_epoch_id"],
             row["latest_checkpoint_id"],
@@ -1244,6 +1317,9 @@ class CampaignPersistence:
             None if row["terminal_json"] is None else TerminalOutcome.from_dict(
                 json.loads(row["terminal_json"])
             ),
+            measured_risk=(None if risk_row is None else CampaignRiskMeasurement.from_dict(
+                json.loads(risk_row[0])
+            )),
         )
 
     def rebuild_projection(self, campaign_id: str) -> CampaignRebuild:
@@ -1266,6 +1342,7 @@ class CampaignPersistence:
         recovery_epochs: set[str] = set()
         checkpoint_ids: set[str] = set()
         checkpoint_values: dict[str, CampaignCheckpoint] = {}
+        risk_measurements: list[CampaignRiskMeasurement] = []
         health_rollups: list[CampaignHealthRollup] = []
         campaign_contract: CampaignContract | None = None
         operations: set[str] = set()
@@ -1325,6 +1402,18 @@ class CampaignPersistence:
                     revision += 1
                     leased_epochs.pop(checkpoint.epoch_id, None)
                     recovery_epochs.discard(checkpoint.epoch_id)
+                elif kind == "campaign.risk-measured":
+                    measurement = CampaignRiskMeasurement.from_dict(payload)
+                    if measurement.campaign_id != campaign_id \
+                            or measurement.sequence != len(risk_measurements) + 1:
+                        raise CampaignPersistenceError("risk measurement history is invalid")
+                    if risk_measurements:
+                        prior_risk = risk_measurements[-1]
+                        if measurement.source.source != prior_risk.source.source \
+                                or measurement.source.revision <= prior_risk.source.revision:
+                            raise CampaignPersistenceError("risk measurement authority regressed")
+                    risk_measurements.append(measurement)
+                    revision += 1
                 elif kind == "epoch.leased":
                     if payload["epochId"] not in epochs:
                         raise CampaignPersistenceError("leased epoch is dangling")
@@ -1449,15 +1538,16 @@ class CampaignPersistence:
                 problems.append(f"impossible event {row['campaign_seq']}: {exc}")
         replay = CampaignProjection(campaign_id, status, revision, current_epoch,
                                     latest_checkpoint, usage, terminal,
-                                    bool(problems), tuple(problems))
+                                    bool(problems), tuple(problems),
+                                    risk_measurements[-1] if risk_measurements else None)
         try:
             live = self.campaign(campaign_id)
             comparable = (live.campaign_id, live.status, live.revision,
                           live.current_epoch_id, live.latest_checkpoint_id,
-                          live.cumulative_usage, live.terminal)
+                          live.cumulative_usage, live.terminal, live.measured_risk)
             replayable = (replay.campaign_id, replay.status, replay.revision,
                            replay.current_epoch_id, replay.latest_checkpoint_id,
-                           replay.cumulative_usage, replay.terminal)
+                           replay.cumulative_usage, replay.terminal, replay.measured_risk)
             matches = comparable == replayable and not problems
             if comparable != replayable:
                 problems.append("live projection differs from canonical replay")
@@ -1476,6 +1566,6 @@ class CampaignPersistence:
             CampaignProjection(replay.campaign_id, replay.status, replay.revision,
                                replay.current_epoch_id, replay.latest_checkpoint_id,
                                replay.cumulative_usage, replay.terminal,
-                               bool(problems), tuple(problems)),
+                               bool(problems), tuple(problems), replay.measured_risk),
             matches, bool(problems), tuple(problems),
         )
