@@ -98,6 +98,30 @@ it is not an isolation boundary. Native Windows, VM, container, and other adapte
 must implement the same `WorkerTransport` behavior without changing the envelopes.
 Machine-specific lifecycle and reset behavior stays behind those adapters.
 
+### Minimal HTTP transport
+
+`rekit_factory.remote_http` provides the first deployable transport boundary. The
+server exposes authenticated capability discovery, asynchronous invocation
+submission, ordered event retrieval with an `after` cursor, and terminal result
+retrieval. The matching client implements `WorkerTransport` and polls the bounded
+result endpoint while also exposing resumable events.
+
+The server requires an explicit bearer token and staged input root. Networked
+requests may name only regular files beneath that root; absolute paths and parent
+traversal are rejected. The default allowed invocation network policy is only
+`none`, so accepting a request cannot silently relax worker networking. Request and
+response sizes and client connect/read/result waits are bounded. Worker identity is
+pinned when the server starts, and returned provenance must match the leased
+invocation before a result becomes visible.
+
+Bearer authentication does not provide transport encryption. A deployment beyond
+loopback must terminate TLS with a pinned/private trust configuration or place the
+endpoint inside an authenticated tunnel. Token rotation, rate limiting, durable
+server-side event storage, target upload/content-hash verification, cancellation,
+artifact transfer, and interactive attachment remain adapter/deployment work. The
+in-memory HTTP proof must not be treated as the Windows worker proof or as an
+isolation boundary.
+
 ## Files and isolation
 
 Each invocation gets three directories inside the worker boundary:
