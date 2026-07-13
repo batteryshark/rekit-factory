@@ -48,6 +48,35 @@ must not claim Windows kernel or x64dbg coverage.
 - terminal exit status and artifact manifest;
 - optional attach URL for RDP, VM console, or a terminal session.
 
+Every capability, request, event, result, and artifact envelope crosses the wire as
+JSON with `schema_version: 1`. Receivers reject unknown versions instead of silently
+guessing. Tuple-valued Python fields are JSON arrays on the wire and round-trip back
+to their immutable in-process representation.
+
+The provenance tuple is `(run_id, work_item_id, invocation_id, worker_id)`. Events
+and terminal results carry the complete tuple; requests carry the first three and
+the accepting worker supplies its advertised `worker_id`. An adapter must not copy
+identifiers from a worker-supplied payload over the controller's leased work. Event
+sequence numbers begin at one and increase within an invocation, allowing an event
+consumer to resume after its last durable sequence.
+
+Artifacts are manifests, not arbitrary worker paths. Each record contains a path
+relative to the invocation's `output/` root, a lowercase SHA-256 digest, byte size,
+and optional media type. Absolute and parent-traversing paths are invalid. The
+controller verifies the size and digest after transfer before attaching an artifact
+to the run.
+
+`target_path` names the staged target as seen by the selected transport. The local
+proof accepts a host path; a remote adapter maps it to its immutable `input/` path.
+The optional target digest identifies the bytes independent of that mapping. The
+arguments field is an opaque string array rather than a shell command: adapters
+must invoke tools without introducing an extra shell parsing step.
+
+The contract deliberately contains no credentials or host mount configuration.
+Authentication and staging belong to the transport configuration, while the
+invocation contains only the explicit network policy and, for a gated operation,
+the durable approval identifier.
+
 The remote implementation should expose:
 
 ```text
@@ -63,6 +92,11 @@ GET  /v1/invocations/<id>/attach
 The controller authenticates the worker with a pinned certificate or an SSH host
 key. The worker never receives provider API keys, Factory's whole storage root, or a
 general-purpose host credential.
+
+`LocalRekitWorker` is the conformance proof for the envelope and approval boundary;
+it is not an isolation boundary. Native Windows, VM, container, and other adapters
+must implement the same `WorkerTransport` behavior without changing the envelopes.
+Machine-specific lifecycle and reset behavior stays behind those adapters.
 
 ## Files and isolation
 
