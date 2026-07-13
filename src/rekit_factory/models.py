@@ -19,6 +19,7 @@ from muster.pydantic_runtime import (
     dump_message_history,
     load_message_history,
 )
+from rekit_factory.memory import MemoryAction
 
 
 class WorkerReport(BaseModel):
@@ -26,6 +27,7 @@ class WorkerReport(BaseModel):
     observations: list[str] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
     status_update: str
+    proposed_memory_actions: list[MemoryAction] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -187,7 +189,11 @@ class PydanticWorkerBackend:
                 "evidence. Return concise structured output; the durable scheduler, not you, "
                 "decides whether the overall investigation is complete. When Rekit tools "
                 "are available, request one only when the supplied evidence is insufficient; "
-                "the scheduler will execute or gate it and return its durable result."
+                "the scheduler will execute or gate it and return its durable result. "
+                "Propose durable reasoning updates only through proposed_memory_actions; "
+                "never encode memory writes in summary, observations, or next_actions. "
+                "Each proposal must use the documented typed event vocabulary and evidence "
+                "references. The Factory validates proposals and owns all persistence."
             ),
         )
 

@@ -41,6 +41,7 @@ from rekit_factory.evidence import (
     hash_target,
     render_tool_output,
 )
+from rekit_factory.memory import MemoryAction, ProjectMemoryLog, memory_context
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.store import FactoryLedger
 from rekit_factory.strategies import (
@@ -176,6 +177,16 @@ class InvestigationController:
                 max_iterations=100,
             )
             ledger.event_log(run_id, "run.created", "Investigation queued", payload=public_config)
+            _project_memory_log(paths).append(MemoryAction(
+                "goal_set",
+                {
+                    "text": request.goal,
+                    "reason": "investigation created",
+                    "scope": "target",
+                    "references": [{"kind": "run-event", "id": f"{run_id}:created"}],
+                },
+                action_id=f"run-goal:{run_id}",
+            ))
             tool_items = []
             for tool_id in request.tools:
                 manifest = self.rekit.manifest(tool_id)
@@ -349,6 +360,7 @@ class InvestigationController:
         artifacts = [dict(row) for row in ledger.conn.execute(
             "select * from artifacts where run_id=? order by created_at", (paths.run_id,)
         ).fetchall()]
+        project_memory = _project_memory_log(paths).replay()
         return {
             "run": dict(run) if run is not None else None,
             "meta": _read_meta(paths),
@@ -361,6 +373,8 @@ class InvestigationController:
             "workerSessions": ledger.worker_sessions(paths.run_id),
             "toolCalls": ledger.tool_calls(paths.run_id),
             "artifacts": artifacts,
+            "memory": project_memory.deterministic_dict(),
+            "memoryContext": memory_context(project_memory),
         }
 
     async def _tool_handler(self, ctx, item: dict[str, Any]) -> None:
@@ -533,11 +547,18 @@ class InvestigationController:
                     payload=activity.payload,
                 )
 
+            project_memory = _project_memory_log(ctx.deps.paths).replay()
+            resume_context = memory_context(project_memory)
+            tool_context = _tool_context(ledger, ctx.state.run_id)
+            bounded_context = (
+                f"Project memory (bounded, cited):\n{resume_context}\n\n"
+                f"Rekit tool evidence:\n{tool_context or '[no tool results]'}"
+            )
             turn = await worker_backend.analyze(
                 role=role,
                 goal=payload["goal"],
                 target_snapshot=ctx.deps.scratch["targetSnapshot"],
-                tool_context=_tool_context(ledger, ctx.state.run_id),
+                tool_context=bounded_context,
                 available_tools=available_tools,
                 messages_json=session["messages_json"] if session else None,
                 tool_results=tool_results,
@@ -605,6 +626,10 @@ class InvestigationController:
             report = turn.report
             if report is None:
                 raise RuntimeError("model worker returned neither report nor tool requests")
+            accepted, rejected = self._append_memory_proposals(
+                ctx.deps.paths,
+                getattr(report, "proposed_memory_actions", ()),
+            )
             ledger.resolve(
                 item["id"],
                 result=report.model_dump(mode="json"),
@@ -618,7 +643,9 @@ class InvestigationController:
                 report.status_update,
                 worker_id=worker_id,
                 payload={"observationCount": len(report.observations),
-                         "nextActionCount": len(report.next_actions)},
+                         "nextActionCount": len(report.next_actions),
+                         "memoryActionCount": accepted,
+                         "memoryActionRejectedCount": rejected},
             )
             self._enqueue_follow_ups(
                 ledger, ctx.state.run_id, item, payload, report.next_actions,
@@ -650,6 +677,31 @@ class InvestigationController:
                 worker_id=worker_id,
             )
             raise
+
+    def _append_memory_proposals(self, paths: RunPaths,
+                                 proposals: Any) -> tuple[int, int]:
+        """Validate structured proposals; prose is never interpreted as a memory write."""
+        log = _project_memory_log(paths)
+        accepted = rejected = 0
+        for proposed in proposals or ():
+            try:
+                action = proposed if isinstance(proposed, MemoryAction) else MemoryAction(
+                    type=proposed.type,
+                    payload=dict(proposed.payload),
+                    action_id=getattr(proposed, "action_id", None),
+                )
+                payload = dict(action.payload)
+                references = list(payload.get("references", []))
+                if not references:
+                    raise ValueError(
+                        "model-proposed memory actions must cite durable evidence"
+                    )
+                payload["references"] = references
+                log.append(MemoryAction(action.type, payload, action.action_id))
+                accepted += 1
+            except (TypeError, ValueError):
+                rejected += 1
+        return accepted, rejected
 
     def _enqueue_planned_worker(self, ledger: FactoryLedger, run_id: str, target: str,
                                 model_profile: str, model_tools: tuple[str, ...] | list[str],
@@ -791,6 +843,17 @@ class InvestigationController:
 
 def _read_meta(paths: RunPaths) -> dict[str, Any]:
     return json.loads(paths.run_json.read_text(encoding="utf-8"))
+
+
+def _project_memory_log(paths: RunPaths) -> ProjectMemoryLog:
+    """Canonical project-level stream shared by every run for the same target.
+
+    Muster lays runs out as ``<storage>/projects/<project-id>/runs/<run-id>``. Memory
+    belongs at the project root beside ``runs/``; it references run/artifact/question
+    records and never copies their operational tables.
+    """
+    project_dir = paths.run_dir.parents[1]
+    return ProjectMemoryLog(project_dir)
 
 
 def _request_plan(request: RunRequest) -> InvestigationPlan:
