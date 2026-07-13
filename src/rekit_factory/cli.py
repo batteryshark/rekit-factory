@@ -10,7 +10,7 @@ import sys
 
 from rekit_factory.control import InvestigationController, RunRequest, default_storage_root
 from rekit_factory.models import ModelProfile, PydanticWorkerBackend
-from rekit_factory.rekit_client import RekitClient
+from rekit_factory.rekit_client import FederatedRekitClient
 
 
 def parser() -> argparse.ArgumentParser:
@@ -20,9 +20,8 @@ def parser() -> argparse.ArgumentParser:
         help="Factory run storage (default: REKIT_FACTORY_HOME or ~/.rekit-factory)",
     )
     root.add_argument(
-        "--rekit-root", type=Path,
-        default=Path(__file__).resolve().parents[3] / "rekit",
-        help="Rekit checkout containing bin/rekit and registry.json",
+        "--rekit-root", type=Path, action="append",
+        help="Rekit checkout containing bin/rekit and registry.json; repeat to federate",
     )
     commands = root.add_subparsers(dest="command", required=True)
 
@@ -109,9 +108,10 @@ def _controller(args, *, needs_model: bool) -> InvestigationController:
             name="status", provider="none", model="none", base_url="none", api_key="none"
         )
         backends = _UnusedBackend(profile)
+    roots = args.rekit_root or [Path(__file__).resolve().parents[3] / "rekit"]
     return InvestigationController(
         storage_root=args.storage_root,
-        rekit=RekitClient(args.rekit_root),
+        rekit=FederatedRekitClient.from_roots(roots),
         workers=backends,
     )
 
