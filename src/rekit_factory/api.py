@@ -267,16 +267,18 @@ class FactoryHandler(BaseHTTPRequestHandler):
         self._static(body, content_type)
 
     def _download(self, path: Path, logical_path: str) -> None:
-        body = path.read_bytes()
+        size = path.stat().st_size
         filename = Path(logical_path).name.replace('"', "") or "artifact.bin"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(size))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(body)
+        with path.open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                self.wfile.write(chunk)
 
     def _static(self, body: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
