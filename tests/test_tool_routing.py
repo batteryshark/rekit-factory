@@ -287,6 +287,7 @@ class ToolRoutingTests(unittest.TestCase):
             self.assertEqual(tuple(action.value for action in actions), request.requested_actions)
             self.assertEqual("account:lab", request.account_ref)
             self.assertTrue(request.uses_credentials)
+            self.assertEqual("lease-test", request.lease_id)
             self.assertEqual("d" * 64, request.expected_manifest_digest)
             self.assertNotIn("api_key", request.to_json().lower())
 

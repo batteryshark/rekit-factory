@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 from types import SimpleNamespace
 from typing import Any, Iterable
@@ -54,6 +55,7 @@ from rekit_factory.findings import (
     ReproductionAttempt,
     finding_snapshot,
 )
+from rekit_factory.dossiers import DossierPublisher, dossier_list
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.remote import LocalRekitWorker
 from rekit_factory.scope import (
@@ -349,6 +351,7 @@ class InvestigationController:
             termination = ledger.assess(paths.run_id)
             coverage = ledger.coverage(paths.run_id)
             if termination.verdict == "complete":
+                DossierPublisher(paths, ledger, self.rekit).publish_ready()
                 report_path = _render_report(ledger, paths, meta)
                 ledger.add_report(paths.run_id, "json", report_path)
                 unsuccessful = coverage["failed"] + coverage["blocked"]
@@ -465,6 +468,9 @@ class InvestigationController:
             "memoryContext": memory_context(project_memory),
             "hypothesisState": hypothesis_snapshot(project_memory),
             "findingState": finding_snapshot(project_memory),
+            # Cheap publication projection only. Anchored byte verification belongs to the
+            # dedicated dossier route, not the high-frequency generic/SSE snapshot path.
+            "dossiers": dossier_list(ledger, paths.run_id),
             "knowledgeReferences": ledger.knowledge_references(paths.run_id),
         }
 
@@ -1156,14 +1162,16 @@ class InvestigationController:
                             payload={
                                 "toolId": call.tool_id, "toolCallId": call.call_id,
                                 "workerId": worker_id, "workerItemId": item["id"],
+                                **({"findingId": payload["findingId"]}
+                                   if payload.get("findingId") else {}),
                                 "safetyTier": manifest.safety_tier, "endpoint": call.endpoint,
                                 "accountRef": _account_intent_ref(call.account_ref),
                                 "usesCredentials": call.uses_credentials,
                                 "requestedAction": call.requested_action,
+                                **route_payload,
                                 **_pinned_manifest_work_payload(
                                     pinned_authorities, call.tool_id
                                 ),
-                                **route_payload,
                             }, state_label="model_requested",
                         )
                 ledger.set_work_status(
@@ -1458,6 +1466,9 @@ class InvestigationController:
                     environment_id=payload["validatorEnvironmentId"],
                     clean_environment=payload["cleanEnvironment"],
                     model_profile=model_profile,
+                    platform=payload.get("validatorPlatform", "unknown"),
+                    architecture=payload.get("validatorArchitecture", "unknown"),
+                    isolation=payload.get("validatorIsolation", "unknown"),
                     observations=result.observations,
                     environmental_differences=result.environmental_differences,
                     references=result.references,
@@ -1577,6 +1588,9 @@ class InvestigationController:
                 "validatorSessionId": f"session:{worker_id}",
                 "validatorEnvironmentId": environment_id,
                 "cleanEnvironment": True,
+                "validatorPlatform": platform.system().lower(),
+                "validatorArchitecture": platform.machine().lower() or "unknown",
+                "validatorIsolation": "factory-clean-session",
                 "originWorkerId": finding["originWorkerId"],
             }, state_label="queued",
         )
@@ -1626,6 +1640,9 @@ class InvestigationController:
             environment_id=payload["validatorEnvironmentId"],
             clean_environment=payload["cleanEnvironment"],
             model_profile=model_profile,
+            platform=payload.get("validatorPlatform", "unknown"),
+            architecture=payload.get("validatorArchitecture", "unknown"),
+            isolation=payload.get("validatorIsolation", "unknown"),
             observations=[observation],
             environmental_differences=["validator protocol did not yield an observable result"],
             references=[reference],

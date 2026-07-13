@@ -294,12 +294,14 @@ async function resolveDecision(runId, questionId, answer) {
 async function openRun(runId) {
   try {
     state.selected = runId;
-    const [snapshot, reportPayload, evidence] = await Promise.all([
+    const [snapshot, reportPayload, evidence, dossierPayload] = await Promise.all([
       api(`/api/runs/${encodeURIComponent(runId)}`),
       api(`/api/runs/${encodeURIComponent(runId)}/reports`),
       api(`/api/runs/${encodeURIComponent(runId)}/evidence`),
+      api(`/api/runs/${encodeURIComponent(runId)}/dossiers`),
     ]);
     snapshot.workerReports = reportPayload.reports;
+    snapshot.dossiers = dossierPayload.dossiers;
     state.snapshot = snapshot; state.evidence = evidence.records || [];
     renderDetail(); show("detail"); connectEvents(runId);
   }
@@ -465,6 +467,18 @@ function renderKnowledge(snapshot) {
   $("knowledgeCount").textContent = references.length;
 }
 
+function renderDossiers(snapshot) {
+  const runId = snapshot.run.id, dossiers = snapshot.dossiers || [];
+  $("dossiers").closest(".dossier-stage").classList.toggle("has-stale", dossiers.some(item => !item.verified));
+  $("dossierCount").textContent = dossiers.length;
+  $("dossiers").innerHTML = dossiers.length ? dossiers.map((dossier, index) => {
+    const open = `/api/runs/${encodeURIComponent(runId)}/dossiers/${encodeURIComponent(dossier.id)}`;
+    const verified = dossier.verified === true, status = verified ? dossier.verdict : "STALE / INVALID";
+    const actions = verified ? `<a class="btn primary" href="${open}" target="_blank" rel="noopener">Open dossier</a><a class="btn" href="${open}/download" download>Export ZIP</a>` : `<span class="btn dossier-disabled" aria-disabled="true">Open unavailable</span><span class="btn dossier-disabled" aria-disabled="true">Republish required</span>`;
+    return `<article class="dossier-card ${verified ? "verified" : "stale"}" style="--dossier-order:${index}"><div class="dossier-card-signal" aria-hidden="true"><span>${verified ? "◆" : "!"}</span><i></i></div><div class="dossier-card-copy"><header><span>${esc(dossier.findingId)}</span><b>${esc(status)}</b></header><h3>Evidence dossier</h3><div class="dossier-facts"><span><small>finding state</small><code>${esc(dossier.findingStateSha256.slice(0, 16))}…</code></span><span><small>manifest</small><code>${esc(dossier.manifestSha256.slice(0, 16))}…</code></span><span><small>verification</small><code>${esc(dossier.verificationStatus)}</code></span></div></div><div class="dossier-actions">${actions}</div></article>`;
+  }).join("") : `<div class="knowledge-empty"><b>No proof dossiers published</b>A dossier appears only after every required file is materialized and its anchored bundle verifies.</div>`;
+}
+
 function renderDetail() {
   const snapshot = state.snapshot, run = snapshot.run, meta = snapshot.meta;
   const events = snapshot.events || [], artifacts = snapshot.artifacts || [], questions = snapshot.pendingQuestions || [];
@@ -479,6 +493,7 @@ function renderDetail() {
   $("usage").innerHTML = MissionObservability.renderUsage(snapshot);
   renderMemory(snapshot);
   renderKnowledge(snapshot);
+  renderDossiers(snapshot);
   $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
   renderEvidence();
   $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;
@@ -492,7 +507,7 @@ function renderDetail() {
 function connectEvents(runId) {
   if (state.stream) state.stream.close();
   state.stream = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
-  state.stream.onmessage = async () => { if (state.selected === runId) { const [snapshot, reportPayload, evidence] = await Promise.all([api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/reports`), api(`/api/runs/${encodeURIComponent(runId)}/evidence`)]); snapshot.workerReports = reportPayload.reports; state.snapshot = snapshot; state.evidence = evidence.records || []; renderDetail(); } refreshFleet(); };
+  state.stream.onmessage = async () => { if (state.selected === runId) { const [snapshot, reportPayload, evidence, dossierPayload] = await Promise.all([api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/reports`), api(`/api/runs/${encodeURIComponent(runId)}/evidence`), api(`/api/runs/${encodeURIComponent(runId)}/dossiers`)]); snapshot.workerReports = reportPayload.reports; snapshot.dossiers = dossierPayload.dossiers; state.snapshot = snapshot; state.evidence = evidence.records || []; renderDetail(); } refreshFleet(); };
   state.stream.addEventListener("heartbeat", () => refreshFleet());
   state.stream.onerror = () => { state.stream.close(); setTimeout(() => state.selected === runId && connectEvents(runId), 1500); };
 }

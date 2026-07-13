@@ -257,7 +257,8 @@ class RemoteHTTPTransportTests(unittest.TestCase):
     def test_rejects_missing_or_spoofed_remote_manifest_attestation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "fixture.txt").write_text("fixture", encoding="utf-8")
+            target = root / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
             expected = "a" * 64
             for attestation in (None, "b" * 64):
                 with self.subTest(attestation=attestation), running_server(root) as (worker, client):
