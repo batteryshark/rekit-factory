@@ -13,6 +13,7 @@ from rekit_factory.rekit_client import RekitAdapter, ToolResult
 
 
 NetworkPolicy = Literal["none", "sinkhole", "restricted", "unrestricted"]
+MountPolicy = Literal["none", "staged-input-read-only"]
 InvocationStatus = Literal["done", "failed", "cancelled"]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -98,6 +99,7 @@ class InvocationRequest(_Envelope):
     requested_actions: tuple[str, ...] = ()
     account_ref: str | None = None
     uses_credentials: bool = False
+    mount_policy: MountPolicy = "none"
     invocation_id: str = field(default_factory=lambda: f"invoke-{uuid.uuid4().hex[:12]}")
 
     def __post_init__(self) -> None:
@@ -126,6 +128,8 @@ class InvocationRequest(_Envelope):
             _require_text(self.account_ref, "account_ref")
         if not isinstance(self.uses_credentials, bool):
             raise ValueError("uses_credentials must be a boolean")
+        if self.mount_policy not in {"none", "staged-input-read-only"}:
+            raise ValueError("unsupported mount_policy")
         if any(not isinstance(argument, str) for argument in self.arguments):
             raise ValueError("arguments must contain only strings")
 

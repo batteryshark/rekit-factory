@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -55,6 +54,7 @@ from rekit_factory.findings import (
     finding_snapshot,
 )
 from rekit_factory.rekit_client import RekitAdapter
+from rekit_factory.remote import LocalRekitWorker
 from rekit_factory.scope import (
     ActionAuthority,
     AuthorizedScope,
@@ -76,6 +76,11 @@ from rekit_factory.strategies import (
     WorkerSeed,
     plan_investigation,
     propose_follow_up,
+)
+from rekit_factory.tool_routing import (
+    RemoteWorkerBinding,
+    ToolWorkerRouter,
+    WorkerRequirements,
 )
 
 
@@ -128,7 +133,8 @@ class RunRequest:
 
 class InvestigationController:
     def __init__(self, *, storage_root: str | Path, rekit: RekitAdapter,
-                 workers: WorkerBackend | dict[str, WorkerBackend]):
+                 workers: WorkerBackend | dict[str, WorkerBackend],
+                 remote_tool_workers: tuple[RemoteWorkerBinding, ...] = ()):
         self.storage_root = Path(storage_root).expanduser().resolve()
         self.rekit = rekit
         if isinstance(workers, dict):
@@ -138,6 +144,9 @@ class InvestigationController:
         else:
             self.worker_backends = {workers.profile.name: workers}
         self.default_profile = next(iter(self.worker_backends))
+        self.tool_router = ToolWorkerRouter(
+            LocalRekitWorker(rekit), remote_tool_workers,
+        )
 
     @property
     def workers(self) -> WorkerBackend:
@@ -167,6 +176,10 @@ class InvestigationController:
             scope = legacy_local_read_only_scope(request.target, now=utcnow())
         target_grant = TargetGrant.from_path(request.target)
         _require_scope_for_creation(scope, target_grant, manifests, now=utcnow())
+        tool_routes = {
+            tool_id: self._route_payload(tool_id, request.target)
+            for tool_id in dict.fromkeys((*request.tools, *request.model_tools))
+        }
         self.storage_root.mkdir(parents=True, exist_ok=True)
         plan = _request_plan(request)
         plan_payload = _plan_payload(plan)
@@ -179,6 +192,7 @@ class InvestigationController:
             "modelProfile": worker_backend.profile.public_dict(),
             "strategyPlan": plan_payload,
             "scope": scope.envelope.public_dict(),
+            "toolRoutes": tool_routes,
         }
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
@@ -199,6 +213,7 @@ class InvestigationController:
             "modelProfile": worker_backend.profile.public_dict(),
             "strategyPlan": plan_payload,
             "scope": scope.envelope.public_dict(),
+            "toolRoutes": tool_routes,
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
@@ -234,6 +249,7 @@ class InvestigationController:
             tool_items = []
             for tool_id in request.tools:
                 manifest = self.rekit.manifest(tool_id)
+                route_payload = tool_routes[tool_id]
                 tool_items.append(ledger.enqueue(
                     run_id=run_id,
                     key=stable_key("tool", tool_id, str(request.target)),
@@ -242,7 +258,8 @@ class InvestigationController:
                     category="tool",
                     title=f"Run Rekit tool {tool_id}",
                     priority=200,
-                    payload={"toolId": tool_id, "safetyTier": manifest.safety_tier},
+                    payload={"toolId": tool_id, "safetyTier": manifest.safety_tier,
+                             **route_payload},
                     state_label="queued",
                 ))
             item_ids: dict[str, str] = {}
@@ -453,7 +470,8 @@ class InvestigationController:
                      if payload.get("endpoint") else None),
                     "invalid",
                 )
-        for action in dict.fromkeys(actions):
+        authorized_actions = tuple(dict.fromkeys(actions))
+        for action in authorized_actions:
             if decision is not None:
                 break
             candidate = decide_scope(
@@ -534,24 +552,69 @@ class InvestigationController:
         call_id = ledger.start_tool_call(
             ctx.state.run_id, item["id"], tool_id, manifest.safety_tier
         )
-        result = await asyncio.to_thread(
-            self.rekit.run,
-            tool_id,
-            Path(item["target"]),
-            allow_dynamic=manifest.requires_permission and answer == "allow",
-        )
+        target_grant = TargetGrant.from_path(item["target"])
+        try:
+            route = self.tool_router.select(
+                tool_id,
+                str(Path(item["target"])),
+                target_grant.content_sha256,
+                requirements=WorkerRequirements(
+                    worker_id=payload.get("toolWorkerId"),
+                    platform=payload.get("toolWorkerPlatform"),
+                    architecture=payload.get("toolWorkerArchitecture"),
+                    isolation=payload.get("toolWorkerIsolation"),
+                    interactive=payload.get("toolWorkerInteractive"),
+                    require_remote=bool(payload.get("requireRemote", False)),
+                ),
+            )
+            invocation = route.invocation(
+                run_id=ctx.state.run_id,
+                work_item_id=item["id"],
+                invocation_id=call_id,
+                tool_id=tool_id,
+                target_sha256=target_grant.content_sha256,
+                scope=scope,
+                actions=authorized_actions,
+                approval_id=(qid if manifest.requires_permission and answer == "allow" else None),
+                endpoint=payload.get("endpoint"),
+                account_ref=payload.get("accountRef"),
+                uses_credentials=bool(payload.get("usesCredentials", False)),
+            )
+            result = await asyncio.to_thread(route.transport.invoke, invocation)
+        except Exception as exc:
+            ledger.finish_tool_call(
+                call_id, status="failed", output_path=None, exit_code=None,
+            )
+            ledger.set_work_status(
+                item["id"], "failed",
+                error=f"tool worker routing failed ({type(exc).__name__})",
+                state_label="worker_unavailable",
+            )
+            ledger.event_log(
+                ctx.state.run_id,
+                "security.worker_route_denied",
+                "No authorized capability-compatible tool route completed",
+                payload={"toolId": tool_id, "errorType": type(exc).__name__},
+            )
+            self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
+            return
         captured_at = utcnow()
         evidence = EvidenceStore(ctx.deps.paths.run_dir / "evidence")
         outcome = evidence.capture_tool_output(
             render_tool_output(
-                result.command_label, result.exit_code, result.stdout, result.stderr
+                f"{route.capabilities.worker_id}:{tool_id}",
+                result.exit_code, result.stdout, result.stderr
             ),
             Provenance(
                 run_id=ctx.state.run_id,
                 source=f"rekit:{tool_id}",
                 capture_reason="tool execution proof",
                 captured_at=captured_at,
-                environment_id=f"local:{platform.system()}:{platform.machine()}",
+                environment_id=(
+                    f"worker:{route.capabilities.worker_id}:"
+                    f"{route.capabilities.platform}:{route.capabilities.architecture}:"
+                    f"{route.capabilities.isolation}"
+                ),
                 target_sha256=hash_target(Path(item["target"])),
                 tool_id=tool_id,
                 worker_id=payload.get("workerId"),
@@ -597,6 +660,9 @@ class InvestigationController:
                 "retentionClass": evidence_record.retention_class.value,
                 "capturePolicy": evidence_record.capture_policy,
                 "provenance": asdict(evidence_record.provenance),
+                "toolWorkerId": route.capabilities.worker_id,
+                "remote": route.remote,
+                "remoteArtifacts": [artifact.to_dict() for artifact in result.artifacts],
             },
         )
         if result.exit_code == 0:
@@ -722,6 +788,11 @@ class InvestigationController:
             if turn.deferred_calls:
                 for call in turn.deferred_calls:
                     manifest = self.rekit.manifest(call.tool_id)
+                    route_payload = payload.get("toolRoutes", {}).get(call.tool_id)
+                    if route_payload is None:
+                        route_payload = self._route_payload(
+                            call.tool_id, Path(item["target"]),
+                        )
                     ledger.enqueue(
                         run_id=ctx.state.run_id,
                         key=stable_key("model-tool", worker_id, call.call_id),
@@ -740,6 +811,7 @@ class InvestigationController:
                             "accountRef": _account_intent_ref(call.account_ref),
                             "usesCredentials": call.uses_credentials,
                             "requestedAction": call.requested_action,
+                            **route_payload,
                         },
                         state_label="model_requested",
                     )
@@ -1174,6 +1246,10 @@ class InvestigationController:
                 "costUnits": planned.cost_units, "origin": planned.origin,
                 "evidenceIds": list(planned.evidence_ids),
                 "retryCeiling": plan.ceilings.retries_per_worker,
+                "toolRoutes": {
+                    tool_id: self._route_payload(tool_id, Path(target))
+                    for tool_id in model_tools
+                },
             },
             state_label="queued",
         )
@@ -1280,6 +1356,16 @@ class InvestigationController:
             run_id, "worker.resuming", "All requested Rekit tool results are available",
             worker_id=worker_id,
         )
+
+    def _route_payload(self, tool_id: str, target: Path) -> dict[str, Any]:
+        target_grant = TargetGrant.from_path(target)
+        route = self.tool_router.select(
+            tool_id, str(target), target_grant.content_sha256,
+        )
+        return {
+            "toolWorkerId": route.capabilities.worker_id,
+            "requireRemote": route.remote,
+        }
 
     def _model_tool_results(self, ledger: FactoryLedger, run_id: str,
                             session: dict[str, Any]) -> tuple[ModelToolResult, ...]:

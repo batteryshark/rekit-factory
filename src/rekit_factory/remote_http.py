@@ -80,6 +80,8 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
             raise PermissionError(
                 f"network policy {request.network_policy!r} is not enabled on this worker"
             )
+        if request.mount_policy != "staged-input-read-only":
+            raise PermissionError("remote invocations require staged-input-read-only policy")
         staged = PurePosixPath(request.target_path)
         if staged.is_absolute() or ".." in staged.parts:
             raise ValueError("remote target_path must be relative to the staged input root")

@@ -101,6 +101,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             "tool_id": "fixture-scan",
             "target_path": "fixture.txt",
             "target_sha256": "a" * 64,
+            "mount_policy": "staged-input-read-only",
         }
         values.update(overrides)
         return InvocationRequest(**values)

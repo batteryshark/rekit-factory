@@ -13,7 +13,9 @@ import sys
 from rekit_factory.control import InvestigationController, RunRequest, default_storage_root
 from rekit_factory.models import ModelProfile, PydanticWorkerBackend
 from rekit_factory.rekit_client import FederatedRekitClient
+from rekit_factory.remote_http import HTTPWorkerTransport
 from rekit_factory.scope import ActionAuthority, author_scope
+from rekit_factory.tool_routing import RemoteWorkerBinding
 
 
 def parser() -> argparse.ArgumentParser:
@@ -104,6 +106,10 @@ def _add_model_options(command: argparse.ArgumentParser) -> None:
         "--model-retry-limit", type=int,
         help="override provider/validation retries for registered profiles",
     )
+    command.add_argument(
+        "--remote-worker-env", dest="remote_worker_envs", action="append",
+        help="environment prefix for URL, TOKEN, and JSON STAGED_TARGETS; repeatable",
+    )
 
 
 def _load_profiles(args: argparse.Namespace) -> list[ModelProfile]:
@@ -126,6 +132,38 @@ def _enforce_concurrency(profile: ModelProfile, requested: int) -> None:
         )
 
 
+def _load_remote_workers(args: argparse.Namespace) -> tuple[RemoteWorkerBinding, ...]:
+    bindings = []
+    for prefix in args.remote_worker_envs or []:
+        names = {
+            "url": f"{prefix}_URL",
+            "token": f"{prefix}_TOKEN",
+            "staged": f"{prefix}_STAGED_TARGETS",
+        }
+        missing = [name for name in names.values() if not os.environ.get(name)]
+        if missing:
+            raise ValueError("missing remote worker variables: " + ", ".join(missing))
+        try:
+            staged = json.loads(os.environ[names["staged"]])
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{names['staged']} must be a JSON object") from exc
+        if not isinstance(staged, dict):
+            raise ValueError(f"{names['staged']} must be a JSON object")
+        priority_name = f"{prefix}_PRIORITY"
+        try:
+            priority = int(os.environ.get(priority_name, "100"))
+        except ValueError as exc:
+            raise ValueError(f"{priority_name} must be an integer") from exc
+        bindings.append(RemoteWorkerBinding(
+            HTTPWorkerTransport(
+                os.environ[names["url"]], auth_token=os.environ[names["token"]],
+            ),
+            {str(key): str(value) for key, value in staged.items()},
+            priority=priority,
+        ))
+    return tuple(bindings)
+
+
 def _controller(args, *, needs_model: bool) -> InvestigationController:
     if needs_model:
         profiles = _load_profiles(args)
@@ -141,6 +179,7 @@ def _controller(args, *, needs_model: bool) -> InvestigationController:
         storage_root=args.storage_root,
         rekit=FederatedRekitClient.from_roots(roots),
         workers=backends,
+        remote_tool_workers=_load_remote_workers(args) if needs_model else (),
     )
 
 

@@ -122,6 +122,44 @@ artifact transfer, and interactive attachment remain adapter/deployment work. Th
 in-memory HTTP proof must not be treated as the Windows worker proof or as an
 isolation boundary.
 
+### Controller routing
+
+`rekit_factory.tool_routing` is the production controller seam between durable
+Muster work and local/remote `WorkerTransport` implementations. Remote workers
+are registered with cached capabilities, a deterministic priority, and an
+explicit map from approved target SHA-256 values to pre-staged worker-relative
+paths. Registration rejects duplicate worker IDs, unsafe staged paths, and
+malformed hashes.
+
+Selection filters by tool ID plus requested platform, architecture, isolation,
+interactive, or exact-worker constraints. Matching remotes sort by
+`(priority, worker_id)`. A configured remote match is preferred over local; if
+that worker lacks an explicit staging entry, routing fails closed instead of
+falling back to the host. The chosen worker ID and remote requirement are stored
+in durable work payloads so a restart with missing or different worker
+configuration cannot silently move the invocation local.
+
+The controller invokes local and remote tools through the same versioned
+`InvocationRequest`/`InvocationResult` contract. It derives `none` versus exact
+`restricted` egress from verified W-0022 actions, always uses `none` mounts
+locally and `staged-input-read-only` remotely, and carries the immutable scope
+revision/digest, target hash, action list, endpoint, opaque account reference,
+credential-use boolean, and independent tool-safety approval ID. No credential
+value or implicit host mount is part of the envelope.
+
+Returned stdout/stderr enters the normal evidence capture pipeline with worker,
+invocation, work-item, target, and environment provenance. Remote artifact
+manifests are retained in artifact metadata. Transfer and verification of remote
+artifact bytes remains future transport work; a manifest is not treated as a
+locally available artifact.
+
+The CLI composition root registers workers with repeated
+`--remote-worker-env <PREFIX>`. `<PREFIX>_URL` and `<PREFIX>_TOKEN` configure the
+authenticated transport, while `<PREFIX>_STAGED_TARGETS` is a JSON object mapping
+target hashes to worker-relative staged paths and `<PREFIX>_PRIORITY` is optional.
+The token remains environment-only and is not copied into the route, run metadata,
+scope revision, invocation body, evidence, or browser projection.
+
 ## Files and isolation
 
 Each invocation gets three directories inside the worker boundary:
