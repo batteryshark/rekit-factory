@@ -98,7 +98,11 @@ def test_campaign_api_is_bounded_canonical_and_omits_private_goal(tmp_path):
         assert listing["schemaVersion"] == 1
         assert len(listing["campaigns"]) == 1
         public = listing["campaigns"][0]
-        assert public == _request(base, f"/api/campaigns/{campaign_id}")["campaign"]
+        detail = _request(base, f"/api/campaigns/{campaign_id}")["campaign"]
+        links = detail.pop("typedLinks")
+        assert links == {"schemaVersion": 1, "references": [], "totalCount": 0,
+                         "truncated": False, "sourceTruncated": False}
+        assert public == detail
         assert public["campaignId"] == campaign_id
         assert public["allowedActions"] == ["pause", "stop"]
         assert public["currentEpoch"] == {
@@ -255,7 +259,12 @@ def test_degraded_projection_exposes_no_controls_and_fails_closed(tmp_path):
                 (campaign_id,),
             )
         public = _request(base, f"/api/campaigns/{campaign_id}")["campaign"]
-        assert public["health"] == {"degraded": True, "problemCount": 1}
+        assert public["health"]["degraded"] is True
+        assert public["health"]["problemCount"] == 1
+        assert public["health"]["current"] is None
+        assert public["health"]["previous"] is None
+        assert public["health"]["problemCodes"] == ["campaign-projection-mismatch"]
+        assert public["health"]["totalObservations"] == 0
         assert public["allowedActions"] == []
         result = _request(
             base, f"/api/campaigns/{campaign_id}/pause",

@@ -72,6 +72,11 @@ def test_raw_and_display_are_independently_hashed_and_secrets_never_project(tmp_
     assert "[REDACTED:CREDENTIAL]" in display
     assert "[REDACTED:PRIVATE_KEY]" in display
     assert store.knowledge_candidate_text(record.artifact_id) == display
+    public = store.public_record("run-fixture", record.artifact_id)
+    assert public is not None and public["artifactId"] == record.artifact_id
+    assert store.public_record("other-run", record.artifact_id) is None
+    assert store.public_record("run-fixture", "missing-artifact") is None
+    assert "rawPath" not in public and "displayPath" not in public
     assert {event.action for event in outcome.events} == {AuditAction.CAPTURED, AuditAction.REDACTED}
 
 

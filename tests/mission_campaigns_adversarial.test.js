@@ -90,6 +90,39 @@ assert.match(hostileDetail, /class="campaign-reference"/);
 assert.ok(!hostileDetail.includes('data-campaign-link="artifacts"'));
 assert.match(hostileDetail, /data-campaign-link="activity"/);
 
+// Typed links accept only exact backend surface/type pairs and keep navigation and copy
+// identities distinct. Unknown or contradictory descriptors do not become controls.
+const typedFixture = fixture({typedLinks: {schemaVersion: 1, totalCount: 6, truncated: false, references: [
+  {kind: "evidence", entityId: "evidence-safe", runId: "run-safe", surface: "artifacts"},
+  {kind: "hypothesis", entityId: "hypothesis-safe", runId: "run-safe", surface: "outcomes"},
+  {kind: "finding", entityId: "finding-safe", runId: "run-safe", surface: "outcomes"},
+  {kind: "operator-decision", entityId: "decision-safe", runId: "run-safe", surface: "outcomes"},
+  {kind: "proof-bundle", entityId: "dossier-safe", runId: "run-safe", surface: "dossiers"},
+  {kind: "finding", entityId: "forged", runId: "run-safe", surface: "artifacts"},
+]}});
+assert.strictEqual(Campaigns.typedLinks(typedFixture).length, 5);
+const typedDetail = Campaigns.renderDetail(typedFixture);
+for (const value of ["evidence-safe", "hypothesis-safe", "finding-safe", "decision-safe", "dossier-safe"])
+  assert.ok(typedDetail.includes(value), value);
+assert.ok(!typedDetail.includes('data-campaign-ref="forged"'));
+assert.match(typedDetail, /data-campaign-run="run-safe"/);
+assert.match(typedDetail, /data-campaign-copy="finding:finding-safe"/);
+
+// Health is a direct formatting of the latest canonical observation. Missing observations
+// remain absent instead of being reconstructed from budgets, status, or browser time.
+assert.deepStrictEqual(Campaigns.healthFacts(fixture()), []);
+const observed = fixture({health: {degraded: false, totalObservations: 2, current: {
+  sequence: 2, phase: "validation", coverageBasisPoints: 6250,
+  epochNovelProgress: 3, cumulativeNovelProgress: 9, noProgressCount: 1,
+  retryCount: 2, elapsedWallSeconds: 45, nextCheckpointExpectedWallSeconds: 60,
+}}});
+assert.deepStrictEqual(Campaigns.healthFacts(observed).map(item => item.value), [
+  "validation", "62.50%", "3 / 9", "1 / 2", "45s", "60s cumulative",
+]);
+for (const marker of ["validation", "62.50%", "3 / 9", "1 / 2", "45s", "60s cumulative"])
+  assert.ok(Campaigns.renderDetail(observed).includes(marker), marker);
+assert.match(Campaigns.renderCard(observed), /campaign-health-strip/);
+
 // A maximum bounded handoff remains dense but complete, with stable deep-link controls.
 const large = fixture({handoff: {
   reasonCode: "waiting", evidenceCount: 500, factoryRunCount: 500, truncated: true,

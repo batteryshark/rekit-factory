@@ -9,6 +9,8 @@ import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import re
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -26,6 +28,9 @@ from rekit_factory.store import FactoryLedger
 
 
 MAX_BODY = 1_000_000
+MAX_CAMPAIGN_TYPED_LINKS = 128
+MAX_CAMPAIGN_TYPED_LINK_SCAN = 512
+_PUBLIC_RECORD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 UI_ASSETS = {
     "mission-control.css": "text/css; charset=utf-8",
     "mission-attention.js": "text/javascript; charset=utf-8",
@@ -422,7 +427,11 @@ class FactoryHandler(BaseHTTPRequestHandler):
     def _campaign(self, campaign_id: str) -> dict[str, object]:
         controller = self._campaign_controller()
         with self.server.campaign_lock:
-            return controller.public_state(campaign_id)
+            campaign = controller.public_state(campaign_id)
+        campaign["typedLinks"] = _campaign_typed_links(
+            self.server.controller, campaign, limit=MAX_CAMPAIGN_TYPED_LINKS,
+        )
+        return campaign
 
     def _campaigns(self) -> list[dict[str, object]]:
         controller = self.server.campaign_controller
@@ -580,6 +589,110 @@ def _find_run(storage_root: Path, run_id: str) -> Path:
         if _run_meta(run_dir).get("runId") == run_id:
             return run_dir
     raise FileNotFoundError(f"unknown run {run_id}")
+
+
+def _campaign_typed_links(controller: InvestigationController,
+                          campaign: dict[str, object], *, limit: int) -> dict[str, object]:
+    """Project exact campaign-owned records into bounded Mission Control links.
+
+    The durable campaign handoff is the only authority for associating a Factory run.
+    Records are then admitted only from that run's canonical outcome or safe evidence
+    projection.  Missing, moved, contradictory, and malformed runs fail closed.
+    """
+    handoff = campaign.get("handoff")
+    run_ids = handoff.get("factoryRunIds", []) if isinstance(handoff, dict) else []
+    project_id = campaign.get("projectId")
+    scope = campaign.get("scope")
+    if not isinstance(scope, dict) or not isinstance(run_ids, list):
+        run_ids = []
+    scope_identity = (scope.get("scopeId"), scope.get("revision"), scope.get("digest"))
+    references: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    supported = {"hypothesis", "finding", "operator-decision", "proof-bundle"}
+    scanned = 0
+    source_truncated = False
+
+    def admit(kind: str, entity_id: object, run_id: str, surface: str) -> None:
+        if not isinstance(entity_id, str) or _PUBLIC_RECORD_ID.fullmatch(entity_id) is None:
+            return
+        identity = (kind, entity_id, run_id)
+        if identity in seen:
+            return
+        seen.add(identity)
+        references.append({
+            "kind": kind, "entityId": entity_id, "runId": run_id, "surface": surface,
+        })
+
+    for run_index, run_id in enumerate(run_ids):
+        if not isinstance(run_id, str) or _PUBLIC_RECORD_ID.fullmatch(run_id) is None:
+            continue
+        try:
+            run_dir = _find_run(controller.storage_root, run_id)
+            snapshot = controller.snapshot(run_dir)
+        except (FileNotFoundError, OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+            continue
+        run = snapshot.get("run")
+        meta = snapshot.get("meta")
+        if not isinstance(run, dict) or not isinstance(meta, dict):
+            continue
+        run_scope = meta.get("scope")
+        if (run.get("id") != run_id or meta.get("runId") != run_id
+                or meta.get("projectId") != project_id or not isinstance(run_scope, dict)
+                or (run_scope.get("scopeId"), run_scope.get("revision"),
+                    run_scope.get("digest")) != scope_identity):
+            continue
+
+        evidence_root = run_dir / "evidence"
+        if (evidence_root / "evidence.sqlite3").is_file():
+            campaign_evidence = handoff.get("evidenceIds", [])
+            evidence_ids = ({item for item in campaign_evidence
+                             if isinstance(item, str) and _PUBLIC_RECORD_ID.fullmatch(item)}
+                            if isinstance(campaign_evidence, list) else set())
+            try:
+                store = EvidenceStore(evidence_root)
+            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+                store = None
+            for artifact_id in sorted(evidence_ids):
+                if store is None:
+                    break
+                try:
+                    # public_record opens each SQLite read in a context-managed connection.
+                    record = store.public_record(run_id, artifact_id)
+                # Corrupt or concurrently disappearing stores are absent links, not API errors.
+                except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+                    record = None
+                if record is not None:
+                    admit("evidence", artifact_id, run_id, "artifacts")
+
+        projection = snapshot.get("outcomeProjection")
+        entities = projection.get("entities", []) if isinstance(projection, dict) else []
+        if not isinstance(entities, list):
+            continue
+        remaining_scan = MAX_CAMPAIGN_TYPED_LINK_SCAN - scanned
+        if len(entities) > remaining_scan:
+            source_truncated = True
+        for entity in entities[:remaining_scan]:
+            scanned += 1
+            if not isinstance(entity, dict) or entity.get("entityType") not in supported:
+                continue
+            admit(str(entity["entityType"]), entity.get("entityId"), run_id,
+                  "dossiers" if entity["entityType"] == "proof-bundle" else "outcomes")
+        if scanned >= MAX_CAMPAIGN_TYPED_LINK_SCAN:
+            source_truncated = source_truncated or run_index < len(run_ids) - 1
+            break
+
+    references.sort(key=lambda item: (
+        run_ids.index(item["runId"]), item["kind"], item["entityId"],
+    ))
+    total = len(references)
+    bounded = references[-limit:] if isinstance(limit, int) and limit > 0 else []
+    return {
+        "schemaVersion": 1,
+        "references": bounded,
+        "totalCount": total,
+        "truncated": source_truncated or total > len(bounded),
+        "sourceTruncated": source_truncated,
+    }
 
 
 def _fleet(controller: InvestigationController) -> list[dict[str, Any]]:

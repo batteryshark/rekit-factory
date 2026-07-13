@@ -7,13 +7,29 @@ does not rebuild policy, infer a terminal result, or write campaign tables direc
 only stable identifiers, public scope identity, the current epoch reference, canonical usage,
 epoch/cumulative/remaining budgets, the exact durable policy recommendation and disposition,
 the exact terminal outcome, bounded rebuild health, allowed operator actions, and a W-0054
-bounded handoff. Health exposes only `degraded` and a problem count, not diagnostic content. Raw goals,
-events, transcripts, paths, artifacts, and evidence contents are deliberately absent.
-Degraded replay/live state exposes no allowed actions, and direct control requests fail closed.
+bounded handoff. Health exposes bounded problem codes/counts, not diagnostic content. Raw goals,
+events, transcripts, paths, artifacts, and evidence contents are deliberately absent. Its nullable
+`current` and `previous` observations carry only persisted phase, basis-point coverage,
+resolved/reproduced totals, artifact count, epoch/cumulative novelty, current retry/no-progress
+counters, cumulative elapsed wall usage, and an optional explicit cumulative-wall checkpoint
+expectation. Mission Control formats those values directly; it does not derive health from status,
+budgets, browser time, or child success. Degraded replay/live state exposes no observations or
+allowed actions, and direct control requests fail closed.
 
 `GET /api/campaigns/{campaignId}` returns `{campaign: ...}` and
 `GET /api/campaigns/{campaignId}/handoff` returns `{handoff: ...}`. An unavailable campaign
 authority yields an empty list and cannot accept controls.
+
+Campaign detail also carries a bounded `typedLinks` projection. Each reference contains only
+`kind`, `entityId`, `runId`, and the existing Mission Control `surface`; supported kinds are
+`evidence`, `hypothesis`, `finding`, `operator-decision`, and `proof-bundle`. A link exists only
+when the durable campaign handoff names the Factory run, that run matches the campaign project
+and exact scope identity, and the safe evidence metadata or canonical outcome projection owns
+the referenced stable identifier. The server scans at most 512 outcome records and returns at
+most 128 links, reporting both output/source truncation. Missing, malformed, moved, corrupt, or
+contradictory sources fail closed. The projection never contains routes, filesystem paths,
+record bodies, report text, or raw evidence. Mission Control translates each descriptor into
+exact run/tab/filter navigation and offers a copy action for the canonical `kind:entityId`.
 
 Pause, resume, and stop use `POST /api/campaigns/{campaignId}/{action}`. Every request supplies
 the stable `operationId` and the `expectedRevision` read with the campaign. Stop also supplies a

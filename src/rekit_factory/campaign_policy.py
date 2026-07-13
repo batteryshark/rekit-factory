@@ -28,6 +28,7 @@ from .campaign_contracts import (
 
 
 CampaignPhase = Literal["recon", "hypothesis", "validation"]
+MAX_POLICY_FACTS = 256
 AttemptOutcome = Literal[
     "productive", "no-novelty", "validation-rejected", "dependency-blocked",
     "environment-failed", "notification-only",
@@ -198,6 +199,8 @@ class CanonicalOutcomeTotals:
             raise ValueError("artifact ids must be non-empty strings")
         if len(set(ordered)) != len(ordered):
             raise ValueError("artifact ids must be unique")
+        if len(ordered) > MAX_POLICY_FACTS:
+            raise ValueError("artifact ids exceed the finite policy-input limit")
         object.__setattr__(self, "artifact_ids", ordered)
 
 
@@ -258,11 +261,15 @@ class CampaignPolicyInput:
         ))
         if len(set(known)) != len(known):
             raise ValueError("known progress digests must be unique")
+        if len(known) > MAX_POLICY_FACTS:
+            raise ValueError("known progress digests exceed the finite policy-input limit")
         attempts = tuple(sorted(self.attempts, key=lambda item: item.attempt_id))
         if any(type(item) is not AttemptFact for item in attempts):
             raise ValueError("attempts must contain AttemptFact values")
         if len({item.attempt_id for item in attempts}) != len(attempts):
             raise ValueError("attempt ids must be unique")
+        if len(attempts) > MAX_POLICY_FACTS:
+            raise ValueError("attempt facts exceed the finite policy-input limit")
         object.__setattr__(self, "known_progress_digests", known)
         object.__setattr__(self, "attempts", attempts)
 

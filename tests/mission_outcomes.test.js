@@ -113,6 +113,7 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
   const large = {...empty, entities: Array.from({length: 250}, (_, index) => entity("work-item", `work-${String(index).padStart(3, "0")}`, {execution: facet(index % 2 ? "active" : "terminal", "muster", {terminal: index % 2 === 0})}))};
   assert.equal(projectionView(large).counts.total, 250);
   assert.equal(projectionView(large, {query: "work-249"}).counts.shown, 1);
+  assert.deepEqual(projectionView(large, {query: "work-24", exactId: "work-249"}).entities.map(item => item.entityId), ["work-249"]);
 
   assert.deepEqual(canonicalLink(entities[0]), {tab: "activity", label: "Open activity"});
   assert.deepEqual(canonicalLink(entities[3]), {tab: "activity", label: "Open campaign activity"});

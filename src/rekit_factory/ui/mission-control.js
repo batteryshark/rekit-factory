@@ -264,6 +264,8 @@ function activate(element) {
   if (campaignAction) { transitionCampaign(campaignAction.dataset.campaignId, campaignAction.dataset.campaignAction); return true; }
   const campaignLink = element.closest("[data-campaign-link]");
   if (campaignLink) { openCampaignLink(campaignLink); return true; }
+  const campaignCopy = element.closest("[data-campaign-copy]");
+  if (campaignCopy) { copyText(campaignCopy.dataset.campaignCopy, "Canonical record ID copied."); return true; }
   const campaign = element.closest("[data-campaign]");
   if (campaign) { openCampaign(campaign.dataset.campaign); return true; }
   const memoryToggle = element.closest("[data-memory-toggle]");
@@ -340,6 +342,7 @@ document.addEventListener("keydown", event => {
 
 document.addEventListener("input", event => {
   if (event.target.id !== "outcomeSearch") return;
+  delete state.outcomes.filters.exactId;
   state.outcomes.filters.query = event.target.value;
   renderOutcomeProjection();
 });
@@ -348,6 +351,7 @@ document.addEventListener("change", event => {
   const names = {outcomeType: "type", outcomeState: "state", outcomeOwner: "owner", outcomeTerminal: "terminal"};
   const name = names[event.target.id];
   if (!name) return;
+  delete state.outcomes.filters.exactId;
   state.outcomes.filters[name] = event.target.value;
   renderOutcomeProjection();
 });
@@ -411,13 +415,30 @@ async function refreshCampaigns() {
     renderCampaigns();
     if (state.campaignSelected && $("campaignDialog").open && !state.campaignAction) {
       const current = state.campaigns.find(item => item.campaignId === state.campaignSelected);
-      if (current) $("campaignDetail").innerHTML = MissionCampaigns.renderDetail(current);
+      if (current) await refreshOpenCampaign(current.campaignId);
       else closeCampaign();
     }
   } catch (error) {
     if (generation !== state.campaignListRequest) return;
     $("campaignBoardHealth").innerHTML = `<span class="attention"><b>!</b> projection unavailable</span>`;
     $("campaignFleet").innerHTML = `<div class="empty compact"><b>Campaign projection unavailable</b>Mission Control will retry the bounded read model automatically.</div>`;
+  }
+}
+
+async function refreshOpenCampaign(campaignId) {
+  const generation = ++state.campaignDetailRequest;
+  try {
+    const payload = await api(`/api/campaigns/${encodeURIComponent(campaignId)}`);
+    if (generation !== state.campaignDetailRequest || state.campaignSelected !== campaignId || !$("campaignDialog").open) return;
+    const campaign = payload.campaign;
+    if (!campaign || campaign.campaignId !== campaignId) throw new Error("Campaign projection identity mismatch");
+    state.campaigns = state.campaigns.map(item => item.campaignId === campaignId ? campaign : item);
+    $("campaignDetail").innerHTML = MissionCampaigns.renderDetail(campaign);
+  } catch (_error) {
+    if (generation !== state.campaignDetailRequest || state.campaignSelected !== campaignId || !$("campaignDialog").open) return;
+    const bounded = state.campaigns.find(item => item.campaignId === campaignId);
+    if (bounded) $("campaignDetail").innerHTML = MissionCampaigns.renderDetail(bounded);
+    toast("Campaign record links are unavailable; stale links were removed.", true);
   }
 }
 
@@ -477,14 +498,26 @@ async function transitionCampaign(campaignId, action) {
   } finally { state.campaignAction = null; $("campaignDialog").setAttribute("aria-busy", "false"); }
 }
 
-function openCampaignLink(link) {
-  const runId = link.dataset.campaignLink === "activity" ? link.dataset.campaignRef : null;
+async function openCampaignLink(link) {
+  const surface = link.dataset.campaignLink;
+  const runId = link.dataset.campaignRun || (surface === "activity" ? link.dataset.campaignRef : null);
   if (!runId) { toast("No bounded run link is available for this reference.", true); return; }
+  const kind = link.dataset.campaignKind, entityId = link.dataset.campaignRef;
   closeCampaign();
-  openRun(runId).then(() => {
-    const tab = link.dataset.campaignLink === "artifacts" ? "artifacts" : "activity";
-    activateDetailTab($(`tab-button-${tab}`), {focus: true});
-  });
+  await openRun(runId);
+  if (state.selected !== runId || state.snapshot?.run?.id !== runId) return;
+  const tab = ["artifacts", "outcomes", "dossiers", "activity"].includes(surface) ? surface : "activity";
+  if (tab === "outcomes") {
+    state.outcomes.filters = {query: entityId, exactId: entityId, type: kind, state: "all", owner: "all", terminal: "all"};
+    $("outcomeSearch").value = entityId;
+    renderOutcomeProjection();
+  }
+  activateDetailTab($(`tab-button-${tab}`), {focus: true});
+  const exact = tab === "artifacts" ? document.querySelector(`[data-evidence-record="${CSS.escape(entityId)}"]`)
+    : tab === "dossiers" ? document.querySelector(`[data-dossier-id="${CSS.escape(entityId)}"]`)
+      : tab === "outcomes" ? document.querySelector(`[data-outcome-id="${CSS.escape(entityId)}"][data-outcome-type="${CSS.escape(kind)}"]`) : null;
+  if (exact) { exact.classList.add("campaign-linked-target"); exact.scrollIntoView({block: "center"}); exact.focus({preventScroll: true}); }
+  else if (tab !== "activity") toast("The canonical record is no longer present in this run.", true);
 }
 
 function renderFleet() {
@@ -566,6 +599,8 @@ async function openRun(runId) {
     state.outcomes.integrity = "missing";
     state.outcomes.filters = {query: "", type: "all", state: "all", owner: "all", terminal: "all"};
     state.selected = runId;
+    state.snapshot = null;
+    state.evidence = [];
     const [snapshot, reportPayload, evidence, dossierPayload] = await Promise.all([
       api(`/api/runs/${encodeURIComponent(runId)}`),
       api(`/api/runs/${encodeURIComponent(runId)}/reports`),
@@ -603,7 +638,7 @@ function renderEvidence() {
   $("evidenceLifecycle").innerHTML = records.length ? records.map(record => {
     const pinned = (record.citations || []).includes(`operator:${record.runId}`), inactive = ["deleted", "expired"].includes(record.state);
     const labels = record.quarantineLabels?.length ? `<span class="evidence-warning">restricted: ${esc(record.quarantineLabels.join(", "))}</span>` : "";
-    return `<article class="evidence-card ${esc(record.state)}"><div class="evidence-head"><div><b>${esc(record.kind)}</b><span>${esc(record.state.replaceAll("_", " "))}</span></div><code>${esc(record.originalSha256.slice(0, 12))}</code></div><div class="evidence-facts"><span>${esc(record.mediaType)}</span><span>${record.rawSize.toLocaleString()} bytes</span><span>${esc(record.retentionClass)}</span>${record.redacted ? "<span>redacted projection</span>" : ""}${record.expiresAt ? `<span>expires ${esc(new Date(record.expiresAt).toLocaleString())}</span>` : ""}${labels}</div><div class="evidence-actions"><button class="btn" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="${pinned ? "unpin" : "pin"}" ${inactive ? "disabled" : ""}>${pinned ? "Unpin" : "Pin"}</button><button class="btn" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="${record.held ? "unhold" : "hold"}" ${inactive ? "disabled" : ""}>${record.held ? "Release hold" : "Hold"}</button><button class="btn red" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="delete" ${inactive ? "disabled" : ""}>Delete</button></div></article>`;
+    return `<article class="evidence-card ${esc(record.state)}" data-evidence-record="${esc(record.artifactId)}" tabindex="-1"><div class="evidence-head"><div><b>${esc(record.kind)}</b><span>${esc(record.state.replaceAll("_", " "))}</span></div><code>${esc(record.originalSha256.slice(0, 12))}</code></div><div class="evidence-facts"><span>${esc(record.mediaType)}</span><span>${record.rawSize.toLocaleString()} bytes</span><span>${esc(record.retentionClass)}</span>${record.redacted ? "<span>redacted projection</span>" : ""}${record.expiresAt ? `<span>expires ${esc(new Date(record.expiresAt).toLocaleString())}</span>` : ""}${labels}</div><div class="evidence-actions"><button class="btn" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="${pinned ? "unpin" : "pin"}" ${inactive ? "disabled" : ""}>${pinned ? "Unpin" : "Pin"}</button><button class="btn" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="${record.held ? "unhold" : "hold"}" ${inactive ? "disabled" : ""}>${record.held ? "Release hold" : "Hold"}</button><button class="btn red" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="delete" ${inactive ? "disabled" : ""}>Delete</button></div></article>`;
   }).join("") : `<div class="empty compact"><b>No retained evidence</b>Proof-required captures and their lifecycle state will appear here.</div>`;
 }
 
@@ -755,7 +790,7 @@ function renderDossiers(snapshot) {
     const open = `/api/runs/${encodeURIComponent(runId)}/dossiers/${encodeURIComponent(dossier.id)}`;
     const verified = dossier.verified === true, status = verified ? dossier.verdict : "STALE / INVALID";
     const actions = verified ? `<a class="btn primary" href="${open}" target="_blank" rel="noopener">Open dossier</a><a class="btn" href="${open}/download" download>Export ZIP</a>` : `<span class="btn dossier-disabled" aria-disabled="true">Open unavailable</span><span class="btn dossier-disabled" aria-disabled="true">Republish required</span>`;
-    return `<article class="dossier-card ${verified ? "verified" : "stale"}" style="--dossier-order:${index}"><div class="dossier-card-signal" aria-hidden="true"><span>${verified ? "◆" : "!"}</span><i></i></div><div class="dossier-card-copy"><header><span>${esc(dossier.findingId)}</span><b>${esc(status)}</b></header><h3>Evidence dossier</h3><div class="dossier-facts"><span><small>finding state</small><code>${esc(dossier.findingStateSha256.slice(0, 16))}…</code></span><span><small>manifest</small><code>${esc(dossier.manifestSha256.slice(0, 16))}…</code></span><span><small>verification</small><code>${esc(dossier.verificationStatus)}</code></span></div></div><div class="dossier-actions">${actions}</div></article>`;
+    return `<article class="dossier-card ${verified ? "verified" : "stale"}" data-dossier-id="${esc(dossier.id)}" tabindex="-1" style="--dossier-order:${index}"><div class="dossier-card-signal" aria-hidden="true"><span>${verified ? "◆" : "!"}</span><i></i></div><div class="dossier-card-copy"><header><span>${esc(dossier.findingId)}</span><b>${esc(status)}</b></header><h3>Evidence dossier</h3><div class="dossier-facts"><span><small>finding state</small><code>${esc(dossier.findingStateSha256.slice(0, 16))}…</code></span><span><small>manifest</small><code>${esc(dossier.manifestSha256.slice(0, 16))}…</code></span><span><small>verification</small><code>${esc(dossier.verificationStatus)}</code></span></div></div><div class="dossier-actions">${actions}</div></article>`;
   }).join("") : `<div class="knowledge-empty"><b>No proof dossiers published</b>A dossier appears only after every required file is materialized and its anchored bundle verifies.</div>`;
 }
 
@@ -784,7 +819,7 @@ function outcomeCard(entity, index) {
   const diagnostics = entity.diagnostics || [];
   const parent = entity.parent;
   const link = MissionOutcomes.canonicalLink(entity);
-  return `<article class="outcome-card type-${esc(entity.entityType)} ${unknown || diagnostics.length ? "degraded" : ""}" style="--outcome-order:${Math.min(index, 12)}">
+  return `<article class="outcome-card type-${esc(entity.entityType)} ${unknown || diagnostics.length ? "degraded" : ""}" data-outcome-type="${esc(entity.entityType)}" data-outcome-id="${esc(entity.entityId)}" tabindex="-1" style="--outcome-order:${Math.min(index, 12)}">
     <header class="outcome-card-head"><div class="outcome-type-mark" aria-hidden="true"><i></i><span>${icon}</span></div><div class="outcome-identity"><span>${esc(label)}</span><h3>${esc(entity.entityId)}</h3>${parent ? `<button type="button" data-outcome-parent="${esc(parent.entityId)}" title="Filter to canonical parent"><small>↳ ${esc(parent.entityType)} / ${esc(parent.entityId)}</small></button>` : `<small>root entity</small>`}</div>${unknown || diagnostics.length ? `<span class="outcome-degraded-badge">degraded</span>` : ""}</header>
     <div class="outcome-facets">${facets.map(([name, facet]) => {
       if (!facet) return `<div class="outcome-facet unknown"><span>${esc(name)}</span><b>missing</b><small>owner unavailable</small></div>`;

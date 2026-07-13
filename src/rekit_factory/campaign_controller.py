@@ -15,7 +15,9 @@ from .campaign_contracts import (
     ProgressSignal, ResourceUsage, ScopeBinding, TerminalOutcome,
 )
 from .campaign_lifecycle import CAMPAIGN_AUTHORITY, CampaignLifecycleStore
-from .campaign_persistence import CampaignPersistence, CampaignPersistenceError
+from .campaign_persistence import (
+    CampaignHealthRollup, CampaignPersistence, CampaignPersistenceError,
+)
 from .campaign_policy import (
     AttemptFact, BudgetAccount, BudgetReservation, CampaignPhase, CampaignPolicyConfig,
     CampaignPolicyInput, CampaignPolicyRecommendation, CanonicalOutcomeTotals,
@@ -26,7 +28,7 @@ from .control import InvestigationController, RunRequest
 
 CONTROLLER_BOUNDARIES = (
     "launched", "execution-staged", "checkpointed", "recommendation-staged",
-    "recommendation-effect", "recommendation-applied",
+    "recommendation-effect", "health-recorded", "recommendation-applied",
 )
 
 
@@ -128,6 +130,8 @@ create table if not exists factory_campaign_controller_epochs (
     recommendation_id text,
     recommendation_json text,
     policy_input_digest text,
+    policy_input_json text,
+    health_rollup_json text,
     factory_run_id text,
     recommendation_applied integer not null default 0,
     recommendation_disposition text not null default 'pending'
@@ -200,7 +204,15 @@ class CampaignController:
                 "alter table factory_campaign_controller_epochs add column "
                 "recommendation_disposition text not null default 'pending'"
             )
-            self.persistence.conn.commit()
+        if "policy_input_json" not in columns:
+            self.persistence.conn.execute(
+                "alter table factory_campaign_controller_epochs add column policy_input_json text"
+            )
+        if "health_rollup_json" not in columns:
+            self.persistence.conn.execute(
+                "alter table factory_campaign_controller_epochs add column health_rollup_json text"
+            )
+        self.persistence.conn.commit()
 
     def _fault(self, boundary: str) -> None:
         if self.fault_injector is not None:
@@ -276,6 +288,26 @@ class CampaignController:
             raise CampaignControllerError("epoch work exceeds its concurrency ceiling")
         if not _usage_fits(reservation, epoch.budget):
             raise CampaignControllerError("reservation exceeds finite epoch budget")
+        reservation_id = "reservation-" + hashlib.sha256(
+            (epoch.epoch_id + _json(reservation.to_dict())).encode()
+        ).hexdigest()
+        row = self.persistence.conn.execute(
+            "select * from factory_campaign_controller_epochs where epoch_id=?", (epoch.epoch_id,),
+        ).fetchone()
+        if row is not None:
+            persisted_epoch = self.persistence.conn.execute(
+                "select campaign_id,contract_json from factory_campaign_epochs where epoch_id=?",
+                (epoch.epoch_id,),
+            ).fetchone()
+            if row["campaign_id"] != epoch.campaign_id \
+                    or row["reservation_id"] != reservation_id \
+                    or row["reservation_json"] != _json(reservation.to_dict()) \
+                    or row["owner_id"] != self.owner_id \
+                    or persisted_epoch is None \
+                    or persisted_epoch["campaign_id"] != epoch.campaign_id \
+                    or persisted_epoch["contract_json"] != _json(epoch.to_dict()):
+                raise CampaignControllerError("epoch launch conflicts with durable reservation")
+            return EpochLaunch(epoch.campaign_id, epoch.epoch_id, row["lease_id"], reservation_id)
         projection = self.persistence.campaign(epoch.campaign_id)
         reserved = ResourceUsage()
         for row in self.persistence.conn.execute(
@@ -286,16 +318,6 @@ class CampaignController:
         if not _usage_fits(_usage_add(_usage_add(projection.cumulative_usage, reserved), reservation),
                            campaign.cumulative_budget):
             raise CampaignControllerError("reservation exceeds remaining cumulative budget")
-        reservation_id = "reservation-" + hashlib.sha256(
-            (epoch.epoch_id + _json(reservation.to_dict())).encode()
-        ).hexdigest()
-        row = self.persistence.conn.execute(
-            "select * from factory_campaign_controller_epochs where epoch_id=?", (epoch.epoch_id,),
-        ).fetchone()
-        if row is not None:
-            if row["reservation_id"] != reservation_id or row["owner_id"] != self.owner_id:
-                raise CampaignControllerError("epoch launch conflicts with durable reservation")
-            return EpochLaunch(epoch.campaign_id, epoch.epoch_id, row["lease_id"], reservation_id)
         self.persistence.publish_epoch(epoch, operation_id=f"publish:{epoch.epoch_id}")
         lease_id = self.persistence.acquire_epoch_lease(
             epoch.campaign_id, epoch.epoch_id, self.owner_id,
@@ -335,7 +357,8 @@ class CampaignController:
              totals: CanonicalOutcomeTotals,
              previous_totals: CanonicalOutcomeTotals = CanonicalOutcomeTotals(),
              known_progress_digests: tuple[str, ...] = (),
-             attempts: tuple[AttemptFact, ...] = ()) -> CampaignSnapshot:
+             attempts: tuple[AttemptFact, ...] = (),
+             next_checkpoint_expected_wall_seconds: int | None = None) -> CampaignSnapshot:
         initial = self.persistence.campaign(campaign_id)
         if initial.status == "suspended":
             raise CampaignControllerError("campaign is not runnable while suspended")
@@ -418,22 +441,52 @@ class CampaignController:
             previous_checkpoint=previous, previous_totals=previous_totals,
             known_progress_digests=known_progress_digests, attempts=attempts,
         ), self.policy_config)
-        policy_input_digest = hashlib.sha256(_json({
+        if next_checkpoint_expected_wall_seconds is not None \
+                and (recommendation.action not in {"continue", "reprioritize"}
+                     or not execution.result.next_action_ids):
+            raise CampaignControllerError(
+                "next checkpoint expectation requires a recommendation that schedules work"
+            )
+        policy_input = {
             "attempts": [{"attemptId": item.attempt_id,
                            "equivalenceDigest": item.equivalence_digest,
                            "outcome": item.outcome} for item in attempts],
+            "campaignId": campaign_id,
             "campaignDigest": self._contract(campaign_id).digest,
             "checkpointId": checkpoint.checkpoint_id,
+            "epochId": epoch.epoch_id,
             "epochResult": execution.result.to_dict(),
             "knownProgressDigests": list(sorted(known_progress_digests)),
+            "nextCheckpointExpectedWallSeconds": next_checkpoint_expected_wall_seconds,
             "phase": phase,
             "policyConfig": {name: getattr(self.policy_config, name)
                              for name in self.policy_config.__dataclass_fields__},
             "previousCheckpointId": None if previous is None else previous.checkpoint_id,
             "previousTotals": self._totals_dict(previous_totals),
             "totals": self._totals_dict(totals),
-        }).encode()).hexdigest()
-        self._stage_recommendation(epoch.epoch_id, recommendation, policy_input_digest)
+        }
+        policy_input_json = _json(policy_input)
+        policy_input_digest = hashlib.sha256(policy_input_json.encode()).hexdigest()
+        previous_health = self.persistence.health(campaign_id).current
+        if previous_health is not None and previous_health.sequence >= checkpoint.sequence:
+            raise CampaignControllerError("health projection is stale or crossed")
+        equivalence = [item.equivalence_digest for item in attempts]
+        epoch_retries = len(equivalence) - len(set(equivalence))
+        novel_count = len(recommendation.novel_progress)
+        epoch_no_progress = sum(item.outcome != "productive" for item in attempts) \
+            if not novel_count else 0
+        rollup = CampaignHealthRollup(
+            campaign_id, epoch.epoch_id, checkpoint.checkpoint_id, policy_input_digest,
+            recommendation.recommendation_id, checkpoint.sequence, phase,
+            totals.coverage_basis_points, totals.resolved_hypotheses,
+            totals.reproduced_findings, totals.artifact_ids, novel_count,
+            (0 if previous_health is None else previous_health.cumulative_novel_progress)
+            + novel_count,
+            epoch_retries, epoch_no_progress,
+            checkpoint.cumulative_usage.wall_seconds,
+            next_checkpoint_expected_wall_seconds,
+        )
+        self._stage_recommendation(epoch.epoch_id, recommendation, policy_input_json, rollup)
         self._apply_recommendation(epoch, execution, recommendation)
         return self.snapshot(campaign_id)
 
@@ -507,20 +560,27 @@ class CampaignController:
 
     def _stage_recommendation(self, epoch_id: str,
                               recommendation: CampaignPolicyRecommendation,
-                              policy_input_digest: str) -> None:
+                              policy_input_json: str,
+                              rollup: CampaignHealthRollup) -> None:
         encoded = _json(recommendation.to_dict())
+        policy_input_digest = hashlib.sha256(policy_input_json.encode()).hexdigest()
+        rollup_json = _json(rollup.to_dict())
         row = self.persistence.conn.execute(
-            "select recommendation_id,recommendation_json,policy_input_digest from "
+            "select recommendation_id,recommendation_json,policy_input_digest,"
+            "policy_input_json,health_rollup_json from "
             "factory_campaign_controller_epochs where epoch_id=?", (epoch_id,),
         ).fetchone()
         if row[0] is not None and (row[0] != recommendation.recommendation_id
-                                  or row[1] != encoded or row[2] != policy_input_digest):
+                                  or row[1] != encoded or row[2] != policy_input_digest
+                                  or row[3] != policy_input_json or row[4] != rollup_json):
             raise CampaignControllerError("policy retry conflicts with durable recommendation")
         with self.persistence.conn:
             self.persistence.conn.execute(
                 "update factory_campaign_controller_epochs set recommendation_id=?,"
-                "recommendation_json=?,policy_input_digest=? where epoch_id=?",
-                (recommendation.recommendation_id, encoded, policy_input_digest, epoch_id),
+                "recommendation_json=?,policy_input_digest=?,policy_input_json=?,"
+                "health_rollup_json=? where epoch_id=?",
+                (recommendation.recommendation_id, encoded, policy_input_digest,
+                 policy_input_json, rollup_json, epoch_id),
             )
         self._fault("recommendation-staged")
 
@@ -592,6 +652,21 @@ class CampaignController:
                 else:
                     self.launch(next_epoch, reservation)
         self._fault("recommendation-effect")
+        staged = self.persistence.conn.execute(
+            "select recommendation_json,policy_input_json,health_rollup_json from "
+            "factory_campaign_controller_epochs where campaign_id=? and epoch_id=?",
+            (campaign_id, epoch.epoch_id),
+        ).fetchone()
+        if staged is None or any(staged[index] is None for index in range(3)):
+            raise CampaignControllerError("applied recommendation lacks staged health authority")
+        rollup = CampaignHealthRollup.from_dict(json.loads(staged[2]))
+        if rollup.recommendation_id != recommendation.recommendation_id:
+            raise CampaignControllerError("staged health crossed recommendation authority")
+        self.persistence.record_health_rollup(
+            rollup, policy_input_json=staged[1], recommendation_json=staged[0],
+            operation_id=f"health:{recommendation.recommendation_id}",
+        )
+        self._fault("health-recorded")
         with self.persistence.conn:
             self.persistence.conn.execute(
                 "update factory_campaign_controller_epochs set recommendation_applied=1,"
@@ -627,6 +702,31 @@ class CampaignController:
              evidence_ids: tuple[str, ...], *, operation_id: str = "operator-stop",
              expected_revision: int | None = None) -> CampaignSnapshot:
         self._require_canonical_projection(campaign_id)
+        pending = self.persistence.conn.execute(
+            "select epoch_id,execution_json,recommendation_json from "
+            "factory_campaign_controller_epochs where campaign_id=? "
+            "and recommendation_json is not null and recommendation_applied=0 limit 1",
+            (campaign_id,),
+        ).fetchone()
+        if pending is not None:
+            recommendation = self._recommendation_from_dict(json.loads(pending[2]))
+            effect = self.persistence.conn.execute(
+                "select 1 from factory_campaign_events where campaign_id=? and operation_id=?",
+                (campaign_id, f"apply:{recommendation.recommendation_id}"),
+            ).fetchone()
+            epoch = self._epoch(campaign_id, pending[0])
+            next_epoch = self.persistence.conn.execute(
+                "select 1 from factory_campaign_epochs where campaign_id=? and ordinal=?",
+                (campaign_id, epoch.ordinal + 1),
+            ).fetchone()
+            if effect is not None or next_epoch is not None:
+                if pending[1] is None:
+                    raise CampaignControllerError(
+                        "started recommendation effect lacks staged execution authority"
+                    )
+                self._apply_recommendation(
+                    epoch, _execution_from_dict(json.loads(pending[1])), recommendation,
+                )
         projection = self.persistence.campaign(campaign_id)
         outcome = TerminalOutcome(campaign_id, "stopped", reason_code, evidence_ids,
                                   projection.latest_checkpoint_id)
@@ -743,6 +843,32 @@ class CampaignController:
         handoff = self.handoff(campaign_id)
         rebuild = self.persistence.rebuild_projection(campaign_id)
         degraded = rebuild.degraded or not rebuild.matches_live
+        health = self.persistence.health(campaign_id)
+        health_degraded = degraded or health.degraded
+        health_problem_codes = tuple(dict.fromkeys(
+            (*rebuild.problem_codes, *health.problem_codes)
+        ))[:16]
+        def health_item(value: CampaignHealthRollup | None) -> dict[str, object] | None:
+            if value is None:
+                return None
+            return {
+                "artifactCount": len(value.artifact_ids),
+                "checkpointId": value.checkpoint_id,
+                "coverageBasisPoints": value.coverage_basis_points,
+                "cumulativeNovelProgress": value.cumulative_novel_progress,
+                "elapsedWallSeconds": value.elapsed_wall_seconds,
+                "epochId": value.epoch_id,
+                "epochNovelProgress": value.epoch_novel_progress,
+                "nextCheckpointExpectedWallSeconds":
+                    value.next_checkpoint_expected_wall_seconds,
+                "noProgressCount": value.no_progress_count,
+                "phase": value.phase,
+                "recommendationId": value.recommendation_id,
+                "reproducedFindings": value.reproduced_findings,
+                "resolvedHypotheses": value.resolved_hypotheses,
+                "retryCount": value.retry_count,
+                "sequence": value.sequence,
+            }
         allowed = () if degraded else {
             "requested": ("stop",),
             "running": ("pause", "stop"),
@@ -757,8 +883,13 @@ class CampaignController:
             "status": snapshot.status,
             "revision": projection.revision,
             "health": {
-                "degraded": degraded,
-                "problemCount": len(rebuild.problems),
+                "current": None if health_degraded else health_item(health.current),
+                "degraded": health_degraded,
+                "previous": None if health_degraded else health_item(health.previous),
+                "problemCodes": list(health_problem_codes),
+                "problemCount": min(len(rebuild.problems), 16),
+                "problemsTruncated": len(rebuild.problems) > 16,
+                "totalObservations": health.total_observations,
             },
             "currentEpoch": None if epoch is None else {
                 "epochId": epoch.epoch_id,

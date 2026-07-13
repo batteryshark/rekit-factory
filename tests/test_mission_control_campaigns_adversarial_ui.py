@@ -17,6 +17,12 @@ def test_campaign_ui_adversarial_helper():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "mission campaigns adversarial: ok" in result.stdout
+    links = subprocess.run(
+        [node, str(ROOT / "tests" / "mission_campaign_links_adversarial.test.js")],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    assert links.returncode == 0, links.stdout + links.stderr
+    assert "mission campaign links adversarial: ok" in links.stdout
 
 
 def test_campaign_surface_preserves_keyboard_mobile_motion_and_bounded_errors():
@@ -42,7 +48,12 @@ def test_campaign_surface_preserves_keyboard_mobile_motion_and_bounded_errors():
         "campaignListRequest", "campaignDetailRequest", "campaignReturnFocus",
         'value: `mission-control:${campaignId}:${action}:${revision}`',
         'evidenceIds: []', 'setAttribute("aria-busy", "true")',
-        "}, 1800)",
+        "}, 1800)", "link.dataset.campaignRun", "link.dataset.campaignKind",
+        "CSS.escape(entityId)", "campaign-linked-target",
+        "The canonical record is no longer present in this run.",
+        "await refreshOpenCampaign(current.campaignId)",
+        "state.campaignSelected !== campaignId", "stale links were removed",
+        "MissionCampaigns.renderDetail(bounded)",
     ):
         assert behavior in script
     # Campaign failures are deliberately summarized; backend exception text can carry paths.

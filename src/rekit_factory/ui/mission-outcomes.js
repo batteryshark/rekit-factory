@@ -194,6 +194,7 @@
     const type = filters.type || "all", state = filters.state || "all";
     const owner = filters.owner || "all", terminal = filters.terminal || "all";
     const query = String(filters.query || "").trim().toLowerCase();
+    const exactId = typeof filters.exactId === "string" ? filters.exactId : null;
     const types = {}, states = new Set(), owners = new Set();
     let terminalCount = 0, unknownCount = 0, degradedCount = 0;
     entities.forEach(entity => {
@@ -207,6 +208,7 @@
     const shown = entities.filter(entity => {
       const facets = FACETS.map(name => entity.facets?.[name]).filter(Boolean);
       return (type === "all" || entity.entityType === type)
+        && (!exactId || entity.entityId === exactId)
         && (state === "all" || facets.some(facet => facet.state === state))
         && (owner === "all" || facets.some(facet => facet.owner === owner))
         && (terminal === "all" || facets.some(facet => facet.terminal && facet.state !== "not-applicable") === (terminal === "terminal"))

@@ -547,6 +547,18 @@ class EvidenceStore:
         return tuple(self._public(record, by_artifact.get(record.artifact_id, []))
                      for record in self.list_records(run_id))
 
+    def public_record(self, run_id: str, artifact_id: str) -> dict[str, object] | None:
+        """Return one exact safe metadata projection without scanning run history."""
+        record = self.get(artifact_id)
+        if record is None or record.run_id != run_id:
+            return None
+        with self._connect() as connection:
+            citations = connection.execute(
+                "select citation_id from evidence_citations where artifact_id=? "
+                "order by citation_id", (artifact_id,),
+            ).fetchall()
+        return self._public(record, [row["citation_id"] for row in citations])
+
     def pin(self, artifact_id: str, citation_id: str, *, now: str | None = None) -> AuditEvent:
         record = self._required(artifact_id)
         timestamp = now or _now()

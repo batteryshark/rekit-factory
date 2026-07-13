@@ -152,7 +152,10 @@ def test_campaign_api_public_projection_is_bounded_private_and_campaign_local(tm
         assert not ({"events", "paths", "transcripts", "artifacts"} & set(first_public))
 
         status, detail = _request(f"{base}/api/campaigns/{first.campaign_id}")
-        assert status == 200 and detail["campaign"] == first_public
+        detail_campaign = dict(detail["campaign"])
+        typed_links = detail_campaign.pop("typedLinks")
+        assert status == 200 and detail_campaign == first_public
+        assert typed_links["references"] == []
         status, missing = _request(f"{base}/api/campaigns/campaign-missing")
         assert status == 404 and "does not exist" in missing["error"]
     finally:
@@ -203,8 +206,17 @@ def test_degraded_campaign_health_is_bounded_and_fails_control_authority_closed(
             (json.dumps(usage, sort_keys=True), campaign.campaign_id),
         )
     public = controller.public_state(campaign.campaign_id)
-    assert public["health"]["degraded"] is True
-    assert public["health"]["problemCount"] >= 1
-    assert set(public["health"]) == {"degraded", "problemCount"}
+    health = public["health"]
+    assert set(health) == {
+        "current", "degraded", "previous", "problemCodes", "problemCount",
+        "problemsTruncated", "totalObservations",
+    }
+    assert health["degraded"] is True
+    assert health["current"] is health["previous"] is None
+    assert health["problemCount"] >= 1
+    assert health["problemCodes"]
+    assert len(health["problemCodes"]) <= 16
+    assert health["totalObservations"] == 0
+    assert type(health["problemsTruncated"]) is bool
     assert public["allowedActions"] == []
     persistence.close()

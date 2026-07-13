@@ -32,7 +32,12 @@ from .campaign_contracts import (
 FailureInjector = Callable[[str], None]
 LeaseStatus = Literal["active", "released", "recovery-required"]
 ZERO_DIGEST = "0" * 64
+MAX_HEALTH_HISTORY = 32
+MAX_HEALTH_ARTIFACTS = 256
+MAX_HEALTH_PROBLEMS = 16
+MAX_POLICY_INPUT_BYTES = 262_144
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 WRITE_BOUNDARIES = (
     "event-appended", "campaign-projected", "epoch-projected",
     "lease-projected", "checkpoint-projected", "decision-projected",
@@ -67,6 +72,185 @@ class CampaignRebuild:
     matches_live: bool
     degraded: bool
     problems: tuple[str, ...]
+
+    @property
+    def problem_codes(self) -> tuple[str, ...]:
+        """Bounded non-sensitive diagnostics suitable for public projections."""
+        codes: list[str] = []
+        for problem in self.problems:
+            if "health" in problem:
+                code = "campaign-health-invalid"
+            elif "hash chain" in problem or "history gap" in problem:
+                code = "campaign-history-integrity"
+            elif "live projection" in problem:
+                code = "campaign-projection-mismatch"
+            else:
+                code = "campaign-history-invalid"
+            if code not in codes:
+                codes.append(code)
+            if len(codes) == MAX_HEALTH_PROBLEMS:
+                break
+        return tuple(codes)
+
+
+@dataclass(frozen=True)
+class CampaignHealthRollup:
+    """Exact canonical health facts applied with one policy recommendation."""
+
+    campaign_id: str
+    epoch_id: str
+    checkpoint_id: str
+    policy_input_digest: str
+    recommendation_id: str
+    sequence: int
+    phase: Literal["recon", "hypothesis", "validation"]
+    coverage_basis_points: int
+    resolved_hypotheses: int
+    reproduced_findings: int
+    artifact_ids: tuple[str, ...]
+    epoch_novel_progress: int
+    cumulative_novel_progress: int
+    retry_count: int
+    no_progress_count: int
+    elapsed_wall_seconds: int
+    next_checkpoint_expected_wall_seconds: int | None = None
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.campaign_id, "campaign_id"), (self.epoch_id, "epoch_id"),
+            (self.checkpoint_id, "checkpoint_id"),
+            (self.recommendation_id, "recommendation_id"),
+        ):
+            _identifier(value, label)
+        if _DIGEST.fullmatch(self.policy_input_digest) is None:
+            raise CampaignPersistenceError("policy_input_digest must be a SHA-256 digest")
+        if self.phase not in {"recon", "hypothesis", "validation"}:
+            raise CampaignPersistenceError("health phase is invalid")
+        bounded = (
+            (self.sequence, "sequence", 1, 2**63 - 1),
+            (self.coverage_basis_points, "coverage", 0, 10_000),
+            (self.resolved_hypotheses, "resolved hypotheses", 0, 2**63 - 1),
+            (self.reproduced_findings, "reproduced findings", 0, 2**63 - 1),
+            (self.epoch_novel_progress, "epoch novel progress", 0, 2**63 - 1),
+            (self.cumulative_novel_progress, "cumulative novel progress", 0, 2**63 - 1),
+            (self.retry_count, "retry count", 0, 2**63 - 1),
+            (self.no_progress_count, "no-progress count", 0, 2**63 - 1),
+            (self.elapsed_wall_seconds, "elapsed observation", 0, 2**63 - 1),
+        )
+        for value, label, minimum, maximum in bounded:
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise CampaignPersistenceError(f"{label} is outside its bounded range")
+        artifacts = tuple(sorted(_identifier(item, "artifact_id") for item in self.artifact_ids))
+        if len(artifacts) > MAX_HEALTH_ARTIFACTS or len(set(artifacts)) != len(artifacts):
+            raise CampaignPersistenceError("health artifact identities are duplicate or unbounded")
+        object.__setattr__(self, "artifact_ids", artifacts)
+        expected = self.next_checkpoint_expected_wall_seconds
+        if expected is not None and (type(expected) is not int
+                                     or not self.elapsed_wall_seconds <= expected <= 2**63 - 1):
+            raise CampaignPersistenceError("next checkpoint expectation precedes elapsed work")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "artifactIds": list(self.artifact_ids), "campaignId": self.campaign_id,
+            "checkpointId": self.checkpoint_id,
+            "coverageBasisPoints": self.coverage_basis_points,
+            "cumulativeNovelProgress": self.cumulative_novel_progress,
+            "elapsedWallSeconds": self.elapsed_wall_seconds, "epochId": self.epoch_id,
+            "epochNovelProgress": self.epoch_novel_progress,
+            "nextCheckpointExpectedWallSeconds": self.next_checkpoint_expected_wall_seconds,
+            "noProgressCount": self.no_progress_count, "phase": self.phase,
+            "policyInputDigest": self.policy_input_digest,
+            "recommendationId": self.recommendation_id,
+            "reproducedFindings": self.reproduced_findings,
+            "resolvedHypotheses": self.resolved_hypotheses,
+            "retryCount": self.retry_count, "schemaVersion": 1,
+            "sequence": self.sequence,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "CampaignHealthRollup":
+        if not isinstance(raw, dict) or set(raw) != {
+            "artifactIds", "campaignId", "checkpointId", "coverageBasisPoints",
+            "cumulativeNovelProgress", "elapsedWallSeconds", "epochId",
+            "epochNovelProgress", "nextCheckpointExpectedWallSeconds", "noProgressCount",
+            "phase", "policyInputDigest", "recommendationId", "reproducedFindings",
+            "resolvedHypotheses", "retryCount", "schemaVersion", "sequence",
+        } or raw.get("schemaVersion") != 1:
+            raise CampaignPersistenceError("health rollup has an invalid schema")
+        return cls(
+            raw["campaignId"], raw["epochId"], raw["checkpointId"],
+            raw["policyInputDigest"], raw["recommendationId"], raw["sequence"],
+            raw["phase"], raw["coverageBasisPoints"], raw["resolvedHypotheses"],
+            raw["reproducedFindings"], tuple(raw["artifactIds"]),
+            raw["epochNovelProgress"], raw["cumulativeNovelProgress"],
+            raw["retryCount"], raw["noProgressCount"], raw["elapsedWallSeconds"],
+            raw["nextCheckpointExpectedWallSeconds"],
+        )
+
+
+@dataclass(frozen=True)
+class CampaignHealthProjection:
+    current: CampaignHealthRollup | None
+    previous: CampaignHealthRollup | None
+    total_observations: int
+    history: tuple[CampaignHealthRollup, ...] = ()
+    degraded: bool = False
+    problem_codes: tuple[str, ...] = ()
+
+
+def _validate_health_content(rollup: CampaignHealthRollup,
+                             policy_input: dict[str, object],
+                             recommendation: dict[str, object],
+                             prior: CampaignHealthRollup | None) -> None:
+    """Derive every rollup-only fact from the exact staged envelopes."""
+    body = dict(recommendation)
+    recommendation_id = body.pop("recommendationId", None)
+    totals = policy_input.get("totals")
+    attempts = policy_input.get("attempts")
+    novel = recommendation.get("novelProgress")
+    epoch_result = policy_input.get("epochResult")
+    expected = policy_input.get("nextCheckpointExpectedWallSeconds")
+    if not isinstance(totals, dict) or not isinstance(attempts, list) \
+            or not isinstance(novel, list) or recommendation_id != rollup.recommendation_id \
+            or recommendation_id != "policy-" + _digest(_json(body)) \
+            or _digest(_json(policy_input)) != rollup.policy_input_digest \
+            or policy_input.get("campaignId") != rollup.campaign_id \
+            or policy_input.get("epochId") != rollup.epoch_id \
+            or policy_input.get("checkpointId") != rollup.checkpoint_id \
+            or policy_input.get("phase") != rollup.phase:
+        raise CampaignPersistenceError("health content authority is invalid")
+    if expected is not None and (
+        recommendation.get("action") not in {"continue", "reprioritize"}
+        or not isinstance(epoch_result, dict) or not epoch_result.get("nextActionIds")
+    ):
+        raise CampaignPersistenceError("next checkpoint expectation lacks scheduled work")
+    try:
+        equivalence = [item["equivalenceDigest"] for item in attempts]
+        outcomes = [item["outcome"] for item in attempts]
+    except (KeyError, TypeError) as exc:
+        raise CampaignPersistenceError("health attempt facts are invalid") from exc
+    epoch_retries = len(equivalence) - len(set(equivalence))
+    epoch_no_progress = sum(item != "productive" for item in outcomes) if not novel else 0
+    if (rollup.coverage_basis_points != totals.get("coverageBasisPoints")
+            or rollup.resolved_hypotheses != totals.get("resolvedHypotheses")
+            or rollup.reproduced_findings != totals.get("reproducedFindings")
+            or list(rollup.artifact_ids) != totals.get("artifactIds")
+            or rollup.epoch_novel_progress != len(novel)
+            or rollup.cumulative_novel_progress
+            != (0 if prior is None else prior.cumulative_novel_progress) + len(novel)
+            or rollup.retry_count != epoch_retries
+            or rollup.no_progress_count != epoch_no_progress
+            or rollup.next_checkpoint_expected_wall_seconds != expected):
+        raise CampaignPersistenceError("health rollup contradicts canonical policy facts")
+    if prior is not None and (
+        rollup.coverage_basis_points < prior.coverage_basis_points
+        or rollup.resolved_hypotheses < prior.resolved_hypotheses
+        or rollup.reproduced_findings < prior.reproduced_findings
+        or not set(prior.artifact_ids).issubset(rollup.artifact_ids)
+        or rollup.cumulative_novel_progress < prior.cumulative_novel_progress
+        or rollup.elapsed_wall_seconds < prior.elapsed_wall_seconds
+    ):
+        raise CampaignPersistenceError("canonical campaign health regressed")
 
 
 SCHEMA = """
@@ -133,6 +317,18 @@ create table if not exists factory_campaign_decisions (
     created_at text not null,
     primary key (campaign_id, request_id),
     unique (campaign_id, operation_id)
+);
+create table if not exists factory_campaign_health (
+    campaign_id text not null,
+    sequence integer not null,
+    epoch_id text not null,
+    checkpoint_id text not null,
+    recommendation_id text not null,
+    rollup_json text not null,
+    primary key (campaign_id, sequence),
+    unique (campaign_id, epoch_id),
+    unique (campaign_id, checkpoint_id),
+    unique (campaign_id, recommendation_id)
 );
 """
 
@@ -439,6 +635,161 @@ class CampaignPersistence:
             self._fault(failure_injector, "checkpoint-projected")
         return self.campaign(checkpoint.campaign_id)
 
+    def record_health_rollup(self, rollup: CampaignHealthRollup, *, policy_input_json: str,
+                             recommendation_json: str,
+                             operation_id: str,
+                             failure_injector: FailureInjector | None = None
+                             ) -> CampaignHealthProjection:
+        """Commit one staged health observation to history and its bounded read model."""
+        operation_id = _operation(operation_id)
+        if type(policy_input_json) is not str \
+                or len(policy_input_json.encode("utf-8")) > MAX_POLICY_INPUT_BYTES:
+            raise CampaignPersistenceError("policy input envelope is absent or unbounded")
+        try:
+            envelope = json.loads(policy_input_json)
+        except json.JSONDecodeError as exc:
+            raise CampaignPersistenceError("policy input envelope is not canonical JSON") from exc
+        if _json(envelope) != policy_input_json \
+                or _digest(policy_input_json) != rollup.policy_input_digest:
+            raise CampaignPersistenceError("policy input envelope contradicts its digest")
+        if not isinstance(envelope, dict) \
+                or envelope.get("campaignId") != rollup.campaign_id \
+                or envelope.get("epochId") != rollup.epoch_id \
+                or envelope.get("checkpointId") != rollup.checkpoint_id \
+                or envelope.get("phase") != rollup.phase:
+            raise CampaignPersistenceError("policy input envelope crosses health authority")
+        try:
+            recommendation = json.loads(recommendation_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise CampaignPersistenceError("recommendation envelope is invalid") from exc
+        if not isinstance(recommendation, dict) or _json(recommendation) != recommendation_json:
+            raise CampaignPersistenceError("recommendation envelope is not canonical JSON")
+        recommendation_body = dict(recommendation)
+        recommendation_id = recommendation_body.pop("recommendationId", None)
+        if recommendation_id != rollup.recommendation_id \
+                or recommendation_id != "policy-" + _digest(_json(recommendation_body)):
+            raise CampaignPersistenceError("health recommendation identity is invalid")
+        totals = envelope.get("totals")
+        attempts = envelope.get("attempts")
+        novel = recommendation.get("novelProgress")
+        if not isinstance(totals, dict) or not isinstance(attempts, list) \
+                or not isinstance(novel, list):
+            raise CampaignPersistenceError("health source envelopes omit canonical facts")
+        epoch_result = envelope.get("epochResult")
+        expected = envelope.get("nextCheckpointExpectedWallSeconds")
+        if expected is not None and (
+            recommendation.get("action") not in {"continue", "reprioritize"}
+            or not isinstance(epoch_result, dict) or not epoch_result.get("nextActionIds")
+        ):
+            raise CampaignPersistenceError(
+                "next checkpoint expectation lacks scheduled recommendation work"
+            )
+        if (rollup.coverage_basis_points != totals.get("coverageBasisPoints")
+                or rollup.resolved_hypotheses != totals.get("resolvedHypotheses")
+                or rollup.reproduced_findings != totals.get("reproducedFindings")
+                or list(rollup.artifact_ids) != totals.get("artifactIds")
+                or rollup.epoch_novel_progress != len(novel)
+                or rollup.next_checkpoint_expected_wall_seconds
+                != envelope.get("nextCheckpointExpectedWallSeconds")):
+            raise CampaignPersistenceError("health rollup contradicts canonical policy facts")
+        try:
+            equivalence = [item["equivalenceDigest"] for item in attempts]
+            outcomes = [item["outcome"] for item in attempts]
+        except (KeyError, TypeError) as exc:
+            raise CampaignPersistenceError("health attempt facts are invalid") from exc
+        epoch_retries = len(equivalence) - len(set(equivalence))
+        epoch_no_progress = sum(item != "productive" for item in outcomes) if not novel else 0
+        payload = _json({"policyInput": envelope, "recommendation": recommendation,
+                         "rollup": rollup.to_dict()})
+        with self.conn:
+            if self._existing_operation(rollup.campaign_id, operation_id,
+                                        "campaign.health-recorded", payload):
+                return self.health(rollup.campaign_id)
+            campaign_row = self._campaign_row(rollup.campaign_id)
+            campaign = CampaignContract.from_dict(json.loads(campaign_row["contract_json"]))
+            if envelope.get("campaignDigest") != campaign.digest:
+                raise CampaignPersistenceError("health input does not bind campaign content")
+            epoch = self._epoch_row(rollup.campaign_id, rollup.epoch_id)
+            checkpoint = self.conn.execute(
+                "select checkpoint_json from factory_campaign_checkpoints "
+                "where campaign_id=? and epoch_id=? and checkpoint_id=?",
+                (rollup.campaign_id, rollup.epoch_id, rollup.checkpoint_id),
+            ).fetchone()
+            if epoch is None or checkpoint is None:
+                raise CampaignPersistenceError("health rollup references a dangling epoch checkpoint")
+            canonical_checkpoint = CampaignCheckpoint.from_dict(json.loads(checkpoint[0]))
+            if rollup.sequence != canonical_checkpoint.sequence \
+                    or rollup.elapsed_wall_seconds != canonical_checkpoint.cumulative_usage.wall_seconds:
+                raise CampaignPersistenceError("health rollup contradicts its checkpoint")
+            if rollup.next_checkpoint_expected_wall_seconds is not None \
+                    and rollup.next_checkpoint_expected_wall_seconds \
+                    > campaign.cumulative_budget.wall_seconds.value:
+                raise CampaignPersistenceError("next checkpoint expectation exceeds wall authority")
+            prior_row = self.conn.execute(
+                "select rollup_json from factory_campaign_health where campaign_id=? "
+                "order by sequence desc limit 1", (rollup.campaign_id,),
+            ).fetchone()
+            prior = None if prior_row is None else CampaignHealthRollup.from_dict(
+                json.loads(prior_row[0])
+            )
+            _validate_health_content(rollup, envelope, recommendation, prior)
+            if prior is not None and rollup.sequence != prior.sequence + 1:
+                raise CampaignPersistenceError("health sequence is stale or discontinuous")
+            if prior is not None and (
+                rollup.coverage_basis_points < prior.coverage_basis_points
+                or rollup.resolved_hypotheses < prior.resolved_hypotheses
+                or rollup.reproduced_findings < prior.reproduced_findings
+                or not set(prior.artifact_ids).issubset(rollup.artifact_ids)
+                or rollup.cumulative_novel_progress < prior.cumulative_novel_progress
+                or rollup.elapsed_wall_seconds < prior.elapsed_wall_seconds
+            ):
+                raise CampaignPersistenceError("canonical campaign health regressed")
+            if rollup.cumulative_novel_progress \
+                    != (0 if prior is None else prior.cumulative_novel_progress) + len(novel) \
+                    or rollup.retry_count != epoch_retries \
+                    or rollup.no_progress_count != epoch_no_progress:
+                raise CampaignPersistenceError("health cumulative counters are not canonical")
+            self._append_event(rollup.campaign_id, operation_id,
+                               "campaign.health-recorded", payload)
+            self._fault(failure_injector, "event-appended")
+            self.conn.execute(
+                "insert into factory_campaign_health "
+                "(campaign_id,sequence,epoch_id,checkpoint_id,recommendation_id,rollup_json) "
+                "values (?,?,?,?,?,?)",
+                (rollup.campaign_id, rollup.sequence, rollup.epoch_id, rollup.checkpoint_id,
+                 rollup.recommendation_id, _json(rollup.to_dict())),
+            )
+            self.conn.execute(
+                "delete from factory_campaign_health where campaign_id=? and sequence <= ?",
+                (rollup.campaign_id, rollup.sequence - MAX_HEALTH_HISTORY),
+            )
+            self._fault(failure_injector, "health-projected")
+        return self.health(rollup.campaign_id)
+
+    def health(self, campaign_id: str, *, history_limit: int = 2
+               ) -> CampaignHealthProjection:
+        """Return a bounded projection; canonical policy envelopes remain private."""
+        _identifier(campaign_id, "campaign_id")
+        if type(history_limit) is not int or not 1 <= history_limit <= MAX_HEALTH_HISTORY:
+            raise CampaignPersistenceError("health history limit must be between 1 and 32")
+        rows = self.conn.execute(
+            "select rollup_json from factory_campaign_health where campaign_id=? "
+            "order by sequence desc limit ?", (campaign_id, history_limit),
+        ).fetchall()
+        try:
+            values = tuple(CampaignHealthRollup.from_dict(json.loads(row[0])) for row in rows)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return CampaignHealthProjection(
+                None, None, 0, (), True, ("health-projection-invalid",),
+            )
+        current = values[0] if values else None
+        previous = values[1] if len(values) > 1 else None
+        total = self.conn.execute(
+            "select count(*) from factory_campaign_events where campaign_id=? "
+            "and kind='campaign.health-recorded'", (campaign_id,),
+        ).fetchone()[0]
+        return CampaignHealthProjection(current, previous, total, values)
+
     def record_operator_decision(self, campaign_id: str,
                                  request: CampaignChangeRequest, *, approved: bool,
                                  decided_by: str, operation_id: str,
@@ -603,6 +954,9 @@ class CampaignPersistence:
         leased_epochs: dict[str, tuple[str, str]] = {}
         recovery_epochs: set[str] = set()
         checkpoint_ids: set[str] = set()
+        checkpoint_values: dict[str, CampaignCheckpoint] = {}
+        health_rollups: list[CampaignHealthRollup] = []
+        campaign_contract: CampaignContract | None = None
         operations: set[str] = set()
         for expected, row in enumerate(rows, 1):
             if row["campaign_seq"] != expected:
@@ -626,7 +980,7 @@ class CampaignPersistence:
                 if kind == "campaign.created":
                     if revision:
                         raise CampaignPersistenceError("duplicate campaign creation")
-                    CampaignContract.from_dict(payload["contract"])
+                    campaign_contract = CampaignContract.from_dict(payload["contract"])
                     status, revision = "requested", 1
                 elif kind == "campaign.transitioned":
                     validate_campaign_transition(status, payload["status"],
@@ -652,6 +1006,7 @@ class CampaignPersistence:
                     if checkpoint.sequence != len(checkpoint_ids) + 1:
                         raise CampaignPersistenceError("non-contiguous checkpoint sequence")
                     checkpoint_ids.add(checkpoint.checkpoint_id)
+                    checkpoint_values[checkpoint.checkpoint_id] = checkpoint
                     latest_checkpoint, usage = checkpoint.checkpoint_id, checkpoint.cumulative_usage
                     revision += 1
                     leased_epochs.pop(checkpoint.epoch_id, None)
@@ -680,6 +1035,81 @@ class CampaignPersistence:
                         )
                     recovery_epochs.remove(epoch_id)
                     status, revision = "running", revision + 1
+                elif kind == "campaign.health-recorded":
+                    if set(payload) != {"policyInput", "recommendation", "rollup"}:
+                        raise CampaignPersistenceError("health event schema is invalid")
+                    health = CampaignHealthRollup.from_dict(payload["rollup"])
+                    policy_input = payload["policyInput"]
+                    recommendation = payload["recommendation"]
+                    if not isinstance(policy_input, dict) or not isinstance(recommendation, dict):
+                        raise CampaignPersistenceError("health envelopes are invalid")
+                    body = dict(recommendation)
+                    recommendation_id = body.pop("recommendationId", None)
+                    checkpoint = checkpoint_values.get(health.checkpoint_id)
+                    totals = policy_input.get("totals")
+                    attempts = policy_input.get("attempts")
+                    novel = recommendation.get("novelProgress")
+                    epoch_result = policy_input.get("epochResult")
+                    expected_checkpoint = policy_input.get(
+                        "nextCheckpointExpectedWallSeconds"
+                    )
+                    if campaign_contract is None or checkpoint is None \
+                            or policy_input.get("campaignId") != campaign_id \
+                            or policy_input.get("campaignDigest") != campaign_contract.digest \
+                            or policy_input.get("epochId") != health.epoch_id \
+                            or policy_input.get("checkpointId") != health.checkpoint_id \
+                            or policy_input.get("phase") != health.phase \
+                            or _digest(_json(policy_input)) != health.policy_input_digest \
+                            or recommendation_id != health.recommendation_id \
+                            or recommendation_id != "policy-" + _digest(_json(body)) \
+                            or not isinstance(totals, dict) \
+                            or not isinstance(attempts, list) or not isinstance(novel, list):
+                        raise CampaignPersistenceError("health content authority is invalid")
+                    if expected_checkpoint is not None and (
+                        recommendation.get("action") not in {"continue", "reprioritize"}
+                        or not isinstance(epoch_result, dict)
+                        or not epoch_result.get("nextActionIds")
+                    ):
+                        raise CampaignPersistenceError(
+                            "health checkpoint expectation has no scheduled work"
+                        )
+                    equivalence = [item["equivalenceDigest"] for item in attempts]
+                    outcomes = [item["outcome"] for item in attempts]
+                    prior_health = health_rollups[-1] if health_rollups else None
+                    epoch_retries = len(equivalence) - len(set(equivalence))
+                    epoch_no_progress = sum(item != "productive" for item in outcomes) \
+                        if not novel else 0
+                    _validate_health_content(
+                        health, policy_input, recommendation, prior_health,
+                    )
+                    if (prior_health is not None
+                            and health.sequence != prior_health.sequence + 1) \
+                            or health.sequence != checkpoint.sequence \
+                            or health.elapsed_wall_seconds \
+                            != checkpoint.cumulative_usage.wall_seconds \
+                            or health.coverage_basis_points \
+                            != totals.get("coverageBasisPoints") \
+                            or health.resolved_hypotheses != totals.get("resolvedHypotheses") \
+                            or health.reproduced_findings != totals.get("reproducedFindings") \
+                            or list(health.artifact_ids) != totals.get("artifactIds") \
+                            or health.epoch_novel_progress != len(novel) \
+                            or health.cumulative_novel_progress \
+                            != (0 if prior_health is None else
+                                prior_health.cumulative_novel_progress) + len(novel) \
+                            or health.retry_count != epoch_retries \
+                            or health.no_progress_count != epoch_no_progress \
+                            or health.next_checkpoint_expected_wall_seconds \
+                            != policy_input.get("nextCheckpointExpectedWallSeconds"):
+                        raise CampaignPersistenceError("health facts are not canonical")
+                    if prior_health is not None and (
+                        health.coverage_basis_points < prior_health.coverage_basis_points
+                        or health.resolved_hypotheses < prior_health.resolved_hypotheses
+                        or health.reproduced_findings < prior_health.reproduced_findings
+                        or not set(prior_health.artifact_ids).issubset(health.artifact_ids)
+                        or health.elapsed_wall_seconds < prior_health.elapsed_wall_seconds
+                    ):
+                        raise CampaignPersistenceError("health history regressed")
+                    health_rollups.append(health)
                 elif kind not in {"operator.decided", "campaign.recovered"}:
                     raise CampaignPersistenceError(f"unknown event kind {kind}")
             except (KeyError, TypeError, ValueError) as exc:
@@ -698,6 +1128,14 @@ class CampaignPersistence:
             matches = comparable == replayable and not problems
             if comparable != replayable:
                 problems.append("live projection differs from canonical replay")
+            live_health = self.health(campaign_id)
+            replay_current = health_rollups[-1] if health_rollups else None
+            replay_previous = health_rollups[-2] if len(health_rollups) > 1 else None
+            if live_health.degraded or live_health.current != replay_current \
+                    or live_health.previous != replay_previous \
+                    or live_health.total_observations != len(health_rollups):
+                problems.append("health projection differs from canonical replay")
+                matches = False
         except (ValueError, json.JSONDecodeError) as exc:
             matches = False
             problems.append(f"live projection is invalid: {exc}")
