@@ -64,7 +64,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false};
+const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -84,6 +84,63 @@ function toast(message, error = false) {
   element.className = `toast show${error ? " error" : ""}`;
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => { element.className = "toast"; }, 3200);
+}
+
+function dismissAttention({restoreFocus = true} = {}) {
+  const element = $("operatorAttention");
+  cancelAnimationFrame(showAttention.frame);
+  clearTimeout(showAttention.announcementTimer);
+  $("operatorAttentionAnnouncer").textContent = "";
+  element.classList.remove("show");
+  element.hidden = true;
+  const previous = state.attentionReturnFocus;
+  state.attentionReturnFocus = null;
+  if (restoreFocus) {
+    const activeView = document.querySelector(".view.active");
+    const heading = activeView?.querySelector("h1, h2");
+    if (heading && !heading.hasAttribute("tabindex")) heading.tabIndex = -1;
+    MissionAttention.restoreFocus(
+      previous, document, [heading, document.querySelector(".nav.active")],
+    );
+  }
+}
+
+function showAttention(runCount, questionCount) {
+  const element = $("operatorAttention");
+  if (element.hidden) {
+    const active = document.activeElement;
+    state.attentionReturnFocus = active && active !== document.body ? active : null;
+  }
+  const message = MissionAttention.messageFor(runCount, questionCount);
+  $("operatorAttentionTitle").textContent = runCount === 1 ? "Operator attention required" : "Multiple investigations need attention";
+  $("operatorAttentionMessage").textContent = message;
+  element.hidden = false;
+  element.classList.remove("show");
+  cancelAnimationFrame(showAttention.frame);
+  clearTimeout(showAttention.announcementTimer);
+  $("operatorAttentionAnnouncer").textContent = "";
+  showAttention.frame = requestAnimationFrame(() => {
+    element.classList.add("show");
+    showAttention.announcementTimer = setTimeout(() => {
+      $("operatorAttentionAnnouncer").textContent = message;
+    }, 40);
+  });
+}
+
+async function announceAttention(transitions) {
+  const claimed = [];
+  for (const run of transitions) {
+    try {
+      const snapshot = await api(`/api/runs/${encodeURIComponent(run.runId)}`);
+      const questionCount = MissionAttention.claimQuestionState(
+        state.attention, run.runId, snapshot.pendingQuestions || [],
+      );
+      if (questionCount) claimed.push(questionCount);
+    } catch (_error) {
+      state.attention.rearm(run.runId);
+    }
+  }
+  if (claimed.length) showAttention(claimed.length, claimed.reduce((total, count) => total + count, 0));
 }
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -128,10 +185,25 @@ async function restartService() {
 }
 
 function show(name) {
+  const generation = ++state.viewGeneration;
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === `view-${name}`));
   document.querySelectorAll(".nav").forEach(nav => nav.classList.toggle("active", nav.dataset.view === name));
   $("crumb").textContent = name.replaceAll("-", " ").toUpperCase();
-  if (name === "inbox") loadInbox();
+  return {generation, ready: name === "inbox" ? loadInbox() : Promise.resolve()};
+}
+
+function focusInbox() {
+  MissionAttention.focusInbox($("inbox"), $("inboxHeading"));
+}
+
+function openAttentionInbox() {
+  dismissAttention({restoreFocus: false});
+  const navigation = show("inbox");
+  navigation.ready.then(() => {
+    if (MissionAttention.shouldFocusInbox(
+      navigation.generation, state.viewGeneration, $("view-inbox"),
+    )) focusInbox();
+  });
 }
 
 function activate(element) {
@@ -139,6 +211,8 @@ function activate(element) {
   if (restart) { restartService(); return true; }
   const view = element.closest("[data-view]");
   if (view) { show(view.dataset.view); return true; }
+  if (element.closest("[data-attention-open]")) { openAttentionInbox(); return true; }
+  if (element.closest("[data-attention-dismiss], [data-attention-later]")) { dismissAttention(); return true; }
   const memoryToggle = element.closest("[data-memory-toggle]");
   if (memoryToggle) {
     const body = document.getElementById(memoryToggle.getAttribute("aria-controls"));
@@ -188,6 +262,7 @@ function activate(element) {
 
 document.addEventListener("click", event => activate(event.target));
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !$("operatorAttention").hidden) { event.preventDefault(); dismissAttention(); }
   if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-run]")) {
     event.preventDefault();
     activate(event.target);
@@ -266,7 +341,13 @@ function renderFleet() {
 }
 
 async function refreshFleet() {
-  try { state.fleet = (await api("/api/fleet")).runs; renderFleet(); }
+  try {
+    const runs = (await api("/api/fleet")).runs;
+    const transitions = state.attention.transitions(runs);
+    state.fleet = runs;
+    renderFleet();
+    if (transitions.length) await announceAttention(transitions);
+  }
   catch (error) { $("healthText").textContent = "API unavailable"; toast(error.message, true); }
 }
 
