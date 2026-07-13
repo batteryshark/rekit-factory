@@ -23,11 +23,18 @@ only for ontology-backed relationships: run/worker/work-item to Activity, proof 
 published finding to Dossiers, and operator decision to Decisions. No report, artifact, or
 evidence link is guessed.
 
-`semanticSha256` is recomputed in the browser over the public canonical domain. Verified
-watermark-only updates retain the existing DOM and focus; a new verified semantic identity
-renders once. Missing identities remain compatible with older snapshots, while mismatch or
-unavailable Web Crypto produces a bounded warning. Late asynchronous verification cannot
-replace a newer projection.
+`semanticCanonicalBase64` carries the exact Python-canonical semantic envelope bytes. The
+browser validates and decodes that envelope, renders its semantic projection rather than
+unbound outer fields, and hashes those authoritative bytes for `semanticSha256` verification.
+This avoids silently substituting JavaScript number formatting or key ordering for the public
+identity domain. Outer source watermarks remain observational only.
+
+Verified watermark-only updates retain the existing DOM and focus; a new verified semantic
+identity renders once. Older snapshots without the byte envelope are explicitly legacy and
+never claim exact verification. Legacy and Web-Crypto-unavailable modes use deterministic
+local text or canonical-Base64 equality only to preserve DOM state, while continuing to show
+their bounded warning. Run-open and SSE request generations prevent late network or hash
+responses from replacing a newer run snapshot.
 
 ## Rendered audit still required
 

@@ -64,7 +64,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
+const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -290,7 +290,7 @@ document.addEventListener("keydown", event => {
     else index = (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
     event.preventDefault(); tabs[index].focus(); activate(tabs[index]);
   }
-  if (event.key === "/" && $("tab-outcomes").classList.contains("active") && !event.target.matches("input, textarea, select")) {
+  if (event.key === "/" && $("view-detail").classList.contains("active") && $("tab-outcomes").classList.contains("active") && !event.target.matches("input, textarea, select")) {
     event.preventDefault(); $("outcomeSearch").focus();
   }
 });
@@ -411,6 +411,8 @@ async function resolveDecision(runId, questionId, answer) {
 }
 
 async function openRun(runId) {
+  const requestGeneration = state.runRequests.begin();
+  state.snapshotRefreshes.invalidate();
   try {
     state.outcomes.tracker.reset();
     state.outcomes.projection = null;
@@ -423,12 +425,17 @@ async function openRun(runId) {
       api(`/api/runs/${encodeURIComponent(runId)}/evidence`),
       api(`/api/runs/${encodeURIComponent(runId)}/dossiers`),
     ]);
+    if (!state.runRequests.isCurrent(requestGeneration) || state.selected !== runId) return;
     snapshot.workerReports = reportPayload.reports;
     snapshot.dossiers = dossierPayload.dossiers;
     state.snapshot = snapshot; state.evidence = evidence.records || [];
     renderDetail(); show("detail"); connectEvents(runId);
   }
-  catch (error) { toast(error.message, true); }
+  catch (error) {
+    if (state.runRequests.isCurrent(requestGeneration) && state.selected === runId) {
+      toast(error.message, true);
+    }
+  }
 }
 
 async function updateEvidence(artifactId, action) {
@@ -654,6 +661,7 @@ function renderOutcomeProjection() {
   if (state.outcomes.integrity === "missing") integrity = `<div class="outcome-alert neutral"><b>Outcome projection unavailable</b><span>This older snapshot has no canonical outcome surface.</span></div>`;
   else if (state.outcomes.integrity === "legacy") integrity = `<div class="outcome-alert warn"><b>Legacy projection</b><span>No semanticSha256 was supplied; the projection remains visible without semantic update dedupe.</span></div>`;
   else if (state.outcomes.integrity === "mismatch") integrity = `<div class="outcome-alert bad"><b>Semantic integrity mismatch</b><span>The claimed outcome identity did not match the canonical client-side digest.</span></div>`;
+  else if (state.outcomes.integrity === "invalid-envelope") integrity = `<div class="outcome-alert bad"><b>Semantic envelope rejected</b><span>The authoritative outcome bytes were malformed or used the wrong identity domain.</span></div>`;
   else if (state.outcomes.integrity === "unavailable") integrity = `<div class="outcome-alert warn"><b>Digest verification unavailable</b><span>The browser cannot verify SHA-256; canonical facets are shown with a bounded warning.</span></div>`;
   else if (projection?.degraded) integrity = `<div class="outcome-alert warn"><b>Canonical projection is degraded</b><span>${diagnostics.length} diagnostic${diagnostics.length === 1 ? "" : "s"}; unknown and dangling states are preserved without inference.</span></div>`;
   else integrity = `<div class="outcome-alert good"><b>Semantic projection verified</b><span>${esc(projection?.semanticSha256?.slice(0, 12) || "")}</span></div>`;
@@ -665,14 +673,19 @@ function renderOutcomeProjection() {
 }
 
 async function renderOutcomes(snapshot) {
+  const renderGeneration = state.outcomes.renders.begin();
   $("outcomeResults").setAttribute("aria-busy", "true");
-  const decision = await state.outcomes.tracker.accept(snapshot?.outcomeProjection);
-  if (decision.action === "stale") return;
-  $("outcomeResults").setAttribute("aria-busy", "false");
-  if (decision.action === "retain") return;
-  state.outcomes.projection = decision.projection;
-  state.outcomes.integrity = decision.integrity;
-  renderOutcomeProjection();
+  try {
+    const decision = await state.outcomes.tracker.accept(snapshot?.outcomeProjection);
+    if (decision.action === "stale" || decision.action === "retain") return;
+    state.outcomes.projection = decision.projection;
+    state.outcomes.integrity = decision.integrity;
+    renderOutcomeProjection();
+  } finally {
+    if (state.outcomes.renders.isCurrent(renderGeneration)) {
+      $("outcomeResults").setAttribute("aria-busy", "false");
+    }
+  }
 }
 
 function renderDetail() {
@@ -703,8 +716,30 @@ function renderDetail() {
 
 function connectEvents(runId) {
   if (state.stream) state.stream.close();
+  state.snapshotRefreshes.invalidate();
   state.stream = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
-  state.stream.onmessage = async () => { if (state.selected === runId) { const [snapshot, reportPayload, evidence, dossierPayload] = await Promise.all([api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/reports`), api(`/api/runs/${encodeURIComponent(runId)}/evidence`), api(`/api/runs/${encodeURIComponent(runId)}/dossiers`)]); snapshot.workerReports = reportPayload.reports; snapshot.dossiers = dossierPayload.dossiers; state.snapshot = snapshot; state.evidence = evidence.records || []; renderDetail(); } refreshFleet(); };
+  state.stream.onmessage = async () => {
+    const refreshGeneration = state.snapshotRefreshes.begin();
+    if (state.selected !== runId) return;
+    try {
+      const [snapshot, reportPayload, evidence, dossierPayload] = await Promise.all([
+        api(`/api/runs/${encodeURIComponent(runId)}`),
+        api(`/api/runs/${encodeURIComponent(runId)}/reports`),
+        api(`/api/runs/${encodeURIComponent(runId)}/evidence`),
+        api(`/api/runs/${encodeURIComponent(runId)}/dossiers`),
+      ]);
+      if (!state.snapshotRefreshes.isCurrent(refreshGeneration) || state.selected !== runId) return;
+      snapshot.workerReports = reportPayload.reports;
+      snapshot.dossiers = dossierPayload.dossiers;
+      state.snapshot = snapshot;
+      state.evidence = evidence.records || [];
+      renderDetail();
+    } catch (error) {
+      if (state.snapshotRefreshes.isCurrent(refreshGeneration) && state.selected === runId) {
+        toast(error.message, true);
+      }
+    } finally { refreshFleet(); }
+  };
   state.stream.addEventListener("heartbeat", () => refreshFleet());
   state.stream.onerror = () => { state.stream.close(); setTimeout(() => state.selected === runId && connectEvents(runId), 1500); };
 }

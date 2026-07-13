@@ -43,6 +43,15 @@ def test_outcomes_surface_is_packaged_first_class_and_projection_only():
     assert "MissionOutcomes.canonicalLink(entity)" in outcome_slice
     assert "renderOutcomeProjection" in script
     assert "state.outcomes.tracker.accept" in script
+    assert "semanticCanonicalBase64" in helper
+    assert "decodeSemanticEnvelope" in helper
+    assert "actual = await digest(prepared.bytes)" in helper
+    assert 'aria-label="Search outcomes"' in page
+    assert '$("view-detail").classList.contains("active")' in script
+    assert "state.runRequests.isCurrent(requestGeneration)" in script
+    assert "state.snapshotRefreshes.isCurrent(refreshGeneration)" in script
+    assert "state.outcomes.renders.isCurrent(renderGeneration)" in script
+    assert 'setAttribute("aria-busy", "false")' in script
     assert "outcome-rise" in style
     assert "outcome-orbit" in style
     assert "prefers-reduced-motion:reduce" in style
