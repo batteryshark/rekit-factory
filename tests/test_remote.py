@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from rekit_factory.rekit_client import ToolManifest, ToolResult
+from rekit_factory.scope import ActionAuthority
 from rekit_factory.remote import (
     ArtifactRecord,
     InvocationRequest,
@@ -29,6 +30,8 @@ class FakeRekit:
             safety_tier=2 if self.risky else 0,
             executes_input="full" if self.risky else "no",
             network="none",
+            actions=((ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.EXECUTE_UNTRUSTED)
+                     if self.risky else (ActionAuthority.READ_LOCAL_TARGET,)),
         )
 
     def list_tools(self) -> list[ToolManifest]:

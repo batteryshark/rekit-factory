@@ -137,6 +137,8 @@ class FakeRekit:
             safety_tier=3 if self.risky else 0,
             executes_input="full" if self.risky else "no",
             network="none",
+            actions=((ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.EXECUTE_UNTRUSTED)
+                     if self.risky else (ActionAuthority.READ_LOCAL_TARGET,)),
         )
 
     def list_tools(self):
@@ -273,6 +275,14 @@ class ControlPlaneTests(unittest.TestCase):
             ))
             suspended = asyncio.run(controller.drive(run_dir))
             qid = suspended["pendingQuestions"][0]["id"]
+            manifest = rekit.manifest("exec-observe")
+            with FactoryLedger(resolve_run_dir(run_dir).db_path) as ledger:
+                permission = ledger.conn.execute(
+                    "select manifest_digest from factory_permissions where question_id=?",
+                    (qid,),
+                ).fetchone()
+                self.assertEqual(manifest.effective_manifest_digest,
+                                 permission["manifest_digest"])
             completed = controller.answer(run_dir, qid, "allow")
 
             self.assertEqual("completed", completed["run"]["status"])
@@ -280,6 +290,12 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertTrue(rekit.calls[0][2])
             self.assertTrue(any(event["kind"] == "permission.resolved"
                                 for event in completed["events"]))
+            self.assertEqual(manifest.effective_manifest_digest,
+                             completed["toolCalls"][0]["manifest_digest"])
+            self.assertEqual(["read_local_target", "execute_untrusted"],
+                             completed["toolCalls"][0]["declaredActions"])
+            self.assertIn(manifest.effective_manifest_digest,
+                          completed["artifacts"][0]["metadata_json"])
 
     def test_terminal_failed_worker_makes_run_failed_not_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -545,6 +561,10 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertEqual("prompted", config["modelProfile"]["structuredOutputMode"])
                 self.assertIn("recon-analysis", {item["name"] for item in config["strategies"]})
                 self.assertEqual(2, len(config["tools"]))
+                for tool in config["tools"]:
+                    self.assertNotIn("path", tool)
+                    self.assertRegex(tool["authority"]["digest"], r"^[0-9a-f]{64}$")
+                    self.assertTrue(tool["authority"]["actions"])
                 launched = self._request(base + "/api/runs", {
                     "target": str(target),
                     "goal": "Exercise the API permission path",
