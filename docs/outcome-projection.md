@@ -205,6 +205,12 @@ rowid watermark. Dossier artifacts and their `dossier.published` event are thems
 in one transaction, so a response cannot expose the dossier publication without the
 same-response artifact rows (or vice versa).
 
+Crash tests abort that real transaction both during the middle of the dossier artifact loop and
+at the final publication event. Each failure leaves zero proof-dossier artifacts and zero
+publication events visible. The already sealed content-addressed directory remains unprojected;
+an exact retry reuses it, preserves every byte, and publishes five bound artifacts plus one event
+exactly once. This proof adds no production fault-injection control.
+
 Project memory is a separately fsynced JSONL source. It is replayed outside the SQLite read
 transaction, and v1 does not claim an atomic revision across those two stores. The
 `sourceWatermarks` object reports the independently observed run-scoped maximum Factory event

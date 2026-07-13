@@ -4,6 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -342,6 +343,59 @@ def test_dossier_export_is_complete_and_deterministic(tmp_path):
             "select * from artifacts where kind like 'proof-%'"
         )]) == 5
     assert (root / "dossier.zip").read_bytes() == first
+
+
+@pytest.mark.parametrize("failure_boundary", ["middle-artifact", "publication-event"])
+def test_dossier_publication_crash_rolls_back_visibility_and_retries_exactly(
+    tmp_path, failure_boundary,
+):
+    _controller, paths, dossier, _snapshot, _unrelated, rekit = _published_fixture(tmp_path)
+    root = paths.run_dir / "dossiers" / dossier["manifestSha256"]
+    sealed_bytes = {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()}
+    with FactoryLedger(paths.db_path) as ledger:
+        with ledger.conn:
+            ledger.conn.execute(
+                "delete from artifacts where run_id=? and origin='proof-dossier'",
+                (paths.run_id,),
+            )
+            ledger.conn.execute(
+                "delete from factory_events where run_id=? and kind='dossier.published'",
+                (paths.run_id,),
+            )
+        if failure_boundary == "middle-artifact":
+            ledger.conn.execute(
+                "create trigger fail_dossier_publish before insert on artifacts "
+                "when new.origin='proof-dossier' and new.kind='proof-report' "
+                "begin select raise(abort, 'injected dossier artifact failure'); end"
+            )
+        else:
+            ledger.conn.execute(
+                "create trigger fail_dossier_publish before insert on factory_events "
+                "when new.kind='dossier.published' "
+                "begin select raise(abort, 'injected dossier event failure'); end"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="injected dossier"):
+            DossierPublisher(paths, ledger, rekit).publish("f-fixture")
+        assert ledger.conn.execute(
+            "select count(*) from artifacts where run_id=? and origin='proof-dossier'",
+            (paths.run_id,),
+        ).fetchone()[0] == 0
+        assert ledger.conn.execute(
+            "select count(*) from factory_events where run_id=? and kind='dossier.published'",
+            (paths.run_id,),
+        ).fetchone()[0] == 0
+        ledger.conn.execute("drop trigger fail_dossier_publish")
+        recovered = DossierPublisher(paths, ledger, rekit).publish("f-fixture")
+        assert recovered["manifestSha256"] == dossier["manifestSha256"]
+        assert ledger.conn.execute(
+            "select count(*) from artifacts where run_id=? and origin='proof-dossier'",
+            (paths.run_id,),
+        ).fetchone()[0] == 5
+        assert ledger.conn.execute(
+            "select count(*) from factory_events where run_id=? and kind='dossier.published'",
+            (paths.run_id,),
+        ).fetchone()[0] == 1
+    assert {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()} == sealed_bytes
 
 
 def test_resealed_dossier_cannot_replace_the_published_content_identity(tmp_path):
