@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from rekit_factory.control import InvestigationController, RunRequest
+from rekit_factory.strategies import DEFAULT_STRATEGIES
 
 
 MAX_BODY = 1_000_000
@@ -111,6 +112,10 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     "modelProfiles": [backend.profile.public_dict()
                                       for backend in self.server.controller.worker_backends.values()],
                     "defaultModelProfile": self.server.controller.default_profile,
+                    "strategies": [
+                        {"name": item.name, "description": item.description}
+                        for item in DEFAULT_STRATEGIES.values()
+                    ],
                     "tools": tools,
                 })
                 return
@@ -148,6 +153,10 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     worker_roles=tuple(payload.get("workerRoles") or ("recon", "analyst")),
                     concurrency=int(payload.get("concurrency", 4)),
                     model_profile=payload.get("modelProfile"),
+                    strategy=payload.get("strategy"),
+                    retries_per_worker=int(payload.get("retriesPerWorker", 1)),
+                    cost_units=int(payload.get("costUnits", 100)),
+                    max_workers=int(payload.get("maxWorkers", 8)),
                 )
                 run_dir = self.server.controller.create(request)
                 self.server.supervisor.submit(run_dir)

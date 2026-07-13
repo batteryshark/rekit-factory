@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -32,6 +33,17 @@ from rekit_factory.models import (
 )
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.store import FactoryLedger
+from rekit_factory.strategies import (
+    DEFAULT_STRATEGIES,
+    FollowUpProposal,
+    InvestigationPlan,
+    PlannedWork,
+    RunCeilings,
+    Strategy,
+    WorkerSeed,
+    plan_investigation,
+    propose_follow_up,
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +55,10 @@ class RunRequest:
     worker_roles: tuple[str, ...] = ("recon", "analyst")
     concurrency: int = 4
     model_profile: str | None = None
+    strategy: str | None = None
+    retries_per_worker: int = 1
+    cost_units: int = 100
+    max_workers: int = 8
 
     def validate(self) -> "RunRequest":
         target = self.target.expanduser().resolve()
@@ -52,8 +68,14 @@ class RunRequest:
             raise ValueError("goal must not be empty")
         if not self.worker_roles:
             raise ValueError("at least one worker role is required")
-        if self.concurrency < 1:
-            raise ValueError("concurrency must be at least 1")
+        ceilings = RunCeilings(
+            concurrency=self.concurrency,
+            retries_per_worker=self.retries_per_worker,
+            cost_units=self.cost_units,
+            max_workers=self.max_workers,
+        )
+        if self.strategy is not None and self.strategy not in DEFAULT_STRATEGIES:
+            raise ValueError(f"unknown worker strategy {self.strategy!r}")
         return RunRequest(
             target=target,
             goal=self.goal.strip(),
@@ -62,6 +84,10 @@ class RunRequest:
             worker_roles=tuple(dict.fromkeys(self.worker_roles)),
             concurrency=self.concurrency,
             model_profile=self.model_profile,
+            strategy=self.strategy,
+            retries_per_worker=ceilings.retries_per_worker,
+            cost_units=ceilings.cost_units,
+            max_workers=ceilings.max_workers,
         )
 
 
@@ -93,6 +119,8 @@ class InvestigationController:
         request = request.validate()
         self.storage_root.mkdir(parents=True, exist_ok=True)
         worker_backend = self.worker_backend(request.model_profile)
+        plan = _request_plan(request)
+        plan_payload = _plan_payload(plan)
         public_config = {
             "goal": request.goal,
             "tools": list(request.tools),
@@ -100,6 +128,7 @@ class InvestigationController:
             "workerRoles": list(request.worker_roles),
             "concurrency": request.concurrency,
             "modelProfile": worker_backend.profile.public_dict(),
+            "strategyPlan": plan_payload,
         }
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
@@ -118,6 +147,7 @@ class InvestigationController:
             "workerRoles": list(request.worker_roles),
             "concurrency": request.concurrency,
             "modelProfile": worker_backend.profile.public_dict(),
+            "strategyPlan": plan_payload,
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
@@ -150,21 +180,12 @@ class InvestigationController:
                     payload={"toolId": tool_id, "safetyTier": manifest.safety_tier},
                     state_label="queued",
                 ))
-            for role in request.worker_roles:
-                worker_id = ledger.add_worker(run_id, role, worker_backend.profile.name)
-                ledger.enqueue(
-                    run_id=run_id,
-                    key=stable_key("worker", role, request.goal),
-                    target=str(request.target),
-                    operation="model-worker",
-                    category="worker",
-                    title=f"{role} worker",
-                    priority=100,
-                    depends_on=tool_items,
-                    payload={"workerId": worker_id, "role": role, "goal": request.goal,
-                             "modelProfile": worker_backend.profile.name,
-                             "availableTools": list(request.model_tools)},
-                    state_label="queued",
+            item_ids: dict[str, str] = {}
+            for planned in plan.work:
+                dependencies = tool_items + [item_ids[value] for value in planned.depends_on]
+                item_ids[planned.id] = self._enqueue_planned_worker(
+                    ledger, run_id, str(request.target), worker_backend.profile.name,
+                    request.model_tools, plan, planned, dependencies,
                 )
         return paths.run_dir
 
@@ -176,7 +197,8 @@ class InvestigationController:
         paths = resolve_run_dir(run_dir)
         meta = _read_meta(paths)
         target = Path(meta["target"])
-        concurrency = int(meta.get("concurrency", 4))
+        plan = _plan_from_meta(meta)
+        concurrency = plan.ceilings.concurrency
 
         with FactoryLedger(paths.db_path) as ledger:
             ledger.requeue_stale_leases(paths.run_id)
@@ -522,8 +544,13 @@ class InvestigationController:
                 payload={"observationCount": len(report.observations),
                          "nextActionCount": len(report.next_actions)},
             )
+            self._enqueue_follow_ups(
+                ledger, ctx.state.run_id, item, payload, report.next_actions,
+                ctx.deps.paths, worker_backend.profile.name,
+            )
         except Exception as exc:
-            if item["attempts"] < 2:
+            retry_ceiling = int(payload.get("retryCeiling", 1))
+            if item["attempts"] <= retry_ceiling:
                 message = f"{type(exc).__name__}: {exc}"
                 ledger.need_evidence(
                     item["id"], note="Transient worker failure; retrying",
@@ -547,6 +574,77 @@ class InvestigationController:
                 worker_id=worker_id,
             )
             raise
+
+    def _enqueue_planned_worker(self, ledger: FactoryLedger, run_id: str, target: str,
+                                model_profile: str, model_tools: tuple[str, ...] | list[str],
+                                plan: InvestigationPlan, planned: PlannedWork,
+                                depends_on: list[str]) -> str:
+        worker_id = ledger.add_planned_worker(
+            run_id, planned.id, planned.role, model_profile
+        )
+        return ledger.enqueue(
+            run_id=run_id, key=planned.dedupe_key, target=target,
+            operation="model-worker", category="worker",
+            title=f"{planned.role} worker", priority=100,
+            depends_on=depends_on,
+            payload={
+                "workerId": worker_id, "role": planned.role,
+                "goal": f"{plan.goal}\nAssigned objective: {planned.objective}",
+                "modelProfile": model_profile, "availableTools": list(model_tools),
+                "planId": planned.id, "dedupeKey": planned.dedupe_key,
+                "costUnits": planned.cost_units, "origin": planned.origin,
+                "evidenceIds": list(planned.evidence_ids),
+                "retryCeiling": plan.ceilings.retries_per_worker,
+            },
+            state_label="queued",
+        )
+
+    def _enqueue_follow_ups(self, ledger: FactoryLedger, run_id: str,
+                            item: dict[str, Any], payload: dict[str, Any],
+                            next_actions: list[str], paths: RunPaths,
+                            model_profile: str) -> None:
+        """Translate explicit proposals into work; only the scheduler assesses completion."""
+        if "planId" not in payload:
+            return
+        plan = _plan_from_meta(_read_meta(paths))
+        existing = _adaptive_work(ledger, run_id)
+        for action in next_actions:
+            match = re.fullmatch(r"\s*\[follow-up:([^\]]+)\]\s*(.+)", action)
+            if match is None:
+                continue
+            proposal = FollowUpProposal(
+                role=match.group(1), objective=match.group(2),
+                evidence_ids=(item["id"],), depends_on=(payload["planId"],),
+            )
+            try:
+                planned = propose_follow_up(plan, proposal, existing_work=existing)
+            except ValueError as exc:
+                ledger.event_log(
+                    run_id, "strategy.follow_up_rejected", str(exc),
+                    worker_id=payload["workerId"], payload={"proposal": action},
+                )
+                continue
+            if planned is None:
+                continue
+            dependency_rows = {
+                json.loads(row["payload_json"]).get("planId"): row["id"]
+                for row in ledger.conn.execute(
+                    "select id, payload_json from work_items "
+                    "where run_id=? and operation='model-worker'", (run_id,),
+                ).fetchall()
+            }
+            work_item_id = self._enqueue_planned_worker(
+                ledger, run_id, item["target"], model_profile,
+                tuple(payload.get("availableTools", [])), plan, planned,
+                [dependency_rows[value] for value in planned.depends_on],
+            )
+            existing.append(planned)
+            ledger.event_log(
+                run_id, "strategy.follow_up_enqueued",
+                f"{planned.role} follow-up enqueued", worker_id=payload["workerId"],
+                payload={"workItemId": work_item_id, "planId": planned.id,
+                         "evidenceIds": list(planned.evidence_ids)},
+            )
 
     def _resume_model_worker_if_ready(self, ledger: FactoryLedger, run_id: str,
                                       payload: dict[str, Any]) -> None:
@@ -617,6 +715,80 @@ class InvestigationController:
 
 def _read_meta(paths: RunPaths) -> dict[str, Any]:
     return json.loads(paths.run_json.read_text(encoding="utf-8"))
+
+
+def _request_plan(request: RunRequest) -> InvestigationPlan:
+    ceilings = RunCeilings(
+        request.concurrency, request.retries_per_worker,
+        request.cost_units, request.max_workers,
+    )
+    if request.strategy is not None:
+        return plan_investigation(request.goal, request.strategy, ceilings=ceilings)
+    strategy = Strategy(
+        name="custom-roles",
+        description="Explicit worker roles supplied by the operator.",
+        workers=tuple(WorkerSeed(role, f"Investigate as the {role} specialist.")
+                      for role in request.worker_roles),
+        ceilings=ceilings,
+    )
+    return plan_investigation(request.goal, strategy, ceilings=ceilings)
+
+
+def _plan_payload(plan: InvestigationPlan) -> dict[str, Any]:
+    return {
+        "strategy": plan.strategy, "goal": plan.goal,
+        "ceilings": asdict(plan.ceilings),
+        "work": [asdict(item) for item in plan.work],
+    }
+
+
+def _plan_from_payload(payload: dict[str, Any]) -> InvestigationPlan:
+    return InvestigationPlan(
+        strategy=payload["strategy"], goal=payload["goal"],
+        ceilings=RunCeilings(**payload["ceilings"]),
+        work=tuple(PlannedWork(**item) for item in payload["work"]),
+    )
+
+
+def _plan_from_meta(meta: dict[str, Any]) -> InvestigationPlan:
+    """Read current plans while keeping pre-strategy runs resumable."""
+    payload = meta.get("strategyPlan")
+    if payload is not None:
+        return _plan_from_payload(payload)
+    roles = tuple(meta.get("workerRoles") or ("recon", "analyst"))
+    concurrency = int(meta.get("concurrency", 4))
+    ceilings = RunCeilings(
+        concurrency=concurrency, retries_per_worker=1,
+        cost_units=max(100, len(roles) * 10), max_workers=max(8, concurrency, len(roles)),
+    )
+    legacy = Strategy(
+        name="legacy-roles", description="Compatibility plan for an existing run.",
+        workers=tuple(WorkerSeed(role, f"Investigate as the {role} specialist.")
+                      for role in roles),
+        ceilings=ceilings,
+    )
+    return plan_investigation(meta["goal"], legacy, ceilings=ceilings)
+
+
+def _adaptive_work(ledger: FactoryLedger, run_id: str) -> list[PlannedWork]:
+    result = []
+    rows = ledger.conn.execute(
+        "select payload_json from work_items "
+        "where run_id=? and operation='model-worker'", (run_id,),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        if payload.get("origin") != "worker-proposal":
+            continue
+        result.append(PlannedWork(
+            id=payload["planId"], dedupe_key=payload["dedupeKey"],
+            role=payload["role"],
+            objective=payload["goal"].split("Assigned objective: ", 1)[-1],
+            cost_units=int(payload["costUnits"]),
+            evidence_ids=tuple(payload.get("evidenceIds", [])),
+            origin="worker-proposal",
+        ))
+    return result
 
 
 def _write_status(paths: RunPaths, status: str) -> None:
