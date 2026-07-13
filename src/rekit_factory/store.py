@@ -27,6 +27,13 @@ create table if not exists factory_workers (
 );
 create index if not exists idx_factory_workers_run on factory_workers(run_id);
 
+create table if not exists factory_strategy_workers (
+    run_id         text not null,
+    plan_work_id   text not null,
+    worker_id      text not null unique,
+    primary key (run_id, plan_work_id)
+);
+
 create table if not exists factory_events (
     id            text primary key,
     run_id        text not null,
@@ -106,6 +113,30 @@ class FactoryLedger(Ledger):
             (worker_id, run_id, role, "queued", model_profile, now, now),
         )
         self.conn.commit()
+        return worker_id
+
+    def add_planned_worker(self, run_id: str, plan_work_id: str, role: str,
+                           model_profile: str) -> str:
+        """Return one durable worker for a deterministic strategy work id."""
+        existing = self.conn.execute(
+            "select worker_id from factory_strategy_workers "
+            "where run_id=? and plan_work_id=?", (run_id, plan_work_id),
+        ).fetchone()
+        if existing is not None:
+            return existing["worker_id"]
+        worker_id = new_id("worker")
+        now = utcnow()
+        with self.conn:
+            self.conn.execute(
+                "insert into factory_workers "
+                "(id, run_id, role, status, model_profile, created_at, updated_at) "
+                "values (?,?,?,?,?,?,?)",
+                (worker_id, run_id, role, "queued", model_profile, now, now),
+            )
+            self.conn.execute(
+                "insert into factory_strategy_workers (run_id, plan_work_id, worker_id) "
+                "values (?,?,?)", (run_id, plan_work_id, worker_id),
+            )
         return worker_id
 
     def update_worker(self, worker_id: str, *, status: str | None = None,
