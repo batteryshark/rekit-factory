@@ -113,6 +113,12 @@ def test_unknown_fields_tampered_identity_and_ambiguous_success_fail_closed():
         CompletionCriteria(0, 0, 0)
     with pytest.raises(ValueError, match="terminal evidence"):
         TerminalOutcome(campaign().campaign_id, "completed", "success", (), "checkpoint-a")
+    with pytest.raises(ValueError, match="requires a final checkpoint"):
+        TerminalOutcome(campaign().campaign_id, "completed", "success", ("event-a",), None)
+    stopped = TerminalOutcome(
+        campaign().campaign_id, "stopped", "operator-before-start", ("decision-a",), None,
+    )
+    assert TerminalOutcome.from_dict(stopped.to_dict()) == stopped
 
 
 def test_transition_matrix_names_exact_authority_and_terminal_states_do_not_reopen():
@@ -139,6 +145,9 @@ def test_scope_or_hard_ceiling_increase_requires_exact_operator_decision():
         ),
     )
     assert requires_operator_decision(current, larger)
+    assert requires_operator_decision(
+        current, replace(current, completion=CompletionCriteria(9000, 1, 1))
+    )
     request = CampaignChangeRequest(current.campaign_id, larger, "Raise bounded cost ceiling")
     assert CampaignChangeRequest.from_dict(request.to_dict()) == request
     assert request.request_id.startswith("campaign-change-")

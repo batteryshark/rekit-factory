@@ -2,8 +2,9 @@
 
 `factory-campaign-contract/v1` is the pure execution contract for a finite research
 campaign. It complements—but does not replace—the smaller
-`factory-campaign-lifecycle/v1` outcome source. Persistence, progress decisions, controller
-execution, and UI controls remain owned by W-0052 through W-0055.
+`factory-campaign-lifecycle/v1` outcome source. Durable, exactly-once storage is implemented
+by `CampaignPersistence` and documented in `campaign-persistence-v1.md`; progress decisions,
+controller execution, and UI controls remain separate downstream concerns.
 
 ## Identity and bounds
 
@@ -20,8 +21,9 @@ and require each epoch to fit both the campaign per-epoch budget and cumulative 
 Zero network/tool/artifact allowance is explicit; work, concurrency, and time can never be
 undefined or zero.
 
-Scope expansion and hard cumulative-ceiling increases always require an exact-content
-operator decision in v1. The decision request binds the current campaign identity, complete
+Every in-place campaign contract change requires an exact-content operator decision in v1,
+including scope, ceiling enforcement/value, completion criteria, operator policy, and
+component versions. The decision request binds the current campaign identity, complete
 proposed contract, and normalized reason under its own SHA-256 identity. A changed project
 or goal is a new campaign, not an in-place revision.
 
@@ -36,8 +38,11 @@ or goal is a new campaign, not an in-place revision.
 | completed, exhausted, blocked, stopped, policy-stopped, failed | none | terminal |
 
 `completed` is not a synonym for exhausted, blocked, stopped, policy-stopped, or failed.
-Every terminal outcome carries a stable reason code, a final checkpoint, and at least one
-canonical evidence reference. Model prose cannot create a progress or terminal fact.
+Every terminal outcome carries a stable reason code and at least one canonical evidence
+reference. Completed and exhausted outcomes require a final checkpoint. Stopped,
+policy-stopped, blocked, or failed outcomes may explicitly omit it only when no epoch has
+committed one; the contract never invents a checkpoint. Model prose cannot create a progress
+or terminal fact.
 
 Progress signals are restricted to new material evidence, resolved hypotheses, coverage
 movement, reproduced findings, and changed capability gaps, each bound to a stable

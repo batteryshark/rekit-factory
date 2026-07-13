@@ -658,7 +658,7 @@ class TerminalOutcome:
     status: TerminalStatus
     reason_code: str
     evidence_ids: tuple[str, ...]
-    final_checkpoint_id: str
+    final_checkpoint_id: str | None
 
     def __post_init__(self) -> None:
         _identifier(self.campaign_id, "campaign_id")
@@ -668,7 +668,10 @@ class TerminalOutcome:
         object.__setattr__(
             self, "evidence_ids", _items(self.evidence_ids, "terminal evidence", allow_empty=False),
         )
-        _identifier(self.final_checkpoint_id, "final checkpoint id")
+        if self.status in {"completed", "exhausted"} and self.final_checkpoint_id is None:
+            raise ValueError("completed or exhausted outcome requires a final checkpoint")
+        if self.final_checkpoint_id is not None:
+            _identifier(self.final_checkpoint_id, "final checkpoint id")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -708,17 +711,7 @@ def requires_operator_decision(
     """Return whether exact-content operator approval gates a proposed authority change."""
     if current.project_id != proposed.project_id or current.goal != proposed.goal:
         raise ValueError("campaign goal/project identity cannot be revised in place")
-    scope_changed = current.scope != proposed.scope
-    hard_increase = any(
-        getattr(new_budget, field).enforcement == "hard"
-        and getattr(new_budget, field).value > getattr(old_budget, field).value
-        for old_budget, new_budget in (
-            (current.epoch_budget, proposed.epoch_budget),
-            (current.cumulative_budget, proposed.cumulative_budget),
-        )
-        for field in ResourceBudget._attributes()
-    )
-    return scope_changed or hard_increase
+    return current != proposed
 
 
 @dataclass(frozen=True)
