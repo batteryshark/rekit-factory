@@ -656,10 +656,11 @@ function renderOutcomeProjection() {
   $("outcomeOwner").innerHTML = outcomeOption("all", state.outcomes.filters.owner, "All owners")
     + view.options.owners.map(value => outcomeOption(value, state.outcomes.filters.owner)).join("");
   $("outcomeSummary").innerHTML = `<div><b>${counts.total}</b><span>entities</span></div><div><b>${counts.shown}</b><span>shown</span></div><div><b>${counts.terminal}</b><span>terminal</span></div><div class="${counts.unknown ? "warn" : ""}"><b>${counts.unknown}</b><span>unknown</span></div><div class="${counts.degraded ? "warn" : ""}"><b>${counts.degraded}</b><span>degraded</span></div>`;
+  $("outcomeAnnouncement").textContent = `Showing ${counts.shown} of ${counts.total} canonical outcomes.`;
   const diagnostics = Array.isArray(projection?.diagnostics) ? projection.diagnostics : [];
   let integrity = "";
   if (state.outcomes.integrity === "missing") integrity = `<div class="outcome-alert neutral"><b>Outcome projection unavailable</b><span>This older snapshot has no canonical outcome surface.</span></div>`;
-  else if (state.outcomes.integrity === "legacy") integrity = `<div class="outcome-alert warn"><b>Legacy projection</b><span>No semanticSha256 was supplied; the projection remains visible without semantic update dedupe.</span></div>`;
+  else if (state.outcomes.integrity === "legacy") integrity = `<div class="outcome-alert warn"><b>Legacy projection</b><span>Exact canonical outcome bytes are unavailable; local semantic equality may preserve UI state without claiming SHA-256 verification.</span></div>`;
   else if (state.outcomes.integrity === "mismatch") integrity = `<div class="outcome-alert bad"><b>Semantic integrity mismatch</b><span>The claimed outcome identity did not match the canonical client-side digest.</span></div>`;
   else if (state.outcomes.integrity === "invalid-envelope") integrity = `<div class="outcome-alert bad"><b>Semantic envelope rejected</b><span>The authoritative outcome bytes were malformed or used the wrong identity domain.</span></div>`;
   else if (state.outcomes.integrity === "unavailable") integrity = `<div class="outcome-alert warn"><b>Digest verification unavailable</b><span>The browser cannot verify SHA-256; canonical facets are shown with a bounded warning.</span></div>`;
@@ -717,10 +718,11 @@ function renderDetail() {
 function connectEvents(runId) {
   if (state.stream) state.stream.close();
   state.snapshotRefreshes.invalidate();
-  state.stream = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
-  state.stream.onmessage = async () => {
+  const stream = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
+  state.stream = stream;
+  stream.onmessage = async () => {
+    if (!MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) return;
     const refreshGeneration = state.snapshotRefreshes.begin();
-    if (state.selected !== runId) return;
     try {
       const [snapshot, reportPayload, evidence, dossierPayload] = await Promise.all([
         api(`/api/runs/${encodeURIComponent(runId)}`),
@@ -728,20 +730,32 @@ function connectEvents(runId) {
         api(`/api/runs/${encodeURIComponent(runId)}/evidence`),
         api(`/api/runs/${encodeURIComponent(runId)}/dossiers`),
       ]);
-      if (!state.snapshotRefreshes.isCurrent(refreshGeneration) || state.selected !== runId) return;
+      if (!state.snapshotRefreshes.isCurrent(refreshGeneration)
+          || !MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) return;
       snapshot.workerReports = reportPayload.reports;
       snapshot.dossiers = dossierPayload.dossiers;
       state.snapshot = snapshot;
       state.evidence = evidence.records || [];
       renderDetail();
     } catch (error) {
-      if (state.snapshotRefreshes.isCurrent(refreshGeneration) && state.selected === runId) {
+      if (state.snapshotRefreshes.isCurrent(refreshGeneration)
+          && MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) {
         toast(error.message, true);
       }
-    } finally { refreshFleet(); }
+    } finally {
+      if (MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) refreshFleet();
+    }
   };
-  state.stream.addEventListener("heartbeat", () => refreshFleet());
-  state.stream.onerror = () => { state.stream.close(); setTimeout(() => state.selected === runId && connectEvents(runId), 1500); };
+  stream.addEventListener("heartbeat", () => {
+    if (MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) refreshFleet();
+  });
+  stream.onerror = () => {
+    if (!MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) return;
+    stream.close();
+    setTimeout(() => {
+      if (MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) connectEvents(runId);
+    }, 1500);
+  };
 }
 
 function selectedProfile() {

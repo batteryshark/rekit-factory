@@ -73,6 +73,7 @@
                 <header class="outcome-stage-head"><div><span class="eyebrow">ORTHOGONAL OUTCOME READ MODEL</span><h2 id="outcomeHeading" tabindex="-1">Outcomes</h2><p>Execution, completion, disposition, validation, acceptance, and publication remain separate.</p></div><div class="outcome-orbit" aria-hidden="true"><i></i><span>6</span><small>facets</small></div></header>
                 <div class="outcome-integrity" id="outcomeIntegrity" role="status"></div>
                 <div class="outcome-summary" id="outcomeSummary"></div>
+                <div class="sr-only" id="outcomeAnnouncement" role="status" aria-live="polite" aria-atomic="true"></div>
                 <form class="outcome-controls" id="outcomeFilters" role="search" aria-label="Filter canonical outcomes">
                   <label class="outcome-search" for="outcomeSearch"><span aria-hidden="true">⌕</span><input id="outcomeSearch" name="query" type="search" aria-label="Search outcomes" placeholder="Search entity, state, owner…" autocomplete="off"><kbd aria-hidden="true">/</kbd></label>
                   <label><span>Type</span><select id="outcomeType" name="type"><option value="all">All types</option></select></label>
@@ -81,7 +82,7 @@
                   <label><span>Terminal</span><select id="outcomeTerminal" name="terminal"><option value="all">Any</option><option value="terminal">Has terminal facet</option><option value="nonterminal">No terminal facet</option></select></label>
                   <button class="btn" id="outcomeReset" type="reset">Reset</button>
                 </form>
-                <div class="outcome-results" id="outcomeResults" aria-live="polite" aria-busy="false"></div>
+                <div class="outcome-results" id="outcomeResults" aria-busy="false"></div>
               </section>
             </div>
             <div class="tabpane" role="tabpanel" id="tab-memory"><div class="memory-board"><div class="memory-primary"><div class="memory-board-head"><div><span class="eyebrow">DURABLE REASONING</span><h2>Project memory</h2></div><button class="btn" id="copyMemoryContext" type="button">Copy resume context</button></div><div id="memoryDegraded"></div><div class="memory-groups" id="memoryGroups"></div></div><aside class="memory-context-panel"><div><span class="eyebrow">BOUNDED PROJECTION</span><b>Worker resume context</b></div><pre id="memoryContext"></pre></aside></div></div>

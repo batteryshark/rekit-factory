@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const {webcrypto} = require("node:crypto");
 const {
   canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker,
-  decodeSemanticEnvelope, projectionView, semanticSha256,
+  decodeSemanticEnvelope, isCurrentEventStream, projectionView, semanticSha256,
 } = require("../src/rekit_factory/ui/mission-outcomes.js");
 
 const empty = {
@@ -136,6 +136,11 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
   assert.equal(gate.isCurrent(newer), true);
   gate.invalidate();
   assert.equal(gate.isCurrent(newer), false, "cross-run changes invalidate in-flight snapshot responses");
+
+  const streamA = {}, streamB = {};
+  assert.equal(isCurrentEventStream(streamA, streamA, "run-a", "run-a"), true);
+  assert.equal(isCurrentEventStream(streamA, streamB, "run-a", "run-a"), false, "an old source cannot act on a replacement stream");
+  assert.equal(isCurrentEventStream(streamA, streamA, "run-a", "run-b"), false, "an old source cannot invalidate a newly selected run");
 
   console.log("mission outcomes behavior: ok");
 })().catch(error => {

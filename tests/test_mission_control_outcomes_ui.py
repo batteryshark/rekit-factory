@@ -20,6 +20,7 @@ def test_outcomes_surface_is_packaged_first_class_and_projection_only():
         'data-tab="outcomes"', 'id="tab-outcomes"', 'id="outcomeCount"',
         'id="outcomeSearch"', 'id="outcomeType"', 'id="outcomeState"',
         'id="outcomeOwner"', 'id="outcomeTerminal"', 'id="outcomeResults"',
+        'id="outcomeAnnouncement"',
         "ORTHOGONAL OUTCOME READ MODEL",
     ):
         assert marker in page
@@ -50,6 +51,12 @@ def test_outcomes_surface_is_packaged_first_class_and_projection_only():
     assert '$("view-detail").classList.contains("active")' in script
     assert "state.runRequests.isCurrent(requestGeneration)" in script
     assert "state.snapshotRefreshes.isCurrent(refreshGeneration)" in script
+    assert "isCurrentEventStream(stream, state.stream, runId, state.selected)" in script
+    assert script.index("isCurrentEventStream(stream, state.stream, runId, state.selected)") < script.index("const refreshGeneration = state.snapshotRefreshes.begin()")
+    assert 'id="outcomeResults" aria-busy="false"' in page
+    assert 'id="outcomeResults" aria-live=' not in page
+    assert 'id="outcomeAnnouncement" role="status" aria-live="polite"' in page
+    assert "Exact canonical outcome bytes are unavailable" in script
     assert "state.outcomes.renders.isCurrent(renderGeneration)" in script
     assert 'setAttribute("aria-busy", "false")' in script
     assert "outcome-rise" in style

@@ -153,6 +153,10 @@
     };
   }
 
+  function isCurrentEventStream(stream, activeStream, runId, selectedRunId) {
+    return stream === activeStream && runId === selectedRunId;
+  }
+
   const primitive = value => value === null || ["string", "number", "boolean"].includes(typeof value);
 
   function entityText(entity) {
@@ -209,5 +213,5 @@
     return null;
   }
 
-  return {DOMAIN, FACETS, canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker, decodeSemanticEnvelope, projectionView, semanticSha256, sha256Bytes};
+  return {DOMAIN, FACETS, canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker, decodeSemanticEnvelope, isCurrentEventStream, projectionView, semanticSha256, sha256Bytes};
 });
