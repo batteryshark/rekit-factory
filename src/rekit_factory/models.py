@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, is_dataclass
 import os
 import re
@@ -10,21 +9,23 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from muster.pydantic_runtime import (
+    ModelEventSink,
+    ModelStreamEvent as ModelActivity,
+    RequiredToolTurn,
+    acquisition_output_types,
+    anthropic_cache_settings,
+    coalesced_event_handler,
+    dump_message_history,
+    load_message_history,
+)
+
 
 class WorkerReport(BaseModel):
     summary: str
     observations: list[str] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
     status_update: str
-
-
-@dataclass(frozen=True)
-class ModelActivity:
-    """Provider-neutral, bounded activity suitable for the durable Factory event log."""
-
-    kind: str
-    message: str
-    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -54,9 +55,6 @@ class WorkerTurn:
     usage: dict[str, Any]
     messages_json: str
     deferred_calls: tuple[DeferredModelToolCall, ...] = ()
-
-
-ModelEventSink = Callable[[ModelActivity], None]
 
 
 @dataclass(frozen=True)
@@ -124,12 +122,7 @@ class PydanticWorkerBackend:
 
             provider = AnthropicProvider(base_url=profile.base_url, api_key=profile.api_key)
             model = AnthropicModel(profile.model, provider=provider)
-            model_settings = AnthropicModelSettings(
-                # Per-block caching is the compatible path for gateways such as MiniMax.
-                anthropic_cache_messages=True,
-                anthropic_cache_instructions=True,
-                anthropic_cache_tool_definitions=True,
-            )
+            model_settings = AnthropicModelSettings(**anthropic_cache_settings())
         else:
             from pydantic_ai.models.openai import OpenAIChatModel
             from pydantic_ai.providers.openai import OpenAIProvider
@@ -164,40 +157,8 @@ class PydanticWorkerBackend:
             DeferredToolRequests,
             DeferredToolResults,
             FunctionToolset,
-            ModelMessagesTypeAdapter,
             ToolDenied,
         )
-        from pydantic_ai.capabilities import AbstractCapability
-
-        class RequireEvidenceTool(AbstractCapability):
-            def get_model_settings(self):
-                # A callable is intentionally used: Pydantic permits required function
-                # tools when policy may vary. This capability exists only on the fresh
-                # worker run; the separate continuation run does not attach it. MiniMax-M3
-                # currently ignores forced tool choice when any explicit Anthropic cache
-                # breakpoint is present, so caching is disabled for this request only.
-                return lambda _ctx: {
-                    "tool_choice": "required",
-                    "anthropic_cache_messages": False,
-                    "anthropic_cache_instructions": False,
-                    "anthropic_cache_tool_definitions": False,
-                }
-
-            async def before_model_request(self, _ctx, request_context):
-                if event_sink:
-                    definitions = request_context.model_request_parameters.tool_defs
-                    tool_names = (list(definitions) if isinstance(definitions, dict)
-                                  else [getattr(item, "name", "unknown")
-                                        for item in definitions])
-                    event_sink(ModelActivity(
-                        kind="model.request.prepared",
-                        message=f"Prepared model request with {len(tool_names)} tool(s)",
-                        payload={
-                            "toolChoice": request_context.model_settings.get("tool_choice"),
-                            "tools": tool_names,
-                        },
-                    ))
-                return request_context
 
         prompt = (
             f"Worker role: {role}\nInvestigation goal: {goal}\n\n"
@@ -228,7 +189,7 @@ class PydanticWorkerBackend:
             )
 
         message_history = (
-            ModelMessagesTypeAdapter.validate_json(messages_json)
+            load_message_history(messages_json)
             if messages_json else None
         )
         deferred_results = None
@@ -243,16 +204,19 @@ class PydanticWorkerBackend:
             # Keep the forced evidence turn free of the prompted WorkerReport JSON
             # schema. MiniMax-M3 otherwise treats schema text as a competing final-output
             # instruction and may ignore the forced function tool choice.
-            output_type=[str, DeferredToolRequests]
+            output_type=acquisition_output_types()
             if names and not message_history else None,
             message_history=message_history,
             deferred_tool_results=deferred_results,
             toolsets=[toolset] if names else None,
-            capabilities=[RequireEvidenceTool()]
+            capabilities=[RequiredToolTurn(
+                disable_anthropic_cache=True,
+                event_sink=event_sink,
+            )]
             if names and not message_history else None,
-            event_stream_handler=_event_handler(event_sink) if event_sink else None,
+            event_stream_handler=coalesced_event_handler(event_sink) if event_sink else None,
         )
-        serialized = ModelMessagesTypeAdapter.dump_json(result.all_messages()).decode("utf-8")
+        serialized = dump_message_history(result.all_messages())
         usage = _usage_dict(result.usage)
         if isinstance(result.output, DeferredToolRequests):
             calls = []
@@ -280,79 +244,6 @@ class PydanticWorkerBackend:
 
 def _tool_name(tool_id: str) -> str:
     return "rekit__" + re.sub(r"[^a-zA-Z0-9_]", "_", tool_id)
-
-
-def _event_handler(sink: ModelEventSink):
-    """Coalesce token deltas while retaining every semantic model/tool boundary."""
-
-    async def handle(_ctx, stream) -> None:
-        totals: dict[str, int] = {}
-        emitted: dict[str, int] = {}
-        async for event in stream:
-            event_kind = getattr(event, "event_kind", type(event).__name__)
-            if event_kind == "part_delta":
-                delta = event.delta
-                part_kind = getattr(delta, "part_delta_kind", "unknown").replace("_", "-")
-                content = getattr(delta, "content_delta", None)
-                if content is None:
-                    content = getattr(delta, "args_delta", None)
-                size = len(content) if isinstance(content, (str, dict)) else 0
-                totals[part_kind] = totals.get(part_kind, 0) + size
-                if totals[part_kind] - emitted.get(part_kind, 0) >= 512:
-                    emitted[part_kind] = totals[part_kind]
-                    sink(ModelActivity(
-                        kind=f"model.{part_kind}.streaming",
-                        message=f"Streaming {part_kind}",
-                        payload={"characters": totals[part_kind]},
-                    ))
-                continue
-            if event_kind in {"part_start", "part_end"}:
-                part = event.part
-                part_kind = getattr(part, "part_kind", "unknown")
-                payload = {"part": part_kind, "index": event.index}
-                if hasattr(part, "tool_name"):
-                    payload.update(toolName=part.tool_name,
-                                   toolCallId=getattr(part, "tool_call_id", None))
-                sink(ModelActivity(
-                    kind=f"model.part.{event_kind.removeprefix('part_')}",
-                    message=f"Model {part_kind} part {event_kind.removeprefix('part_')}",
-                    payload=payload,
-                ))
-                continue
-            if event_kind == "function_tool_call":
-                sink(ModelActivity(
-                    kind="model.tool.requested",
-                    message=f"Model requested {event.part.tool_name}",
-                    payload={"toolName": event.part.tool_name,
-                             "toolCallId": event.part.tool_call_id},
-                ))
-                continue
-            if event_kind == "function_tool_result":
-                sink(ModelActivity(
-                    kind="model.tool.returned",
-                    message=f"Tool result returned for {event.part.tool_name}",
-                    payload={"toolName": event.part.tool_name,
-                             "toolCallId": event.part.tool_call_id,
-                             "outcome": getattr(event.part, "outcome", "success")},
-                ))
-                continue
-            if event_kind == "final_result":
-                sink(ModelActivity(
-                    kind="model.finalizing",
-                    message="Model produced a final result",
-                    payload={"toolName": event.tool_name,
-                             "toolCallId": event.tool_call_id},
-                ))
-
-        for part_kind, total in totals.items():
-            if total and emitted.get(part_kind, 0) != total:
-                sink(ModelActivity(
-                    kind=f"model.{part_kind}.streamed",
-                    message=f"Finished streaming {part_kind}",
-                    payload={"characters": total},
-                ))
-
-    return handle
 
 
 def _usage_dict(usage: object) -> dict[str, Any]:
