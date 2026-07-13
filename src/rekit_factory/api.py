@@ -1,0 +1,291 @@
+"""Loopback-only JSON API and resumable SSE feed for Mission Control."""
+
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import Future
+import json
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import threading
+import time
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from rekit_factory.control import InvestigationController, RunRequest
+
+
+MAX_BODY = 1_000_000
+
+
+class DriveSupervisor:
+    """Own one asyncio loop so every model worker runs on a stable event loop."""
+
+    def __init__(self, controller: InvestigationController):
+        self.controller = controller
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, name="factory-drives", daemon=True)
+        self.thread.start()
+        self._active: dict[str, Future] = {}
+        self._lock = threading.Lock()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def submit(self, run_dir: Path) -> bool:
+        run_id = _run_meta(run_dir)["runId"]
+        with self._lock:
+            current = self._active.get(run_id)
+            if current is not None and not current.done():
+                return False
+            future = asyncio.run_coroutine_threadsafe(self.controller.drive(run_dir), self.loop)
+            self._active[run_id] = future
+            future.add_done_callback(lambda _future: self._forget(run_id, _future))
+            return True
+
+    def _forget(self, run_id: str, future: Future) -> None:
+        # Retrieve the exception so failed background drives do not emit an unhandled warning.
+        try:
+            future.result()
+        except Exception:
+            pass
+        with self._lock:
+            if self._active.get(run_id) is future:
+                self._active.pop(run_id, None)
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=2)
+
+
+class FactoryServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, controller: InvestigationController):
+        host = address[0]
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("Factory API must bind to a loopback address")
+        super().__init__(address, FactoryHandler)
+        self.controller = controller
+        self.storage_root = controller.storage_root.resolve()
+        self.supervisor = DriveSupervisor(controller)
+
+    def server_close(self) -> None:
+        if hasattr(self, "supervisor"):
+            self.supervisor.close()
+        super().server_close()
+
+
+class FactoryHandler(BaseHTTPRequestHandler):
+    server: FactoryServer
+
+    def log_message(self, format: str, *args) -> None:
+        # Keep operator output concise; run activity belongs in the durable event stream.
+        return
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        parts = [part for part in parsed.path.split("/") if part]
+        try:
+            if parts in ([], ["mission-control"]):
+                self._html((Path(__file__).with_name("ui") / "index.html").read_bytes())
+                return
+            if parts == ["api", "config"]:
+                tools = []
+                if hasattr(self.server.controller.rekit, "list_tools"):
+                    tools = [{
+                        **tool.__dict__, "requires_permission": tool.requires_permission,
+                    } for tool in self.server.controller.rekit.list_tools()]
+                self._json(HTTPStatus.OK, {
+                    "storageRoot": str(self.server.storage_root),
+                    "modelProfile": self.server.controller.workers.profile.public_dict(),
+                    "modelProfiles": [backend.profile.public_dict()
+                                      for backend in self.server.controller.worker_backends.values()],
+                    "defaultModelProfile": self.server.controller.default_profile,
+                    "tools": tools,
+                })
+                return
+            if parts == ["api", "fleet"]:
+                self._json(HTTPStatus.OK, {"runs": _fleet(self.server.controller)})
+                return
+            if len(parts) == 3 and parts[:2] == ["api", "runs"]:
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                self._json(HTTPStatus.OK, self.server.controller.snapshot(run_dir))
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events":
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                after = parse_qs(parsed.query).get("after", [None])[0]
+                after = self.headers.get("Last-Event-ID") or after
+                self._events(run_dir, after)
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except FileNotFoundError as exc:
+            self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+        except Exception as exc:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                       {"error": f"{type(exc).__name__}: {exc}"})
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        parts = [part for part in parsed.path.split("/") if part]
+        try:
+            payload = self._body()
+            if parts == ["api", "runs"]:
+                request = RunRequest(
+                    target=Path(payload["target"]),
+                    goal=str(payload["goal"]),
+                    tools=tuple(payload.get("tools", [])),
+                    model_tools=tuple(payload.get("modelTools", [])),
+                    worker_roles=tuple(payload.get("workerRoles") or ("recon", "analyst")),
+                    concurrency=int(payload.get("concurrency", 4)),
+                    model_profile=payload.get("modelProfile"),
+                )
+                run_dir = self.server.controller.create(request)
+                self.server.supervisor.submit(run_dir)
+                snapshot = self.server.controller.snapshot(run_dir)
+                snapshot["runDir"] = str(run_dir)
+                self._json(HTTPStatus.ACCEPTED, snapshot)
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "resume":
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                started = self.server.supervisor.submit(run_dir)
+                self._json(HTTPStatus.ACCEPTED if started else HTTPStatus.CONFLICT,
+                           {"runId": parts[2], "started": started})
+                return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "answers":
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                result = self.server.controller.answer(
+                    run_dir, str(payload["questionId"]), str(payload["answer"]), resume=False
+                )
+                started = self.server.supervisor.submit(run_dir)
+                self._json(HTTPStatus.ACCEPTED, {
+                    "runId": parts[2], "started": started,
+                    "pendingQuestions": result["pendingQuestions"],
+                })
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except (KeyError, TypeError, ValueError, FileNotFoundError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": f"{type(exc).__name__}: {exc}"})
+        except Exception as exc:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                       {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _body(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length <= 0 or length > MAX_BODY:
+            raise ValueError(f"request body must be 1..{MAX_BODY} bytes")
+        value = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise TypeError("JSON body must be an object")
+        return value
+
+    def _json(self, status: HTTPStatus, payload: Any) -> None:
+        body = json.dumps(payload, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, body: bytes) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _events(self, run_dir: Path, after: str | None) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        cursor = after
+        deadline = time.monotonic() + 15
+        try:
+            while time.monotonic() < deadline:
+                events = self.server.controller.snapshot(run_dir)["events"]
+                fresh = _after(events, cursor)
+                for event in fresh:
+                    encoded = json.dumps(event, sort_keys=True)
+                    self.wfile.write(
+                        f"id: {event['id']}\nevent: message\ndata: {encoded}\n\n".encode()
+                    )
+                    cursor = event["id"]
+                if fresh:
+                    self.wfile.flush()
+                time.sleep(0.25)
+            self.wfile.write(b"event: heartbeat\ndata: {}\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+
+def _after(events: list[dict[str, Any]], cursor: str | None) -> list[dict[str, Any]]:
+    if cursor is None:
+        return events
+    for index, event in enumerate(events):
+        if event["id"] == cursor:
+            return events[index + 1:]
+    return events
+
+
+def _run_meta(run_dir: Path) -> dict[str, Any]:
+    return json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+
+def _run_dirs(storage_root: Path) -> list[Path]:
+    if not storage_root.is_dir():
+        return []
+    return sorted(
+        (path.parent for path in storage_root.glob("projects/*/runs/*/run.json")),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+
+
+def _find_run(storage_root: Path, run_id: str) -> Path:
+    for run_dir in _run_dirs(storage_root):
+        if _run_meta(run_dir).get("runId") == run_id:
+            return run_dir
+    raise FileNotFoundError(f"unknown run {run_id}")
+
+
+def _fleet(controller: InvestigationController) -> list[dict[str, Any]]:
+    cards = []
+    for run_dir in _run_dirs(controller.storage_root):
+        snapshot = controller.snapshot(run_dir)
+        run = snapshot["run"]
+        meta = snapshot["meta"]
+        cards.append({
+            "runId": run["id"],
+            "runDir": str(run_dir),
+            "projectId": run["project_id"],
+            "target": meta["target"],
+            "goal": meta["goal"],
+            "status": run["status"],
+            "modelProfile": meta["modelProfile"],
+            "coverage": snapshot["coverage"],
+            "workers": snapshot["workers"],
+            "needsYou": len(snapshot["pendingQuestions"]),
+            "latestEvent": snapshot["events"][-1] if snapshot["events"] else None,
+        })
+    return cards
+
+
+def serve(controller: InvestigationController, *, host: str = "127.0.0.1",
+          port: int = 8768) -> None:
+    server = FactoryServer((host, port), controller)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

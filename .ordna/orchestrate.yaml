@@ -1,0 +1,10 @@
+reviewers:
+  - name: codex-correctness
+    cmd: "codex exec --skip-git-repo-check -"
+    stdin: true
+    role: strict-correctness
+  - name: claude-design
+    cmd: "claude -p"
+    stdin: false
+    role: design-fit
+parallel: true

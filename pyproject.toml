@@ -1,43 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "rekit-factory"
-version = "0.1.0"
-description = "rekit: a harness-agnostic orchestration runtime — ralph loop, persistent ledger, skills + scoping, human channel, goalpacks. Point it at a target, pick a goal. Depends on nothing."
+version = "0.2.0"
+description = "A durable, supervised dark factory for reverse engineering."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
-authors = [{ name = "Mario Mercaldi" }]
-keywords = ["orchestration", "runtime", "ralph-loop", "ledger", "reverse-engineering", "agent-harness"]
-# Zero runtime dependencies on purpose: rekit is a clean kernel. Heavy deps
-# (harness SDKs, tree-sitter, decompilers) live inside the skills that need them,
-# never in the core. It depends on nothing.
-dependencies = []
-
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+license = "Apache-2.0"
+authors = [{ name = "batteryshark" }]
+dependencies = [
+  "muster @ git+https://github.com/batteryshark/muster.git",
+  "pydantic-ai>=2.6,<3",
+]
 
 [project.scripts]
-rekit-factory = "rekit.cli:main"
+rekit-factory = "rekit_factory.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["rekit*"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/rekit_factory"]
 
-# Ship the builtin goalpacks (GOALPACK.md + system-prompt.md + renderer.py) as
-# package data so `rekit.goalpacks.discover_goalpacks()` finds them from an install.
-# The goalpack folders carry no __init__.py (renderers are imported by path, not as
-# submodules), so they are data, not packages — hence an explicit glob here.
-[tool.setuptools.package-data]
-rekit = ["goalpacks/**/GOALPACK.md", "goalpacks/**/system-prompt.md", "goalpacks/**/renderer.py"]
+[tool.hatch.build.targets.wheel.force-include]
+"src/rekit_factory/ui/index.html" = "rekit_factory/ui/index.html"
 
-# Builtin skills live at the *repo root* (`rekit/skills/<skill>/`), committed to
-# this repo — NOT inside the `rekit` package — so they're resolved by
-# `rekit.skills.registry.builtin_skills_dir()` as `Path(__file__).parents[2] /
-# "skills"`. Because they sit outside any package, setuptools' package-data glob
-# (rooted at the package dir) can't reach them; MANIFEST.in ships them in the
-# **sdist**, and an editable / source checkout finds them directly at the repo
-# root. WHEEL CAVEAT: a plain `pip wheel .` does not vendor top-level-relative
-# data next to the installed package, so `builtin_skills_dir()` may point at a
-# non-existent path in a wheel install — discovery tolerates that (returns just
-# the user skills). Shipping builtin skills inside a wheel would require either
-# moving the tree under the package (`rekit/rekit/skills_builtin/`) or a custom
-# build step; deferred, since the target install here is editable/source.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
