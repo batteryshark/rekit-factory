@@ -2045,10 +2045,13 @@ def _validate_invocation_result(invocation: Any, result: Any,
     )
     if actual != expected:
         raise ValueError("tool result provenance does not match the durable invocation")
+    if (result.manifest_digest is not None
+            and result.manifest_digest != invocation.expected_manifest_digest):
+        raise ValueError("tool result manifest attestation does not match the invocation")
     if result.status == "done" or result.exit_code == 0:
         if result.status != "done" or result.exit_code != 0:
             raise ValueError("tool result success state is internally inconsistent")
-        if result.manifest_digest != invocation.expected_manifest_digest:
+        if result.manifest_digest is None:
             raise ValueError("tool result manifest attestation does not match the invocation")
 
 

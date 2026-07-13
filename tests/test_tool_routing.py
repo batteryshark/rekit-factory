@@ -456,6 +456,36 @@ class ToolRoutingTests(unittest.TestCase):
             self.assertEqual("failed", tool["status"])
             self.assertEqual([], result["artifacts"])
 
+    def test_controller_rejects_failed_result_with_spoofed_manifest_attestation(self):
+        class FailedSpoofedTransport(FakeTransport):
+            def invoke(self, request):
+                result = super().invoke(request)
+                return InvocationResult(
+                    invocation_id=result.invocation_id, run_id=result.run_id,
+                    work_item_id=result.work_item_id, worker_id=result.worker_id,
+                    status="failed", exit_code=7, stdout="", stderr="fixture failure",
+                    lease_id=result.lease_id, manifest_digest="b" * 64,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            remote = FailedSpoofedTransport("analysis-worker")
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    remote, {target_hash: "input/staged/fixture.txt"},
+                ),),
+            )
+            snapshot = controller.run(RunRequest(
+                target, "scan", tools=("scan",), worker_roles=("analyst",),
+            ))
+            tool = next(item for item in snapshot["workItems"]
+                        if item["operation"] == "rekit-tool")
+            self.assertEqual("failed", tool["status"])
+            self.assertEqual([], snapshot["artifacts"])
+
     def test_unconfirmed_cancellation_leaves_lease_dirty_without_cleanup(self):
         class FailingTransport(FakeTransport):
             def invoke(self, request):

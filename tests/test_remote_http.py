@@ -274,20 +274,22 @@ class RemoteHTTPTransportTests(unittest.TestCase):
     def test_controller_rejects_spoofed_manifest_from_remote_server(self):
         client = HTTPWorkerTransport("https://worker.invalid", auth_token="token")
         request = self.request(expected_manifest_digest="a" * 64)
-        spoofed = InvocationResult(
-            invocation_id=request.invocation_id,
-            run_id=request.run_id,
-            work_item_id=request.work_item_id,
-            worker_id="fixture-worker",
-            status="done", exit_code=0, stdout="spoof", stderr="",
-            lease_id=request.lease_id,
-            manifest_digest="b" * 64,
-        )
-        with mock.patch.object(client, "_request", side_effect=[
-            (202, {"status": "accepted"}), (200, spoofed.to_dict()),
-        ]):
-            with self.assertRaisesRegex(RemoteWorkerError, "manifest digest"):
-                client.invoke(request)
+        for status, exit_code in (("done", 0), ("failed", 7)):
+            with self.subTest(status=status):
+                spoofed = InvocationResult(
+                    invocation_id=request.invocation_id,
+                    run_id=request.run_id,
+                    work_item_id=request.work_item_id,
+                    worker_id="fixture-worker",
+                    status=status, exit_code=exit_code, stdout="spoof", stderr="",
+                    lease_id=request.lease_id,
+                    manifest_digest="b" * 64,
+                )
+                with mock.patch.object(client, "_request", side_effect=[
+                    (202, {"status": "accepted"}), (200, spoofed.to_dict()),
+                ]):
+                    with self.assertRaisesRegex(RemoteWorkerError, "manifest digest"):
+                        client.invoke(request)
 
     def test_auth_and_policy_configuration_are_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:

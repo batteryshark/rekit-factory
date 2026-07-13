@@ -369,7 +369,10 @@ class LocalRekitWorker:
             allow_dynamic=manifest.requires_permission,
             expected_manifest_digest=expected_digest,
         )
-        if result.exit_code == 0 and result.manifest_digest != expected_digest:
+        if (result.manifest_digest is not None
+                and result.manifest_digest != expected_digest):
+            raise ValueError("local worker result supplied a mismatched manifest attestation")
+        if result.exit_code == 0 and result.manifest_digest is None:
             raise ValueError("local worker result did not attest the expected manifest digest")
         return InvocationResult(
             invocation_id=request.invocation_id,
