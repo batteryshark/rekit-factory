@@ -586,6 +586,7 @@ class InvestigationController:
         invocation = None
         artifact_bytes: list[tuple[Any, bytes]] = []
         primary_error: Exception | None = None
+        terminal_result = False
         try:
             route = self.tool_router.select(
                 tool_id,
@@ -640,6 +641,7 @@ class InvestigationController:
                 lease_id=lease.lease_id,
             )
             result = await asyncio.to_thread(route.transport.invoke, invocation)
+            terminal_result = True
             _validate_invocation_result(invocation, result, route.capabilities.worker_id)
             for artifact in result.artifacts:
                 data = await asyncio.to_thread(
@@ -654,7 +656,10 @@ class InvestigationController:
             primary_error = exc
         finally:
             if route is not None and lease is not None:
-                if primary_error is not None and invocation is not None:
+                cleanup_allowed = True
+                if (primary_error is not None and invocation is not None
+                        and not terminal_result):
+                    cancellation_error: str | None = None
                     try:
                         cancelled = await asyncio.to_thread(
                             route.transport.cancel, invocation.invocation_id,
@@ -666,35 +671,48 @@ class InvestigationController:
                                      "invocationId": invocation.invocation_id,
                                      "workerId": lease.worker_id, "cancelled": cancelled},
                         )
+                        cleanup_allowed = cancelled
                     except Exception as cleanup_exc:
-                        primary_error = primary_error or cleanup_exc
-                for action, event_kind in (
-                    (route.transport.reset_lease, "worker.lease.reset"),
-                    (route.transport.teardown_lease, "worker.lease.teardown"),
-                ):
-                    try:
-                        state = await asyncio.to_thread(action, lease)
-                        _validate_lease_state(lease, state)
-                        expected_status = "ready" if event_kind.endswith("reset") else "closed"
-                        if state.status != expected_status:
-                            raise PermissionError(
-                                f"worker cleanup did not reach {expected_status} state"
-                            )
+                        cleanup_allowed = False
+                        cancellation_error = type(cleanup_exc).__name__
+                    if not cleanup_allowed:
                         ledger.event_log(
-                            ctx.state.run_id, event_kind, "Tool worker lease cleanup",
+                            ctx.state.run_id, "security.worker_cancellation_unconfirmed",
+                            "Tool worker cancellation was not confirmed; lease remains dirty",
                             payload={"leaseId": lease.lease_id,
-                                     "workerId": lease.worker_id, "status": state.status,
-                                     "generation": state.generation},
-                        )
-                    except Exception as cleanup_exc:
-                        primary_error = primary_error or cleanup_exc
-                        ledger.event_log(
-                            ctx.state.run_id, "security.worker_cleanup_failed",
-                            "Tool worker failed closed during cleanup",
-                            payload={"leaseId": lease.lease_id,
+                                     "invocationId": invocation.invocation_id,
                                      "workerId": lease.worker_id,
-                                     "errorType": type(cleanup_exc).__name__},
+                                     **({"errorType": cancellation_error}
+                                        if cancellation_error else {})},
                         )
+                if cleanup_allowed:
+                    for action, event_kind in (
+                        (route.transport.reset_lease, "worker.lease.reset"),
+                        (route.transport.teardown_lease, "worker.lease.teardown"),
+                    ):
+                        try:
+                            state = await asyncio.to_thread(action, lease)
+                            _validate_lease_state(lease, state)
+                            expected_status = "ready" if event_kind.endswith("reset") else "closed"
+                            if state.status != expected_status:
+                                raise PermissionError(
+                                    f"worker cleanup did not reach {expected_status} state"
+                                )
+                            ledger.event_log(
+                                ctx.state.run_id, event_kind, "Tool worker lease cleanup",
+                                payload={"leaseId": lease.lease_id,
+                                         "workerId": lease.worker_id, "status": state.status,
+                                         "generation": state.generation},
+                            )
+                        except Exception as cleanup_exc:
+                            primary_error = primary_error or cleanup_exc
+                            ledger.event_log(
+                                ctx.state.run_id, "security.worker_cleanup_failed",
+                                "Tool worker failed closed during cleanup",
+                                payload={"leaseId": lease.lease_id,
+                                         "workerId": lease.worker_id,
+                                         "errorType": type(cleanup_exc).__name__},
+                            )
         if primary_error is not None:
             exc = primary_error
             ledger.finish_tool_call(

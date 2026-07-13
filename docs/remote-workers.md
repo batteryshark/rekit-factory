@@ -120,8 +120,9 @@ loopback must terminate TLS with a pinned/private trust configuration or place t
 endpoint inside an authenticated tunnel. Token rotation, rate limiting, durable
 server-side event storage, target upload/content-hash verification,
 adapter-specific cancellation, and interactive attachment remain deployment work.
-Lease state is written atomically under the configured worker input root, so a
-restart preserves dirty and closed dispositions instead of silently reusing them.
+Lease state is written atomically under the configured worker input root. On
+restart every previously non-closed disposition is conservatively loaded as dirty;
+only closed remains closed.
 The
 in-memory HTTP proof must not be treated as the Windows worker proof or as an
 isolation boundary.
@@ -163,9 +164,12 @@ host or shared-filesystem path.
 
 Each dispatch derives a stable lease ID from the durable run/work/route binding.
 Setup is idempotent; dirty and closed dispositions require an explicit reset before
-invocation. Reset and teardown run after success, failure, cancellation, and
-timeout, with durable Muster audit events. Cleanup that cannot reach `ready` then
-`closed` fails the work item closed.
+invocation. Reset and teardown run after an observed terminal result or a confirmed
+cancellation, with durable Muster audit events. An unconfirmed cancellation leaves
+the lease dirty and performs no reset or teardown. The worker rejects reset and
+teardown while an invocation remains active, then permits idempotent cleanup after
+terminal completion (or process restart). Cleanup that cannot safely reach `ready`
+then `closed` fails the work item closed.
 
 The CLI composition root registers workers with repeated
 `--remote-worker-env <PREFIX>`. `<PREFIX>_URL` and `<PREFIX>_TOKEN` configure the

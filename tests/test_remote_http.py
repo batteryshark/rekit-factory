@@ -59,6 +59,8 @@ class FixtureWorker:
         self.requests: list[InvocationRequest] = []
         self.result_worker_id = "fixture-worker"
         self.artifact_data = b"fixture artifact"
+        self.started = threading.Event()
+        self.release: threading.Event | None = None
 
     def capabilities(self) -> WorkerCapabilities:
         return WorkerCapabilities(
@@ -71,6 +73,9 @@ class FixtureWorker:
 
     def invoke(self, request: InvocationRequest) -> InvocationResult:
         self.requests.append(request)
+        self.started.set()
+        if self.release is not None:
+            self.release.wait(timeout=5)
         return InvocationResult(
             invocation_id=request.invocation_id,
             run_id=request.run_id,
@@ -296,6 +301,45 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             with running_server(root) as (_, resumed):
                 self.assertEqual("dirty", resumed.setup_lease(lease).status)
                 self.assertEqual("ready", resumed.reset_lease(lease).status)
+
+    def test_ready_lease_is_demoted_to_dirty_after_server_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lease = WorkerLeaseRequest(
+                lease_id="lease-ready-restart", run_id="run-1", work_item_id="work-1",
+                worker_id="fixture-worker", route_sha256="a" * 64,
+            )
+            with running_server(root) as (_, client):
+                self.assertEqual("ready", client.setup_lease(lease).status)
+            with running_server(root) as (_, resumed):
+                self.assertEqual("dirty", resumed.setup_lease(lease).status)
+
+    def test_reset_is_rejected_while_invocation_is_active_then_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            with running_server(root) as (worker, client):
+                worker.release = threading.Event()
+                request = self.scoped_request(target, invocation_id="invoke-active")
+                lease = WorkerLeaseRequest(
+                    lease_id=request.lease_id, run_id=request.run_id,
+                    work_item_id=request.work_item_id, worker_id="fixture-worker",
+                    route_sha256="a" * 64,
+                )
+                self.assertEqual("ready", client.setup_lease(lease).status)
+                result: list[InvocationResult] = []
+                thread = threading.Thread(target=lambda: result.append(client.invoke(request)))
+                thread.start()
+                self.assertTrue(worker.started.wait(timeout=2))
+                with self.assertRaisesRegex(RemoteWorkerError, "active invocation"):
+                    client.reset_lease(lease)
+                worker.release.set()
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual("done", result[0].status)
+                self.assertEqual("ready", client.reset_lease(lease).status)
+                self.assertEqual("closed", client.teardown_lease(lease).status)
 
     def test_scope_is_required_even_for_offline_read_only_and_endpoint_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

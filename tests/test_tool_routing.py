@@ -450,9 +450,11 @@ class ToolRoutingTests(unittest.TestCase):
             self.assertEqual("failed", tool["status"])
             self.assertEqual([], result["artifacts"])
 
-    def test_failed_invocation_is_cancelled_reset_and_torn_down(self):
+    def test_unconfirmed_cancellation_leaves_lease_dirty_without_cleanup(self):
         class FailingTransport(FakeTransport):
             def invoke(self, request):
+                state = self.leases[request.lease_id]
+                self.leases[request.lease_id] = replace(state, status="dirty")
                 self.requests.append(request)
                 raise TimeoutError("deterministic timeout")
 
@@ -473,8 +475,19 @@ class ToolRoutingTests(unittest.TestCase):
             tool = next(item for item in result["workItems"]
                         if item["operation"] == "rekit-tool")
             self.assertEqual("failed", tool["status"])
-            self.assertEqual(["setup", "reset", "teardown"], remote.lifecycle)
+            self.assertEqual(["setup"], remote.lifecycle)
             self.assertEqual([remote.requests[0].invocation_id], remote.cancelled)
+            self.assertTrue(any(
+                event["kind"] == "security.worker_cancellation_unconfirmed"
+                for event in result["events"]
+            ))
+            lease = remote.leases[remote.requests[0].lease_id]
+            self.assertEqual("dirty", lease.status)
+            self.assertEqual("ready", remote.reset_lease(WorkerLeaseRequest(
+                lease_id=lease.lease_id, run_id=lease.run_id,
+                work_item_id=lease.work_item_id, worker_id=lease.worker_id,
+                route_sha256=lease.route_sha256,
+            )).status)
 
     def test_replacing_run_scope_with_another_valid_revision_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

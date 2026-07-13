@@ -71,6 +71,7 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
         self._lock = threading.Lock()
         self._lease_state_path = self.input_root / ".rekit-worker-leases.json"
         self._lease_states = self._load_lease_states()
+        self._active_leases: dict[str, str] = {}
         self._events: dict[str, list[WorkerEvent]] = {}
         self._results: dict[str, InvocationResult] = {}
         super().__init__(address, RemoteWorkerHTTPRequestHandler)
@@ -78,16 +79,6 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
     def submit(self, request: InvocationRequest) -> None:
         if request.lease_id is None:
             raise PermissionError("remote invocation requires an explicit worker lease")
-        with self._lock:
-            lease = self._lease_states.get(request.lease_id)
-            if lease is None or lease.status != "ready":
-                raise PermissionError("remote worker lease is not clean and ready")
-            if (lease.run_id, lease.work_item_id, lease.worker_id) != (
-                request.run_id, request.work_item_id, self.worker_capabilities.worker_id,
-            ):
-                raise PermissionError("remote invocation does not match leased authority")
-            self._lease_states[lease.lease_id] = replace(lease, status="dirty")
-            self._persist_lease_states_locked()
         if request.network_policy not in self.allowed_network_policies:
             raise PermissionError(
                 f"network policy {request.network_policy!r} is not enabled on this worker"
@@ -117,8 +108,20 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
             message="Invocation accepted by worker",
         )
         with self._lock:
+            lease = self._lease_states.get(request.lease_id)
+            if lease is None or lease.status != "ready":
+                raise PermissionError("remote worker lease is not clean and ready")
+            if (lease.run_id, lease.work_item_id, lease.worker_id) != (
+                request.run_id, request.work_item_id, worker_id,
+            ):
+                raise PermissionError("remote invocation does not match leased authority")
+            if request.lease_id in self._active_leases:
+                raise PermissionError("remote worker lease already has an active invocation")
             if request.invocation_id in self._events:
                 raise FileExistsError("invocation_id already exists")
+            self._lease_states[lease.lease_id] = replace(lease, status="dirty")
+            self._active_leases[lease.lease_id] = request.invocation_id
+            self._persist_lease_states_locked()
             self._events[request.invocation_id] = [accepted]
         threading.Thread(
             target=self._run_invocation,
@@ -170,6 +173,8 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
         )
         with self._lock:
             self._results[request.invocation_id] = result
+            if request.lease_id is not None:
+                self._active_leases.pop(request.lease_id, None)
 
     def _append_event(
         self, request: InvocationRequest, kind: str, message: str,
@@ -202,6 +207,11 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
             raise PermissionError("lease worker identity does not match endpoint")
         with self._lock:
             current = self._lease_states.get(request.lease_id)
+            active_invocation = self._active_leases.get(request.lease_id)
+        if action in {"reset", "teardown"} and active_invocation is not None:
+            raise PermissionError(
+                f"lease still has active invocation {active_invocation}"
+            )
         if action == "setup" and current is not None:
             expected = (request.run_id, request.work_item_id, request.worker_id,
                         request.route_sha256)
@@ -233,7 +243,11 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
         value = json.loads(self._lease_state_path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError("worker lease state file must contain an object")
-        return {key: WorkerLeaseState.from_dict(item) for key, item in value.items()}
+        states = {key: WorkerLeaseState.from_dict(item) for key, item in value.items()}
+        return {
+            key: (state if state.status == "closed" else replace(state, status="dirty"))
+            for key, state in states.items()
+        }
 
     def _persist_lease_states_locked(self) -> None:
         temporary = self._lease_state_path.with_suffix(".tmp")
