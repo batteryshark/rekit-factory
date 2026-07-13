@@ -30,6 +30,11 @@ class DossierNotReady(ValueError):
     pass
 
 
+_DOSSIER_ARTIFACT_KINDS = {
+    "proof-bundle", "proof-manifest", "proof-report", "proof-report-html", "proof-export",
+}
+
+
 def finding_state_sha256(memory: ProjectMemory, finding_id: str) -> str:
     finding = memory.findings[finding_id]
     value = {
@@ -88,17 +93,11 @@ def verify_published_dossier(run_dir: Path, dossier: dict[str, Any]):
     finding_id = dossier["findingId"]
     if finding_id not in project_memory.findings:
         raise DossierNotReady("published finding is absent from canonical memory")
-    scope = AuthorizedScope.from_dict(json.loads(
-        (run_dir / "scope.json").read_text(encoding="utf-8")
-    )).envelope
-    artifact_id = dossier["artifactIds"]["proof-bundle"]
+    run_id = dossier.get("runId") or run_dir.name
     with FactoryLedger(run_dir / "run.db") as ledger:
-        row = ledger.conn.execute(
-            "select path from artifacts where id=? and run_id=? and kind='proof-bundle'",
-            (artifact_id, dossier.get("runId") or run_dir.name),
-        ).fetchone()
-        if row is None:
-            raise DossierNotReady("published proof artifact is absent from the ledger")
+        scope = _run_bound_scope(run_dir, ledger, run_id)
+        artifacts = _verified_dossier_artifacts(run_dir, ledger, run_id, dossier)
+    row = artifacts["proof-bundle"]
     report = verify_bundle(
         Path(row["path"]), expected_scope_digest=scope.content_digest,
         expected_scope_revision=scope.revision,
@@ -210,9 +209,9 @@ class DossierPublisher:
         work = self._finding_work(finding)
         if not work:
             raise DossierNotReady("no ledger work is anchored to this finding")
-        scope = AuthorizedScope.from_dict(json.loads(
-            (self.paths.run_dir / "scope.json").read_text(encoding="utf-8")
-        )).envelope
+        scope = _run_bound_scope(
+            self.paths.run_dir, self.ledger, self.paths.run_id,
+        )
         run = self.ledger.get_run(self.paths.run_id)
         if run is None:
             raise DossierNotReady("dossier run is absent from the canonical ledger")
@@ -440,7 +439,7 @@ class DossierPublisher:
                     or not payload.get("toolId") or not payload.get("manifestDigest")):
                 continue
             call = self.ledger.conn.execute(
-                "select manifest_digest,status,exit_code from factory_tool_calls "
+                "select id,manifest_digest,status,exit_code from factory_tool_calls "
                 "where run_id=? and work_item_id=? and tool_id=? order by created_at desc",
                 (self.paths.run_id, item["id"], payload["toolId"]),
             ).fetchone()
@@ -456,6 +455,7 @@ class DossierPublisher:
                 provenance = metadata.get("provenance", {})
                 if (metadata.get("toolId") == payload["toolId"]
                         and provenance.get("work_item_id") == item["id"]
+                        and provenance.get("invocation_id") == call["id"]
                         and metadata.get("effectiveManifestDigest") == call["manifest_digest"]
                         and metadata.get("verifiedManifestDigest") == call["manifest_digest"]):
                     verified = metadata["verifiedManifestDigest"]
@@ -477,6 +477,59 @@ class DossierPublisher:
                 capability_id=f"rekit:{tool_id}", capability_version=authority_version,
             ))
         return tuple(result)
+
+
+def _run_bound_scope(run_dir: Path, ledger: FactoryLedger, run_id: str):
+    run = ledger.get_run(run_id)
+    if run is None:
+        raise DossierNotReady("dossier run is absent from the canonical ledger")
+    config = json.loads(run["config_json"])
+    expected = config.get("scope")
+    if not isinstance(expected, dict):
+        raise DossierNotReady("run has no pinned scope binding")
+    try:
+        scope = AuthorizedScope.from_dict(json.loads(
+            (run_dir / "scope.json").read_text(encoding="utf-8")
+        )).envelope
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise DossierNotReady("run-bound scope record is unavailable or malformed") from exc
+    actual = scope.public_dict()
+    if any(actual.get(name) != expected.get(name)
+           for name in ("scopeId", "revision", "digest")):
+        raise DossierNotReady("run-bound scope record changed after run creation")
+    return scope
+
+
+def _verified_dossier_artifacts(run_dir: Path, ledger: FactoryLedger, run_id: str,
+                                dossier: dict[str, Any]) -> dict[str, Any]:
+    artifact_ids = dossier.get("artifactIds")
+    if not isinstance(artifact_ids, dict) or set(artifact_ids) != _DOSSIER_ARTIFACT_KINDS:
+        raise DossierNotReady("published dossier artifact set is incomplete or malformed")
+    result = {}
+    root = run_dir.resolve(strict=True)
+    for kind in sorted(_DOSSIER_ARTIFACT_KINDS):
+        artifact_id = artifact_ids[kind]
+        row = ledger.conn.execute(
+            "select id,kind,path,sha256,size_bytes,metadata_json from artifacts "
+            "where id=? and run_id=? and kind=?",
+            (artifact_id, run_id, kind),
+        ).fetchone()
+        if row is None:
+            raise DossierNotReady(f"published dossier artifact {kind} is absent")
+        try:
+            metadata = json.loads(row["metadata_json"])
+            path = Path(row["path"]).resolve(strict=True)
+            path.relative_to(root)
+            data = path.read_bytes()
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise DossierNotReady(f"published dossier artifact {kind} is unsafe") from exc
+        if (metadata.get("manifestSha256") != dossier.get("manifestSha256")
+                or metadata.get("artifactIds") != artifact_ids):
+            raise DossierNotReady(f"published dossier artifact {kind} lost its ledger binding")
+        if len(data) != row["size_bytes"] or sha256(data).hexdigest() != row["sha256"]:
+            raise DossierNotReady(f"published dossier artifact {kind} changed after publication")
+        result[kind] = row
+    return result
 
 
 def _record(path: Path, kind: str, logical_path: str, media_type: str) -> dict[str, Any]:

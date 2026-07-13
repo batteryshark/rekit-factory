@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
+from hashlib import sha256
 import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -181,11 +182,11 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 artifact = next(
                     item for item in snapshot["artifacts"] if item["id"] == artifact_id
                 )
-                path = _contained_artifact_path(run_dir, artifact)
+                body = _verified_artifact_bytes(run_dir, artifact)
                 if kind == "proof-report-html":
-                    self._dossier_html(path.read_bytes())
+                    self._dossier_html(body)
                 else:
-                    self._download(path, artifact["logical_path"])
+                    self._download_bytes(body, artifact["logical_path"])
                 return
             if (len(parts) == 5 and parts[:2] == ["api", "runs"]
                     and parts[3] == "artifacts"):
@@ -370,6 +371,17 @@ class FactoryHandler(BaseHTTPRequestHandler):
             while chunk := stream.read(64 * 1024):
                 self.wfile.write(chunk)
 
+    def _download_bytes(self, body: bytes, logical_path: str) -> None:
+        filename = Path(logical_path).name.replace('"', "") or "artifact.bin"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _static(self, body: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -427,6 +439,14 @@ def _contained_artifact_path(run_dir: Path, artifact: dict[str, Any]) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"artifact file is unavailable: {artifact['logical_path']}")
     return path
+
+
+def _verified_artifact_bytes(run_dir: Path, artifact: dict[str, Any]) -> bytes:
+    path = _contained_artifact_path(run_dir, artifact)
+    data = path.read_bytes()
+    if len(data) != artifact["size_bytes"] or sha256(data).hexdigest() != artifact["sha256"]:
+        raise DossierNotReady("published dossier artifact changed after verification")
+    return data
 
 
 def _run_dirs(storage_root: Path) -> list[Path]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -187,7 +188,9 @@ def _published_fixture(tmp_path: Path, *, decoy_target_first: bool = False):
                 "toolId": "fixture-reader",
                 "effectiveManifestDigest": manifest.effective_manifest_digest,
                 "verifiedManifestDigest": manifest.effective_manifest_digest,
-                "provenance": {"work_item_id": tool_work},
+                "provenance": {
+                    "work_item_id": tool_work, "invocation_id": call_id,
+                },
             },
         )
         ledger.set_work_status(tool_work, "done", result={"observation": "OBSERVED:hello"})
@@ -298,6 +301,25 @@ def test_dossier_rejects_incomplete_or_unattested_finding_tool_calls(tmp_path):
             publisher._build_manifest(memory, "f-fixture")
 
 
+def test_dossier_attestation_must_match_the_exact_completed_invocation(tmp_path):
+    _controller, paths, _dossier, _snapshot, _unrelated, rekit = _published_fixture(tmp_path)
+    with FactoryLedger(paths.db_path) as ledger:
+        row = ledger.conn.execute(
+            "select id,metadata_json from artifacts where kind='tool-output'"
+        ).fetchone()
+        metadata = json.loads(row["metadata_json"])
+        metadata["provenance"]["invocation_id"] = "tool-an-older-call"
+        ledger.conn.execute(
+            "update artifacts set metadata_json=? where id=?",
+            (json.dumps(metadata, sort_keys=True), row["id"]),
+        )
+        ledger.conn.commit()
+        with pytest.raises(DossierNotReady, match="attestation"):
+            DossierPublisher(paths, ledger, rekit)._build_manifest(
+                _project_memory_log(paths).replay(), "f-fixture",
+            )
+
+
 def test_generic_snapshot_does_not_rehash_published_dossiers(tmp_path, monkeypatch):
     controller, paths, _dossier, _snapshot, _unrelated, _rekit = _published_fixture(tmp_path)
     monkeypatch.setattr(
@@ -335,6 +357,42 @@ def test_resealed_dossier_cannot_replace_the_published_content_identity(tmp_path
         bundle, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ) + "\n")
 
+    with FactoryLedger(paths.db_path) as ledger:
+        published = dossier_list(ledger, paths.run_id, run_dir=paths.run_dir)
+    assert published[0]["verified"] is False
+    assert published[0]["verificationStatus"] == "stale-or-invalid"
+
+
+@pytest.mark.parametrize("kind", ["proof-report-html", "proof-export"])
+def test_modified_published_projection_or_export_invalidates_the_dossier(tmp_path, kind):
+    _controller, paths, dossier, _snapshot, _unrelated, _rekit = _published_fixture(tmp_path)
+    with FactoryLedger(paths.db_path) as ledger:
+        artifact = ledger.conn.execute(
+            "select path from artifacts where id=? and run_id=? and kind=?",
+            (dossier["artifactIds"][kind], paths.run_id, kind),
+        ).fetchone()
+        Path(artifact["path"]).write_bytes(Path(artifact["path"]).read_bytes() + b"tampered")
+        published = dossier_list(ledger, paths.run_id, run_dir=paths.run_dir)
+    assert published[0]["verified"] is False
+    assert published[0]["verificationStatus"] == "stale-or-invalid"
+
+
+def test_replaced_scope_file_cannot_change_the_run_pinned_dossier_scope(tmp_path):
+    _controller, paths, _dossier, _snapshot, _unrelated, _rekit = _published_fixture(tmp_path)
+    authorized = AuthorizedScope.from_dict(json.loads(
+        (paths.run_dir / "scope.json").read_text()
+    ))
+    replacement_envelope = replace(authorized.envelope, scope_id="scope-replaced")
+    replacement = AuthorizedScope(
+        replacement_envelope,
+        replace(
+            authorized.approval, scope_id=replacement_envelope.scope_id,
+            content_digest=replacement_envelope.content_digest,
+        ),
+    )
+    (paths.run_dir / "scope.json").write_text(json.dumps(
+        replacement.to_dict(), indent=2, sort_keys=True,
+    ) + "\n")
     with FactoryLedger(paths.db_path) as ledger:
         published = dossier_list(ledger, paths.run_id, run_dir=paths.run_dir)
     assert published[0]["verified"] is False
