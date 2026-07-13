@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="dark light">
   <title>Rekit Factory · Mission Control</title>
   <link rel="stylesheet" href="/ui/mission-control.css">
 </head>
@@ -11,25 +11,26 @@
 <div class="shell">
   <aside class="rail" aria-label="Primary navigation">
     <div class="brand" aria-label="Rekit Factory"><span>R</span><i></i></div>
-    <button class="nav active" data-view="fleet" aria-label="Mission Control"><span class="nav-icon">◈</span><span class="tip">Mission Control</span></button>
-    <button class="nav" data-view="inbox" aria-label="Decision Inbox"><span class="nav-icon">◇</span><span class="badge" id="inboxBadge"></span><span class="tip">Decision Inbox</span></button>
-    <button class="nav" data-view="newrun" aria-label="New Run"><span class="nav-icon">+</span><span class="tip">New Run</span></button>
-    <button class="nav" data-view="tools" aria-label="Tools and Models"><span class="nav-icon">☷</span><span class="tip">Tools &amp; Models</span></button>
+    <button class="nav active" data-view="fleet" data-icon="grid" aria-label="Mission Control"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span><span class="tip">Mission Control</span></button>
+    <button class="nav" data-view="inbox" data-icon="message" aria-label="Decision Inbox"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h16v11H8l-4 3z"/><path d="M8 10h8M8 13h5"/></svg></span><span class="badge" id="inboxBadge"></span><span class="tip">Decision Inbox</span></button>
+    <button class="nav" data-view="newrun" data-icon="plus" aria-label="New Run"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 5v14M5 12h14"/></svg></span><span class="tip">New Run</span></button>
+    <button class="nav" data-view="tools" data-icon="wrench" aria-label="Tools and Models"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.3 2.3-2-2z"/></svg></span><span class="tip">Tools &amp; Models</span></button>
     <div class="rail-spacer"></div>
-    <button class="nav" data-view="settings" aria-label="Settings"><span class="nav-icon">∷</span><span class="tip">Settings</span></button>
+    <button class="nav" data-view="settings" data-icon="settings" aria-label="Settings"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg></span><span class="tip">Settings</span></button>
   </aside>
   <main class="main">
     <header class="topbar">
       <div class="crumb"><span>REKIT</span><b>/</b><span>FACTORY</span><b>/</b><strong id="crumb">MISSION CONTROL</strong></div>
       <div class="top-spacer"></div>
       <div class="health"><i></i><span id="healthText">connecting</span></div>
-      <button class="btn restart-btn" id="restartService" type="button" title="Restart the local Factory service and reload this page"><span aria-hidden="true">↻</span> Restart UI</button>
-      <button class="btn primary" data-view="newrun">+ New Run</button>
+      <button class="iconbtn theme-toggle" id="themeToggle" data-icon="theme" type="button" aria-label="Switch to light theme" title="Switch to light theme"><span class="theme-sun" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-moon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2z"/></svg></span></button>
+      <button class="btn restart-btn" id="restartService" data-icon="refresh" type="button" title="Restart the local Factory service and reload this page"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg></span> Restart UI</button>
+      <button class="btn primary" data-view="newrun" data-icon="plus"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>New Run</button>
     </header>
     <div class="content">
       <section class="view active" id="view-fleet">
         <div class="view-head"><div><div class="eyebrow">OPERATIONS</div><h1>Mission Control</h1><div class="sub" id="fleetSub">durable investigations across the factory</div></div><div class="grow"></div><div class="stats" id="stats"></div></div>
-        <div class="fleet-controls"><div class="filters" id="filters"></div><label class="fleet-search" for="fleetSearch"><span aria-hidden="true">⌕</span><input id="fleetSearch" type="search" placeholder="Search target, goal, model…" autocomplete="off"></label></div><div class="fleet-health" id="fleetHealth"></div><div class="fleet" id="fleet"></div>
+        <div class="fleet-controls"><div class="filters" id="filters"></div><label class="fleet-search" for="fleetSearch"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input id="fleetSearch" type="search" placeholder="Search target, goal, model…" autocomplete="off"></label></div><div class="fleet-health" id="fleetHealth"></div><div class="fleet" id="fleet"></div>
       </section>
       <section class="view" id="view-inbox">
         <div class="view-head"><div><div class="eyebrow">HUMAN GATE</div><h1 id="inboxHeading" tabindex="-1">Decision Inbox</h1><div class="sub">permission and direction questions waiting for your call</div></div></div>

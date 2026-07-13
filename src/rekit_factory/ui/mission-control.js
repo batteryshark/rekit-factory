@@ -68,6 +68,39 @@ const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
 })[character]);
+const THEME_KEY = "rekit-factory-theme";
+const REFRESH_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>`;
+
+function storedTheme() {
+  try {
+    const value = localStorage.getItem(THEME_KEY);
+    return value === "light" || value === "dark" ? value : null;
+  } catch (_error) { return null; }
+}
+
+function applyTheme(theme, {persist = false} = {}) {
+  const resolved = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = resolved;
+  const toggle = $("themeToggle"), next = resolved === "dark" ? "light" : "dark";
+  if (toggle) {
+    toggle.setAttribute("aria-label", `Switch to ${next} theme`);
+    toggle.title = `Switch to ${next} theme`;
+  }
+  if (persist) {
+    try { localStorage.setItem(THEME_KEY, resolved); } catch (_error) { /* Theme persistence is optional. */ }
+  }
+  return resolved;
+}
+
+function initializeTheme() {
+  const stored = storedTheme();
+  const system = window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  return applyTheme(stored || system);
+}
+
+function toggleTheme() {
+  return applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light", {persist: true});
+}
 
 async function api(path, options) {
   const response = await fetch(path, {headers: {"Content-Type": "application/json"}, ...options});
@@ -148,7 +181,7 @@ function setRestartState(restarting) {
   document.body.classList.toggle("service-restarting", restarting);
   document.querySelectorAll("#restartService, [data-restart-service]").forEach(button => {
     button.disabled = restarting || state.config?.restartAvailable === false;
-    button.innerHTML = restarting ? `<span class="restart-spinner" aria-hidden="true">↻</span> Restarting…` : `<span aria-hidden="true">↻</span> ${button.id === "restartService" ? "Restart UI" : "Restart UI service"}`;
+    button.innerHTML = restarting ? `<span class="restart-spinner" aria-hidden="true">${REFRESH_ICON}</span> Restarting…` : `<span aria-hidden="true">${REFRESH_ICON}</span> ${button.id === "restartService" ? "Restart UI" : "Restart UI service"}`;
   });
   if (restarting) $("healthText").textContent = "restarting service";
 }
@@ -219,6 +252,7 @@ function activateDetailTab(tab, {focus = false} = {}) {
 }
 
 function activate(element) {
+  if (element.closest("#themeToggle")) { toggleTheme(); return true; }
   const restart = element.closest("#restartService, [data-restart-service]");
   if (restart) { restartService(); return true; }
   const view = element.closest("[data-view]");
@@ -332,10 +366,20 @@ function elapsedLabel(run, now = Date.now()) {
   return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 }
 
+const TARGET_ICONS = {
+  TREE: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7h7l2 2h9v10H3z"/><path d="M7 13h10M7 16h7"/></svg>`,
+  PE: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M9 9v11"/></svg>`,
+  APK: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 18h4M9 5h6"/></svg>`,
+  JAR: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 3h8M9 3v4l-3 4v8h12v-8l-3-4V3"/><path d="M7 13h10"/></svg>`,
+  ELF: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 12h7M9 16h7"/></svg>`,
+  BIN: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9v6M11 9h3v6h-3zM17 9v6"/></svg>`,
+};
+
 function targetKind(target) {
   const name = target.split("/").pop() || "target", suffix = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
   const known = {exe: "PE", dll: "PE", apk: "APK", ipa: "IPA", asar: "ASAR", zip: "ZIP", jar: "JAR", wasm: "WASM", elf: "ELF", dylib: "MACH"};
-  return {label: known[suffix] || (suffix ? suffix.slice(0, 4).toUpperCase() : "TREE"), icon: suffix ? "◇" : "⌘"};
+  const label = known[suffix] || (suffix ? suffix.slice(0, 4).toUpperCase() : "TREE");
+  return {label, icon: TARGET_ICONS[label] || TARGET_ICONS.BIN};
 }
 
 function renderFleet() {
@@ -857,4 +901,5 @@ async function boot() {
   catch (error) { toast(error.message, true); }
 }
 
+initializeTheme();
 boot();
