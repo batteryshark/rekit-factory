@@ -163,6 +163,31 @@ create table if not exists factory_knowledge_references (
 );
 create index if not exists idx_factory_knowledge_refs_run
     on factory_knowledge_references(run_id, selected_at);
+
+create table if not exists factory_notification_outbox (
+    id                text primary key,
+    dedupe_key        text not null unique,
+    run_id            text not null,
+    kind              text not null,
+    severity          text not null,
+    entity_type       text not null,
+    entity_id         text not null,
+    payload_json      text not null,
+    payload_sha256    text not null,
+    status            text not null,
+    attempt_count     integer not null default 0,
+    next_attempt_at   text,
+    lease_token       text,
+    lease_expires_at  text,
+    last_error_code   text,
+    created_at        text not null,
+    updated_at        text not null,
+    sent_at           text,
+    acknowledged_at   text,
+    superseded_at     text
+);
+create index if not exists idx_factory_notification_outbox_due
+    on factory_notification_outbox(status, next_attempt_at, created_at);
 """
 
 

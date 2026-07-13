@@ -188,6 +188,135 @@ def test_restart_at_every_boundary_applies_one_execution_recommendation_and_term
     assert len(operations) == len({row[0] for row in operations})
 
 
+def test_simulated_overnight_campaign_restarts_across_four_epochs_exactly_once(tmp_path):
+    """Complement the single-epoch crash matrix with a complete multi-epoch run."""
+    path = tmp_path / "overnight.db"
+    parent = contract()
+    work_ids = ("recon-a", "recon-b", "hypothesis-a", "validation-a")
+    totals = (
+        CanonicalOutcomeTotals(2_000, 0, 0),
+        CanonicalOutcomeTotals(4_000, 0, 0, ("artifact-proof",)),
+        CanonicalOutcomeTotals(6_000, 1, 0, ("artifact-proof",)),
+        COMPLETE_TOTALS,
+    )
+    progress = (
+        (signal("coverage-moved", "coverage-1", "1"),),
+        (signal("coverage-moved", "coverage-2", "2"),
+         signal("material-evidence", "artifact-proof", "3")),
+        (signal("coverage-moved", "coverage-3", "4"),
+         signal("hypothesis-resolved", "hypothesis-proof", "5")),
+        (signal("coverage-moved", "coverage-4", "6"),
+         signal("finding-reproduced", "finding-proof", "7")),
+    )
+    phases = ("recon", "recon", "hypothesis", "validation")
+
+    def overnight_script(request: CampaignRunRequest) -> EpochExecution:
+        index = request.epoch.ordinal - 1
+        assert request.epoch.work_ids == (work_ids[index],)
+        return execution(
+            request,
+            progress=progress[index],
+            next_actions=(() if index == 3 else (work_ids[index + 1],)),
+        )
+
+    runner = ScriptedRunner(overnight_script)
+    store = CampaignPersistence(path)
+    controller = CampaignController(
+        store, runner, owner_id="overnight-worker", fault_injector=FailOnce("launched"),
+    )
+    controller.start(parent)
+    epoch = first_epoch(parent, (work_ids[0],))
+    with pytest.raises(CampaignControllerInterrupted, match="launched"):
+        controller.launch(epoch, ResourceUsage(work_items=1, cost_units=2))
+    store.close()
+
+    store = CampaignPersistence(path)
+    CampaignController(store, runner, owner_id="overnight-worker").launch(
+        epoch, ResourceUsage(work_items=1, cost_units=2),
+    )
+    store.close()
+
+    crash_points = (
+        "execution-staged", "checkpointed", "recommendation-staged", "health-recorded",
+    )
+    known_digests: tuple[str, ...] = ()
+    for index, crash_point in enumerate(crash_points):
+        store = CampaignPersistence(path)
+        current = store.campaign(parent.campaign_id)
+        current_epoch_id = current.current_epoch_id
+        current_epoch = store.conn.execute(
+            "select ordinal from factory_campaign_epochs where epoch_id=?",
+            (current_epoch_id,),
+        ).fetchone()
+        assert current_epoch["ordinal"] == index + 1
+        controller = CampaignController(
+            store, runner, owner_id="overnight-worker",
+            fault_injector=FailOnce(crash_point),
+        )
+        kwargs = {
+            "phase": phases[index],
+            "totals": totals[index],
+            "previous_totals": (CanonicalOutcomeTotals() if index == 0 else totals[index - 1]),
+            "known_progress_digests": known_digests,
+        }
+        with pytest.raises(CampaignControllerInterrupted, match=crash_point):
+            controller.step(parent.campaign_id, **kwargs)
+        store.close()
+
+        # A fresh controller first reconciles durable work.  Early crashes still need the
+        # same exact step; later crashes finish solely from the staged recommendation.
+        store = CampaignPersistence(path)
+        restarted = CampaignController(store, runner, owner_id="overnight-worker")
+        snapshot = restarted.recover(parent.campaign_id)
+        if snapshot.current_epoch_id == current_epoch_id and snapshot.status in {
+            "running", "waiting",
+        }:
+            snapshot = restarted.step(parent.campaign_id, **kwargs)
+        expected_status = "completed" if index == 3 else "running"
+        assert snapshot.status == expected_status
+        store.close()
+        known_digests += tuple(item.material_digest for item in progress[index])
+
+    store = CampaignPersistence(path)
+    final = CampaignController(store, runner, owner_id="overnight-worker").recover(
+        parent.campaign_id,
+    )
+    assert final.status == "completed"
+    assert final.terminal is not None
+    assert final.terminal.reason_code == "completion-criteria-satisfied"
+    assert [request.epoch.work_ids[0] for request in runner.calls] == list(work_ids)
+    assert [request.epoch.ordinal for request in runner.calls] == [1, 2, 3, 4]
+
+    controller_rows = store.conn.execute(
+        "select recommendation_applied,factory_run_id from "
+        "factory_campaign_controller_epochs where campaign_id=? order by rowid",
+        (parent.campaign_id,),
+    ).fetchall()
+    assert [(row["recommendation_applied"], row["factory_run_id"])
+            for row in controller_rows] == [
+        (1, "factory-run-1"), (1, "factory-run-2"),
+        (1, "factory-run-3"), (1, "factory-run-4"),
+    ]
+    assert store.conn.execute(
+        "select count(*) from factory_campaign_epochs where campaign_id=?",
+        (parent.campaign_id,),
+    ).fetchone()[0] == 4
+    assert store.conn.execute(
+        "select count(*) from factory_campaign_checkpoints where campaign_id=?",
+        (parent.campaign_id,),
+    ).fetchone()[0] == 4
+    assert store.conn.execute(
+        "select count(*) from factory_campaign_health where campaign_id=?",
+        (parent.campaign_id,),
+    ).fetchone()[0] == 4
+    operations = store.conn.execute(
+        "select operation_id from factory_campaign_events where campaign_id=?",
+        (parent.campaign_id,),
+    ).fetchall()
+    assert len(operations) == len({row[0] for row in operations})
+    assert store.rebuild_projection(parent.campaign_id).matches_live
+
+
 def test_reasoned_outcomes_remain_distinct_and_handoffs_preserve_policy_reason(tmp_path):
     store = CampaignPersistence(tmp_path / "campaign.db")
     config = CampaignPolicyConfig(no_novelty_ask_threshold=2, no_novelty_stop_threshold=4)
