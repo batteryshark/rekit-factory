@@ -27,6 +27,7 @@ htmlcov/
 /rekit-demo/
 /run-output/
 /.rekit-factory-live/
+/.factory/
 
 # Full-res logo master — keep local; only the resized rekit-factory-logo.png is published
 /rekit-factory-logo-source.png
