@@ -5,7 +5,7 @@ const {webcrypto} = require("node:crypto");
 const {
   canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker,
   decodeSemanticEnvelope, eventStreamUrl, isCurrentEventStream, latestEventId,
-  projectionView, semanticSha256,
+  projectionView, reportFacets, semanticSha256,
 } = require("../src/rekit_factory/ui/mission-outcomes.js");
 
 const empty = {
@@ -147,6 +147,14 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
   assert.equal(latestEventId([{id: "event-a"}, {id: "event-b"}]), "event-b");
   assert.equal(eventStreamUrl("run/a"), "/api/runs/run%2Fa/events");
   assert.equal(eventStreamUrl("run/a", "event ?#2"), "/api/runs/run%2Fa/events?after=event%20%3F%232");
+  const report = entity("report", "work-a", {
+    publication: facet("rendered", "factory-report-renderer", {terminal: true}),
+  }, {entityType: "work-item", entityId: "work-a"});
+  assert.deepEqual(reportFacets({facets: report.facets}).map(value => [value.name, value.state]), [
+    ["execution", "not-applicable"], ["completion", "not-applicable"],
+    ["disposition", "not-applicable"], ["validation", "not-applicable"],
+    ["acceptance", "not-applicable"], ["publication", "rendered"],
+  ]);
 
   console.log("mission outcomes behavior: ok");
 })().catch(error => {

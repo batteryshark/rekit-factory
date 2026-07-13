@@ -181,9 +181,23 @@ the finding's completion, disposition, validation, or acceptance facets.
 
 The initial projection covers runs, workers, work items, hypotheses, findings, reproduction
 validations, proof bundles, and pending or finding-scoped operator decisions. Campaign and
-archive entities will join this vocabulary when their canonical event sources land. Reports
-remain ordinary work results in this slice; report rendering does not acquire independent
-outcome authority.
+archive entities will join this vocabulary when their canonical event sources land.
+
+## Canonical worker reports
+
+A committed structured worker result projects a distinct `report` entity whose stable ID is
+the source work-item ID and whose parent is that `work-item`. Its publication facet is
+`rendered`, terminal, and owned by `factory-report-renderer`. Execution, completion,
+disposition, validation, and acceptance remain not-applicable: report rendering never implies
+that the work item completed, a finding was validated, or an operator accepted anything.
+
+The reports API returns the source projection's schema version, vocabulary version, and
+`semanticSha256`, plus each report's canonical identity, parent, facets, and diagnostics
+alongside the rendered summary, observations, and next actions. A model-authored `status_update` is exposed
+only as `workerNote`; Mission Control labels it **Worker note (unverified)** and HTML-escapes it.
+It is never parsed as an outcome transition. The full rebuild and selective incremental fold
+derive the same report entity from the same canonical work-item result and remove it together
+when the result stops being report-shaped or its work item is removed.
 
 The generic/SSE snapshot deliberately uses the cheap `dossier_list` publication projection.
 Every listed dossier therefore has `publication.state: published`, owned by the dossier
@@ -237,6 +251,6 @@ This bounds stale-client recovery without treating an event ID as semantic ident
 a foreign cursor to skip current-run events. The old-stream identity and request-generation
 guards remain authoritative when delayed responses race a replacement stream.
 
-The in-memory incremental reference is not a production cache, durable accumulator, SSE source,
-or consumer migration. Mission Control, exports, notifications, and reports continue using
+The in-memory incremental reference is not a production cache, durable accumulator, or SSE
+source. Reports now consume this canonical vocabulary; exports and notifications continue using
 their existing paths until a separate production design adopts the proven parity boundary.

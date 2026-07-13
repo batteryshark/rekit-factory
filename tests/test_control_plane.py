@@ -638,8 +638,28 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertIn("GOAL: Exercise the API permission path", completed["memoryContext"])
                 self.assertEqual("none", completed["meta"]["scope"]["networkMode"])
                 reports = self._request(base + f"/api/runs/{run_id}/reports")
+                self.assertEqual(1, reports["schemaVersion"])
+                self.assertEqual("factory-outcomes/v1", reports["vocabularyVersion"])
+                self.assertEqual(
+                    completed["outcomeProjection"]["semanticSha256"],
+                    reports["semanticSha256"],
+                )
                 self.assertEqual(1, len(reports["reports"]))
-                self.assertEqual("analyst", reports["reports"][0]["role"])
+                report = reports["reports"][0]
+                self.assertEqual("analyst", report["role"])
+                self.assertEqual({
+                    "entityType": "report", "entityId": report["id"],
+                    "parent": {"entityType": "work-item", "entityId": report["id"]},
+                }, report["identity"])
+                self.assertEqual("rendered", report["facets"]["publication"]["state"])
+                self.assertEqual(
+                    "not-applicable", report["facets"]["validation"]["state"],
+                )
+                self.assertEqual(
+                    "not-applicable", report["facets"]["acceptance"]["state"],
+                )
+                self.assertEqual("analyst review complete", report["workerNote"])
+                self.assertNotIn("status", report)
                 self.assertEqual(1, len(completed["artifacts"]))
                 artifact = completed["artifacts"][0]
                 with urlopen(

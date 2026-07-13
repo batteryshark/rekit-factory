@@ -7,6 +7,7 @@ import pytest
 
 from rekit_factory.ranges import (
     DeterministicFakeRangeAdapter,
+    DeterministicManifestRangeAdapter,
     ImmutableInputV1,
     InjectedRangeFailure,
     NodeHandleV1,
@@ -32,6 +33,9 @@ from rekit_factory.ranges import (
     canonical_json, canonical_sha256,
     require_range_transition,
 )
+
+
+ADAPTER_TYPES = (DeterministicFakeRangeAdapter, DeterministicManifestRangeAdapter)
 
 
 def _handle(state, node_id="analyzer"):
@@ -305,6 +309,82 @@ def test_two_node_offline_lifecycle_records_outputs_resets_and_destroys():
     assert adapter.destroy("destroy-2", spec.range_id) == destroyed
     with pytest.raises(RangeStateError, match="not ready"):
         adapter.execute(_work(reset, operation_id="work-after-destroy"))
+
+
+@pytest.mark.parametrize("adapter_type", ADAPTER_TYPES)
+def test_v1_lifecycle_checkpoint_contract_has_two_adapter_implementations(adapter_type):
+    template, spec = benign_two_node_fixture(
+        range_id=f"range-parity-{adapter_type.HANDLE_PREFIX}",
+    )
+    adapter = adapter_type(now=spec.requested_at)
+    ready = adapter.provision("provision-parity", template, spec)
+    first = adapter.execute(_work(ready, operation_id="work-parity"))
+
+    restarted = adapter_type.from_checkpoint(adapter.checkpoint())
+    assert restarted.execute(_work(ready, operation_id="work-parity")) == first
+    reset = restarted.reset("reset-parity", spec.range_id)
+    assert reset.status == "ready" and reset.generation == 2
+    assert restarted.outputs(spec.range_id) == ()
+    assert restarted.evidence(spec.range_id) == (first,)
+    with pytest.raises(RangeAccessError, match="range generation"):
+        restarted.execute(_work(
+            reset,
+            operation_id="work-stale-after-reset",
+            handle=_handle(ready),
+        ))
+
+    second = restarted.execute(_work(reset, operation_id="work-after-reset"))
+    assert second.generation == 2
+    destroyed = restarted.destroy("destroy-parity", spec.range_id)
+    assert destroyed.status == "destroyed"
+    assert restarted.outputs(spec.range_id) == ()
+    assert restarted.evidence(spec.range_id) == (first, second)
+    assert adapter_type.from_checkpoint(restarted.checkpoint()).destroy(
+        "destroy-parity", spec.range_id,
+    ) == destroyed
+
+
+def test_second_adapter_has_distinct_handles_and_evidence_identity():
+    template, spec = benign_two_node_fixture(range_id="range-distinct-adapters")
+    fake = DeterministicFakeRangeAdapter(now=spec.requested_at)
+    manifest = DeterministicManifestRangeAdapter(now=spec.requested_at)
+    fake_ready = fake.provision("provision-distinct", template, spec)
+    manifest_ready = manifest.provision("provision-distinct", template, spec)
+
+    assert fake_ready.range_handle != manifest_ready.range_handle
+    assert fake_ready.node_handles != manifest_ready.node_handles
+    fake_output = fake.execute(_work(fake_ready, operation_id="work-distinct"))
+    manifest_output = manifest.execute(_work(manifest_ready, operation_id="work-distinct"))
+    assert fake_output.sha256 != manifest_output.sha256
+    assert fake_output.size != manifest_output.size
+
+
+@pytest.mark.parametrize("adapter_type", ADAPTER_TYPES)
+def test_v1_failure_checkpoint_reset_and_destroy_recovery_are_adapter_invariant(adapter_type):
+    template, spec = benign_two_node_fixture(
+        range_id=f"range-failure-parity-{adapter_type.HANDLE_PREFIX}",
+    )
+    adapter = adapter_type(now=spec.requested_at)
+    ready = adapter.provision("provision-failure-parity", template, spec)
+    failed_work = _work(ready, operation_id="work-failure-parity")
+    adapter.inject_failure("in-use")
+    with pytest.raises(InjectedRangeFailure, match="in-use"):
+        adapter.execute(failed_work)
+
+    restarted = adapter_type.from_checkpoint(adapter.checkpoint())
+    with pytest.raises(InjectedRangeFailure, match="in-use"):
+        restarted.execute(failed_work)
+    recovered = restarted.reset("reset-failure-parity", spec.range_id)
+    assert recovered.status == "ready" and recovered.generation == 2
+
+    restarted.inject_failure("destroyed")
+    with pytest.raises(InjectedRangeFailure, match="destroyed"):
+        restarted.destroy("destroy-failure-parity", spec.range_id)
+    assert restarted.state(spec.range_id).status == "failed"
+    final = adapter_type.from_checkpoint(restarted.checkpoint())
+    with pytest.raises(InjectedRangeFailure, match="destroyed"):
+        final.destroy("destroy-failure-parity", spec.range_id)
+    assert final.destroy("destroy-recovery-parity", spec.range_id).status == "destroyed"
 
 
 def test_exact_retry_and_checkpoint_restart_do_not_duplicate_ranges_or_operations():

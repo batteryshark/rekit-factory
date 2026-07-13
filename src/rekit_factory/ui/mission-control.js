@@ -23,18 +23,16 @@ const MissionObservability = (() => {
   function reports(snapshot) {
     if (Array.isArray(snapshot.workerReports)) return snapshot.workerReports.map(report => ({
       role: report.role, title: report.title, summary: report.summary,
-      observations: report.observations || [], next: report.nextActions || [], status: report.status,
+      observations: report.observations || [], next: report.nextActions || [],
+      workerNote: report.workerNote, identity: report.identity,
+      facets: MissionOutcomes.reportFacets(report),
     }));
-    return (snapshot.workItems || []).flatMap(item => {
-      const result = item.result;
-      if (!result || typeof result !== "object" || !first(result, "summary", "observations", "next_actions", "nextActions")) return [];
-      return [{role: first(item.payload, "role", "workerRole") || item.category || "worker", title: item.title || "Worker report", summary: result.summary || "Report completed.", observations: result.observations || [], next: first(result, "next_actions", "nextActions") || [], status: first(result, "status_update", "statusUpdate") || item.state_label || item.status}];
-    });
+    return [];
   }
   function renderReports(snapshot) {
     const items = reports(snapshot);
     if (!items.length) return `<div class="empty compact"><b>No worker reports yet</b>Completed structured worker results will collect here.</div>`;
-    return items.map(report => `<article class="report-card"><header><div><span class="report-role">${safe(report.role)}</span><h3>${safe(report.title)}</h3></div><span class="report-status">${safe(report.status)}</span></header><p>${safe(report.summary)}</p>${report.observations.length ? `<div class="report-section"><b>Observations</b><ul>${report.observations.map(item => `<li>${safe(item)}</li>`).join("")}</ul></div>` : ""}${report.next.length ? `<div class="report-section next"><b>Next actions</b><ul>${report.next.map(item => `<li>${safe(item)}</li>`).join("")}</ul></div>` : ""}</article>`).join("");
+    return items.map(report => `<article class="report-card"><header><div><span class="report-role">${safe(report.role)}</span><h3>${safe(report.title)}</h3><small>${safe(report.identity?.entityType)} · ${safe(report.identity?.entityId)}</small></div></header><div class="report-section"><b>Canonical facets</b><div class="report-facets">${report.facets.map(facet => `<span class="report-status">${safe(facet.name)}: ${safe(facet.state)}</span>`).join("")}</div></div><p>${safe(report.summary)}</p>${report.workerNote ? `<div class="report-section"><b>Worker note (unverified)</b><p>${safe(report.workerNote)}</p></div>` : ""}${report.observations.length ? `<div class="report-section"><b>Observations</b><ul>${report.observations.map(item => `<li>${safe(item)}</li>`).join("")}</ul></div>` : ""}${report.next.length ? `<div class="report-section next"><b>Next actions</b><ul>${report.next.map(item => `<li>${safe(item)}</li>`).join("")}</ul></div>` : ""}</article>`).join("");
   }
   const tokenValue = (usage, names) => { for (const name of names) if (usage?.[name] !== undefined) return number(usage[name]); return 0; };
   function usageRows(snapshot) {

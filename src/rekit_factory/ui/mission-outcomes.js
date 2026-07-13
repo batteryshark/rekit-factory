@@ -168,6 +168,11 @@
     return cursor ? `${base}?after=${encodeURIComponent(cursor)}` : base;
   }
 
+  function reportFacets(report) {
+    const facets = report?.facets || {};
+    return FACETS.map(name => ({name, ...(facets[name] || {})}));
+  }
+
   const primitive = value => value === null || ["string", "number", "boolean"].includes(typeof value);
 
   function entityText(entity) {
@@ -224,5 +229,5 @@
     return null;
   }
 
-  return {DOMAIN, FACETS, canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker, decodeSemanticEnvelope, eventStreamUrl, isCurrentEventStream, latestEventId, projectionView, semanticSha256, sha256Bytes};
+  return {DOMAIN, FACETS, canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker, decodeSemanticEnvelope, eventStreamUrl, isCurrentEventStream, latestEventId, projectionView, reportFacets, semanticSha256, sha256Bytes};
 });

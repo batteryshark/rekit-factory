@@ -18,6 +18,7 @@ import uuid
 from rekit_factory.control import InvestigationController, RunRequest
 from rekit_factory.evidence import EvidenceStore
 from rekit_factory.dossiers import DossierNotReady, dossier_list, verify_published_dossier
+from rekit_factory.outcomes import is_worker_report_result
 from rekit_factory.scope import AuthorizedScope
 from rekit_factory.store import FactoryLedger
 from rekit_factory.strategies import DEFAULT_STRATEGIES
@@ -156,7 +157,13 @@ class FactoryHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "reports":
                 run_dir = _find_run(self.server.storage_root, parts[2])
                 snapshot = self.server.controller.snapshot(run_dir)
-                self._json(HTTPStatus.OK, {"reports": _worker_reports(snapshot)})
+                projection = snapshot["outcomeProjection"]
+                self._json(HTTPStatus.OK, {
+                    "schemaVersion": projection["schemaVersion"],
+                    "vocabularyVersion": projection["vocabularyVersion"],
+                    "semanticSha256": projection["semanticSha256"],
+                    "reports": _worker_reports(snapshot),
+                })
                 return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "dossiers":
                 run_dir = _find_run(self.server.storage_root, parts[2])
@@ -513,21 +520,33 @@ def _fleet(controller: InvestigationController) -> list[dict[str, Any]]:
 
 def _worker_reports(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     reports = []
+    outcome_entities = {
+        (entity.get("entityType"), entity.get("entityId")): entity
+        for entity in snapshot.get("outcomeProjection", {}).get("entities", [])
+    }
     for item in snapshot.get("workItems", []):
         result = item.get("result")
-        if not isinstance(result, dict) or not any(
-                key in result for key in ("summary", "observations", "next_actions")):
+        if not is_worker_report_result(result):
             continue
         payload = item.get("payload") or {}
+        outcome = outcome_entities.get(("report", str(item["id"])))
+        if outcome is None:
+            continue
         reports.append({
             "id": item["id"],
+            "identity": {
+                "entityType": outcome["entityType"],
+                "entityId": outcome["entityId"],
+                "parent": outcome["parent"],
+            },
+            "facets": outcome["facets"],
+            "diagnostics": outcome["diagnostics"],
             "role": payload.get("role") or item.get("category") or "worker",
             "title": item.get("title") or "Worker report",
             "summary": result.get("summary") or "Report completed.",
             "observations": result.get("observations") or [],
             "nextActions": result.get("next_actions") or result.get("nextActions") or [],
-            "status": result.get("status_update") or result.get("statusUpdate")
-                      or item.get("state_label") or item.get("status"),
+            "workerNote": result.get("status_update") or result.get("statusUpdate"),
         })
     return reports
 

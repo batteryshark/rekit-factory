@@ -56,7 +56,7 @@ Failures carry a bounded code, reason, attempted transition, and retryability. R
 contiguous. Reset increments the lease generation exactly once and replaces node handles,
 invalidating handles from older generations.
 
-## Deterministic fake adapter
+## Deterministic adapters
 
 `DeterministicFakeRangeAdapter` is a serializable conformance fake. The included benign
 fixture has two Linux nodes, one declared node-to-node service, one immutable input, an
@@ -64,7 +64,15 @@ isolated network with no egress, and no credentials. Its two inert actions creat
 JSON bytes from already-declared metadata, then record scratch and verified-output metadata.
 It does not run a command or interpret target bytes.
 
-The fake enforces:
+`DeterministicManifestRangeAdapter` is a distinct second adapter type over the same v1
+contract. It assigns a separate opaque provider-handle namespace and materializes a compact
+provider-manifest evidence shape that binds the lease/spec, generation, action, node, input
+digests, and topology digest. Parameterized conformance tests run the same provision,
+execute, checkpoint/restart, exact retry, reset, generation rollover, destroy, injected
+failure, and recovery assertions against both types. This demonstrates that the v1
+investigation contract is not coupled to one adapter's handles or evidence encoding.
+
+The shared deterministic conformance engine enforces:
 
 - exact template/spec/range identity and resource ceilings;
 - one range generation's node handles and inputs, rejecting cross-range access;
@@ -87,7 +95,8 @@ retries after restart return or re-raise the recorded outcome without duplicatin
 
 ## Explicit nonclaims
 
-Passing this fake lifecycle proves only deterministic contract conformance. It is **not**:
+Passing either deterministic adapter lifecycle proves only deterministic contract
+conformance. It is **not**:
 
 - real Windows execution or native Windows fidelity;
 - a VM, hypervisor, container, cloud, or commercial-range provisioning proof;

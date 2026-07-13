@@ -24,6 +24,7 @@ from rekit_factory.outcomes import (
     _completion,
     _disposition,
     _entity,
+    _fold_report,
     _finalize_outcome_projection,
     _json_snapshot,
     _set,
@@ -420,6 +421,10 @@ def _all_entity_keys(state: _SourceState) -> set[EntityKey]:
         keys.add(("run", str(state.run["id"])))
     keys.update(("worker", value) for value in state.workers)
     keys.update(("work-item", value) for value in state.work_items)
+    keys.update(
+        ("report", identifier) for identifier, value in state.work_items.items()
+        if _fold_report(value) is not None
+    )
     keys.update(("hypothesis", value) for value in _memory_map(state, "hypotheses"))
     keys.update(("finding", value) for value in _memory_map(state, "findings"))
     keys.update(("validation", value) for value in _memory_map(state, "finding_attempts"))
@@ -454,6 +459,9 @@ def _refold_key(state: _SourceState, key: EntityKey) -> dict[str, Any] | None:
     if kind == "work-item":
         record = state.work_items.get(identifier)
         return _fold_work_item(record, run_id) if record else None
+    if kind == "report":
+        record = state.work_items.get(identifier)
+        return _fold_report(record) if record else None
     if kind == "hypothesis":
         record = _memory_map(state, "hypotheses").get(identifier)
         return _fold_hypothesis(identifier, record, run_id) if record else None
@@ -506,7 +514,9 @@ def _affected_keys(old: _SourceState, new: _SourceState,
     if change.source_kind == "worker":
         return {("worker", change.source_id)} if old.workers != new.workers else set()
     if change.source_kind == "work-item":
-        return {("work-item", change.source_id)} if old.work_items != new.work_items else set()
+        return {
+            (kind, change.source_id) for kind in ("work-item", "report")
+        } if old.work_items != new.work_items else set()
     if change.source_kind == "pending-decision":
         return {("operator-decision", change.source_id)} \
             if old.pending_decisions != new.pending_decisions else set()

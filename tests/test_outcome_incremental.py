@@ -389,6 +389,32 @@ def test_selective_refold_handles_cross_entity_deletes_reappearance_and_unknowns
     assert fold.last_refolded_entities == (("run", "run-b"),)
 
 
+def test_report_entity_has_exact_full_incremental_parity_across_render_and_removal():
+    fold = IncrementalOutcomeFold()
+    assert fold.apply(change("run-1", "run", 1, {"id": "run-a", "status": "running"}))
+    assert fold.apply(change("work-1", "work-item", 1, {
+        "id": "work-a", "status": "running",
+        "result": {"summary": "draft", "status_update": "accepted by model"},
+    }))
+    projection = assert_full_parity(fold)
+    report = entity(projection, "report", "work-a")
+    assert report["parent"] == {"entityType": "work-item", "entityId": "work-a"}
+    assert report["facets"]["publication"]["state"] == "rendered"
+    assert report["facets"]["validation"]["state"] == "not-applicable"
+    assert report["facets"]["acceptance"]["state"] == "not-applicable"
+    assert fold.last_refolded_entities == (("report", "work-a"), ("work-item", "work-a"))
+
+    assert fold.apply(change("work-2", "work-item", 2, {
+        "id": "work-a", "status": "done", "result": {"status_update": "validated"},
+    }))
+    projection = assert_full_parity(fold)
+    assert not any(item["entityType"] == "report" for item in projection["entities"])
+
+    assert fold.apply(remove("work-3", "work-item", "work-a", 3))
+    assert_full_parity(fold)
+    assert not any(item["entityId"] == "work-a" for item in fold.projection()["entities"])
+
+
 def test_randomized_differential_parity_after_every_arrival_and_batch_order():
     changes = randomized_changes()
     final_projections = []

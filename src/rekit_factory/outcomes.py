@@ -37,6 +37,7 @@ AUTHORITIES = {
     "rekit-tool-result": "Reserved for a future authoritative Rekit result entity.",
     "operator": "The operator owns explicit acceptance, rejection, waiver, and answers.",
     "factory-dossier-publisher": "The Factory dossier publisher owns transactional publication.",
+    "factory-report-renderer": "The Factory report renderer owns canonical report rendering.",
     "offline-proof-verifier": "The offline proof verifier owns current bundle validity.",
 }
 
@@ -197,6 +198,29 @@ def _entity(entity_type: str, entity_id: Any, *, parent: dict[str, str] | None =
         "entityType": entity_type, "entityId": str(entity_id), "parent": parent,
         "facets": {name: _na(default_owners[name]) for name in FACETS}, "diagnostics": [],
     }
+
+
+def is_worker_report_result(value: Any) -> bool:
+    """Return whether a committed work-item result is renderable as a worker report."""
+    return isinstance(value, Mapping) and any(
+        key in value for key in ("summary", "observations", "next_actions", "nextActions")
+    )
+
+
+def _fold_report(work: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project report publication without interpreting model-authored status prose."""
+    if not is_worker_report_result(work.get("result")):
+        return None
+    identifier = str(work.get("id", "missing-work"))
+    item = _entity(
+        "report", identifier,
+        parent={"entityType": "work-item", "entityId": identifier},
+    )
+    item["facets"]["publication"] = {
+        "rawState": "rendered", "state": "rendered", "known": True,
+        "terminal": True, "owner": "factory-report-renderer",
+    }
+    return item
 
 
 def _set(entity: dict[str, Any], facet: str, raw: Any, mapping: Mapping[str, str], *,
@@ -393,6 +417,9 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
         }, terminal_raw=work_terminal, owner=owner, entity=item,
                      diagnostics=diagnostics)
         entities.append(item)
+        report = _fold_report(work)
+        if report is not None:
+            entities.append(report)
 
     hypotheses = memory.get("hypotheses") or {}
     for hypothesis_id, hypothesis in hypotheses.items():

@@ -1,7 +1,7 @@
-"""Strict v1 analysis-range contracts and a deterministic conformance fake.
+"""Strict v1 analysis-range contracts and deterministic conformance adapters.
 
-The fake models lifecycle, identity, scope, and evidence metadata only.  It never
-provisions infrastructure, mounts a host path, opens a socket, or consumes a credential.
+The adapters model lifecycle, identity, scope, and evidence metadata only.  They never
+provision infrastructure, mount a host path, open a socket, or consume a credential.
 """
 
 from __future__ import annotations
@@ -873,6 +873,7 @@ _ERRORS: dict[str, type[RangeError]] = {
 
 def _validate_history(
     history: list[RangeLeaseStateV1], template: RangeTemplateV1, spec: RangeSpecV1,
+    handle_prefix: str,
 ) -> None:
     predecessor: RangeStatus | None = None
     previous_revision = 0
@@ -895,7 +896,9 @@ def _validate_history(
         stamp = _time(state.updated_at)
         if previous_time is not None and stamp < previous_time:
             raise ValueError("checkpoint transition timestamps are not monotonic")
-        expected_range, expected_nodes = _deterministic_handles(template, spec, state.generation)
+        expected_range, expected_nodes = _deterministic_handles(
+            template, spec, state.generation, handle_prefix,
+        )
         if state.status in {"requested", "provisioning", "destroyed"}:
             if state.range_handle is not None or state.node_handles:
                 raise ValueError("checkpoint transition carries forbidden provider handles")
@@ -915,16 +918,19 @@ def _validate_history(
 
 
 def _deterministic_handles(
-    template: RangeTemplateV1, spec: RangeSpecV1, generation: int,
+    template: RangeTemplateV1, spec: RangeSpecV1, generation: int, prefix: str = "fake",
 ) -> tuple[ProviderHandleV1, tuple[NodeHandleV1, ...]]:
     root = canonical_sha256({
         "range_id": spec.range_id, "spec_sha256": spec.digest, "generation": generation,
     })
     return (
-        ProviderHandleV1("range", f"fake-range:{root[:32]}"),
+        ProviderHandleV1("range", f"{prefix}-range:{root[:32]}"),
         tuple(NodeHandleV1(
             node.node_id,
-            ProviderHandleV1("node", f"fake-node:{canonical_sha256({'root': root, 'node': node.node_id})[:32]}"),
+            ProviderHandleV1(
+                "node",
+                f"{prefix}-node:{canonical_sha256({'root': root, 'node': node.node_id})[:32]}",
+            ),
         ) for node in template.nodes),
     )
 
@@ -974,6 +980,9 @@ def _decode_operation_envelope(value: Any) -> tuple[dict[str, Any], Any]:
 
 class DeterministicFakeRangeAdapter:
     """Serializable two-node range lifecycle fake with no infrastructure effects."""
+
+    HANDLE_PREFIX: ClassVar[str] = "fake"
+    PAYLOAD_KIND: ClassVar[str] = "range-conformance-fake-v1"
 
     def __init__(self, *, now: str = "2026-07-13T12:00:00Z") -> None:
         self._now = _timestamp(now, "now")
@@ -1084,14 +1093,7 @@ class DeterministicFakeRangeAdapter:
             self._maybe_fail(record, "in-use")
             self._transition(record, "in-use", "scheduler")
             inputs = {item.input_id: item for item in record.spec.inputs}
-            payload = canonical_json({
-                "action": request.action,
-                "range_id": request.range_id,
-                "node_id": request.node_id,
-                "generation": record.state.generation,
-                "inputs": [inputs[item].sha256 for item in request.input_ids],
-                "topology": record.template.to_dict(),
-            }).encode("utf-8")
+            payload = self._work_payload(record, request, record.state.generation)
             if len(payload) > record.spec.resources.max_scratch_bytes:
                 raise RangeStateError("deterministic scratch exceeds the scratch ceiling")
             if len(payload) > record.spec.resources.max_output_bytes:
@@ -1282,7 +1284,22 @@ class DeterministicFakeRangeAdapter:
     def _handles(
         self, record: _RangeRecord, generation: int,
     ) -> tuple[ProviderHandleV1, tuple[NodeHandleV1, ...]]:
-        return _deterministic_handles(record.template, record.spec, generation)
+        return _deterministic_handles(
+            record.template, record.spec, generation, self.HANDLE_PREFIX,
+        )
+
+    def _work_payload(
+        self, record: _RangeRecord, request: RangeWorkRequestV1, generation: int,
+    ) -> bytes:
+        inputs = {item.input_id: item for item in record.spec.inputs}
+        return canonical_json({
+            "action": request.action,
+            "range_id": request.range_id,
+            "node_id": request.node_id,
+            "generation": generation,
+            "inputs": [inputs[item].sha256 for item in request.input_ids],
+            "topology": record.template.to_dict(),
+        }).encode("utf-8")
 
     def _record(self, range_id: str) -> _RangeRecord:
         _identifier(range_id, "range_id")
@@ -1418,7 +1435,7 @@ class DeterministicFakeRangeAdapter:
                 raise ValueError("checkpoint template identity is inconsistent")
             if not history or history[-1] != state:
                 raise ValueError("checkpoint state does not match transition history")
-            _validate_history(history, template, spec)
+            _validate_history(history, template, spec, adapter.HANDLE_PREFIX)
             if len(template.nodes) > spec.resources.max_nodes:
                 raise ValueError("checkpoint template exceeds the range resource ceiling")
             if any(_time(entry.updated_at) > _time(adapter._now) for entry in history):
@@ -1496,16 +1513,12 @@ class DeterministicFakeRangeAdapter:
                 inputs = {entry.input_id: entry for entry in record.spec.inputs}
                 _expected_range, expected_nodes = _deterministic_handles(
                     record.template, record.spec, result.generation,
+                    adapter.HANDLE_PREFIX,
                 )
                 handles = {entry.node_id: entry.handle for entry in expected_nodes}
                 if not set(request.input_ids) <= set(inputs):
                     raise ValueError("checkpoint execute request references an undeclared input")
-                payload = canonical_json({
-                    "action": request.action, "range_id": request.range_id,
-                    "node_id": request.node_id, "generation": result.generation,
-                    "inputs": [inputs[key].sha256 for key in request.input_ids],
-                    "topology": record.template.to_dict(),
-                }).encode("utf-8")
+                payload = adapter._work_payload(record, request, result.generation)
                 payload_sha256 = hashlib.sha256(payload).hexdigest()
                 if (
                     evidence != result or request.node_id != result.node_id
@@ -1547,6 +1560,37 @@ class DeterministicFakeRangeAdapter:
         # Round-tripping through the canonical encoder also rejects unserializable values.
         canonical_json(value)
         return adapter
+
+
+class DeterministicManifestRangeAdapter(DeterministicFakeRangeAdapter):
+    """A second inert adapter that materializes a provider-manifest evidence shape.
+
+    This adapter deliberately shares the v1 lifecycle/checkpoint conformance engine while
+    using its own opaque provider-handle namespace and deterministic evidence payload. It
+    does not start a process, provision infrastructure, or test network isolation.
+    """
+
+    HANDLE_PREFIX = "manifest"
+    PAYLOAD_KIND = "range-provider-manifest-v1"
+
+    def _work_payload(
+        self, record: _RangeRecord, request: RangeWorkRequestV1, generation: int,
+    ) -> bytes:
+        inputs = {item.input_id: item for item in record.spec.inputs}
+        return canonical_json({
+            "adapter": self.PAYLOAD_KIND,
+            "lease": {
+                "range_id": request.range_id,
+                "generation": generation,
+                "spec_sha256": record.spec.digest,
+            },
+            "work": {
+                "action": request.action,
+                "node_id": request.node_id,
+                "input_sha256": [inputs[item].sha256 for item in request.input_ids],
+                "topology_sha256": record.template.digest,
+            },
+        }).encode("utf-8")
 
 
 def benign_two_node_fixture(

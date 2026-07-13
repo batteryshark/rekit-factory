@@ -119,6 +119,32 @@ def test_children_never_promote_parent_outcomes():
     assert finding["facets"]["publication"]["state"] == "published"
 
 
+def test_worker_report_is_rendered_child_without_model_authored_outcome_inference():
+    projection = _project(work=[{
+        "id": "work-1", "status": "running", "operation": "model-worker",
+        "result": {
+            "summary": "candidate narrative", "status_update": "validated and accepted",
+        },
+    }])
+
+    report = _entity(projection, "report", "work-1")
+    assert report["parent"] == {"entityType": "work-item", "entityId": "work-1"}
+    assert report["facets"]["publication"] == {
+        "rawState": "rendered", "state": "rendered", "known": True,
+        "terminal": True, "owner": "factory-report-renderer",
+    }
+    assert report["facets"]["validation"]["state"] == "not-applicable"
+    assert report["facets"]["acceptance"]["state"] == "not-applicable"
+    assert "validated and accepted" not in json.dumps(report)
+
+
+def test_non_report_work_result_does_not_create_report_entity():
+    projection = _project(work=[{
+        "id": "work-1", "status": "done", "result": {"status_update": "complete"},
+    }])
+    assert not any(item["entityType"] == "report" for item in projection["entities"])
+
+
 def test_unknown_raw_state_is_preserved_and_degrades_without_guessing():
     projection = _project(run_status="future-paused")
     run = _entity(projection, "run", "run-1")
@@ -172,8 +198,8 @@ def test_authority_is_explicit_for_every_facet():
         questions=[{"id": "question-1"}],
     )
     assert set(projection["authorities"]) == {
-        "factory-dossier-publisher", "factory-scheduler", "muster", "offline-proof-verifier",
-        "operator", "rekit-tool-result", "validator-policy",
+        "factory-dossier-publisher", "factory-report-renderer", "factory-scheduler", "muster",
+        "offline-proof-verifier", "operator", "rekit-tool-result", "validator-policy",
     }
     for entity in projection["entities"]:
         assert set(entity["facets"]) == set(projection["facets"])
