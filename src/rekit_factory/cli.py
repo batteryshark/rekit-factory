@@ -155,6 +155,11 @@ def _load_remote_workers(args: argparse.Namespace) -> tuple[RemoteWorkerBinding,
             raise ValueError(f"{names['staged']} must be a JSON object") from exc
         if not isinstance(staged, dict):
             raise ValueError(f"{names['staged']} must be a JSON object")
+        if any(not isinstance(key, str) or not isinstance(value, str)
+               for key, value in staged.items()):
+            raise ValueError(
+                f"{names['staged']} keys and relative-path values must be strings"
+            )
         priority_name = f"{prefix}_PRIORITY"
         try:
             priority = int(os.environ.get(priority_name, "100"))
@@ -172,7 +177,7 @@ def _load_remote_workers(args: argparse.Namespace) -> tuple[RemoteWorkerBinding,
                 os.environ[names["url"]], auth_token=os.environ[names["token"]],
                 **transport_options,
             ),
-            {str(key): str(value) for key, value in staged.items()},
+            staged,
             priority=priority,
         ))
     return tuple(bindings)

@@ -103,8 +103,9 @@ Machine-specific lifecycle and reset behavior stays behind those adapters.
 `rekit_factory.remote_http` provides the first deployable transport boundary. The
 server exposes authenticated capability discovery, asynchronous invocation
 submission, ordered event retrieval with an `after` cursor, and terminal result
-retrieval. The matching client implements `WorkerTransport` and polls the bounded
-result endpoint while also exposing resumable events.
+retrieval. The matching client implements `WorkerTransport`, polls the bounded
+result endpoint, exposes resumable events, and supports explicit setup/reset/
+teardown leases plus content-addressed artifact download.
 
 The server requires an explicit bearer token and staged input root. Networked
 requests may name only regular files beneath that root; absolute paths and parent
@@ -117,8 +118,11 @@ invocation before a result becomes visible.
 Bearer authentication does not provide transport encryption. A deployment beyond
 loopback must terminate TLS with a pinned/private trust configuration or place the
 endpoint inside an authenticated tunnel. Token rotation, rate limiting, durable
-server-side event storage, target upload/content-hash verification, cancellation,
-artifact transfer, and interactive attachment remain adapter/deployment work. The
+server-side event storage, target upload/content-hash verification,
+adapter-specific cancellation, and interactive attachment remain deployment work.
+Lease state is written atomically under the configured worker input root, so a
+restart preserves dirty and closed dispositions instead of silently reusing them.
+The
 in-memory HTTP proof must not be treated as the Windows worker proof or as an
 isolation boundary.
 
@@ -151,10 +155,17 @@ credential-use boolean, and independent tool-safety approval ID. No credential
 value or implicit host mount is part of the envelope.
 
 Returned stdout/stderr enters the normal evidence capture pipeline with worker,
-invocation, work-item, target, and environment provenance. Remote artifact
-manifests are retained in artifact metadata. Transfer and verification of remote
-artifact bytes remains future transport work; a manifest is not treated as a
-locally available artifact.
+lease, invocation, work-item, target, and environment provenance. The controller
+fetches each remote artifact by exact invocation and content digest, then
+revalidates its relative path, size, SHA-256, worker, lease, route, and work
+identity before EvidenceStore capture. A manifest path is never interpreted as a
+host or shared-filesystem path.
+
+Each dispatch derives a stable lease ID from the durable run/work/route binding.
+Setup is idempotent; dirty and closed dispositions require an explicit reset before
+invocation. Reset and teardown run after success, failure, cancellation, and
+timeout, with durable Muster audit events. Cleanup that cannot reach `ready` then
+`closed` fails the work item closed.
 
 The CLI composition root registers workers with repeated
 `--remote-worker-env <PREFIX>`. `<PREFIX>_URL` and `<PREFIX>_TOKEN` configure the
@@ -162,7 +173,8 @@ authenticated transport, while `<PREFIX>_STAGED_TARGETS` is a JSON object mappin
 target hashes to worker-relative staged paths and `<PREFIX>_PRIORITY` is optional.
 The token remains environment-only and is not copied into the route, run metadata,
 scope revision, invocation body, evidence, or browser projection. Worker URLs must
-use HTTPS. Plain HTTP is accepted only for a loopback URL when the corresponding
+use HTTPS and may not contain userinfo, query, fragment, or a path prefix. Plain
+HTTP is accepted only for a loopback URL when the corresponding
 `<PREFIX>_ALLOW_LOOPBACK_HTTP=1` development opt-in is present.
 
 ## Files and isolation

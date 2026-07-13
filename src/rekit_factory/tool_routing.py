@@ -10,7 +10,9 @@ import re
 from types import MappingProxyType
 from typing import Mapping
 
-from rekit_factory.remote import InvocationRequest, WorkerCapabilities, WorkerTransport
+from rekit_factory.remote import (
+    InvocationRequest, WorkerCapabilities, WorkerLeaseRequest, WorkerTransport,
+)
 from rekit_factory.scope import ActionAuthority, AuthorizedScope
 
 
@@ -56,6 +58,19 @@ class ToolRoute:
     remote: bool
     target_path: str
 
+    def lease_request(self, *, run_id: str, work_item_id: str,
+                      target_sha256: str) -> WorkerLeaseRequest:
+        route_sha256 = _text_digest(json.dumps(
+            self.binding_payload(target_sha256), sort_keys=True, separators=(",", ":"),
+        ))
+        lease_id = "lease-" + _text_digest(
+            f"{run_id}\0{work_item_id}\0{self.capabilities.worker_id}\0{route_sha256}"
+        )[:24]
+        return WorkerLeaseRequest(
+            lease_id=lease_id, run_id=run_id, work_item_id=work_item_id,
+            worker_id=self.capabilities.worker_id, route_sha256=route_sha256,
+        )
+
     def binding_payload(self, target_sha256: str) -> dict[str, object]:
         return {
             "routeBindingVersion": 1,
@@ -94,6 +109,7 @@ class ToolRoute:
         endpoint: str | None,
         account_ref: str | None,
         uses_credentials: bool,
+        lease_id: str,
     ) -> InvocationRequest:
         networked = ActionAuthority.NETWORK_ACCESS in actions
         return InvocationRequest(
@@ -112,6 +128,7 @@ class ToolRoute:
             scope_digest=scope.envelope.content_digest,
             scope_revision=scope.to_dict(),
             requested_actions=tuple(action.value for action in actions),
+            lease_id=lease_id,
         )
 
 

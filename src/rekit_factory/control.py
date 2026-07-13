@@ -581,6 +581,11 @@ class InvestigationController:
             ctx.state.run_id, item["id"], tool_id, manifest.safety_tier
         )
         target_grant = TargetGrant.from_path(item["target"])
+        route = None
+        lease = None
+        invocation = None
+        artifact_bytes: list[tuple[Any, bytes]] = []
+        primary_error: Exception | None = None
         try:
             route = self.tool_router.select(
                 tool_id,
@@ -597,6 +602,29 @@ class InvestigationController:
             )
             if payload.get("toolWorkerId") is not None:
                 route.verify_binding(payload, target_grant.content_sha256)
+            lease = route.lease_request(
+                run_id=ctx.state.run_id, work_item_id=item["id"],
+                target_sha256=target_grant.content_sha256,
+            )
+            lease_state = await asyncio.to_thread(route.transport.setup_lease, lease)
+            _validate_lease_state(lease, lease_state)
+            ledger.event_log(
+                ctx.state.run_id, "worker.lease.setup", "Tool worker lease setup",
+                payload={"leaseId": lease.lease_id, "workerId": lease.worker_id,
+                         "status": lease_state.status, "generation": lease_state.generation},
+            )
+            if lease_state.status != "ready":
+                lease_state = await asyncio.to_thread(route.transport.reset_lease, lease)
+                _validate_lease_state(lease, lease_state)
+                ledger.event_log(
+                    ctx.state.run_id, "worker.lease.reset",
+                    "Dirty worker lease explicitly reset before dispatch",
+                    payload={"leaseId": lease.lease_id, "workerId": lease.worker_id,
+                             "status": lease_state.status,
+                             "generation": lease_state.generation},
+                )
+            if lease_state.status != "ready":
+                raise PermissionError("tool worker lease is not clean and ready")
             invocation = route.invocation(
                 run_id=ctx.state.run_id,
                 work_item_id=item["id"],
@@ -609,10 +637,66 @@ class InvestigationController:
                 endpoint=payload.get("endpoint"),
                 account_ref=payload.get("accountRef"),
                 uses_credentials=bool(payload.get("usesCredentials", False)),
+                lease_id=lease.lease_id,
             )
             result = await asyncio.to_thread(route.transport.invoke, invocation)
             _validate_invocation_result(invocation, result, route.capabilities.worker_id)
+            for artifact in result.artifacts:
+                data = await asyncio.to_thread(
+                    route.transport.fetch_artifact, invocation.invocation_id, artifact,
+                )
+                if len(data) != artifact.size:
+                    raise ValueError("remote artifact size does not match manifest")
+                if hashlib.sha256(data).hexdigest() != artifact.sha256:
+                    raise ValueError("remote artifact digest does not match manifest")
+                artifact_bytes.append((artifact, data))
         except Exception as exc:
+            primary_error = exc
+        finally:
+            if route is not None and lease is not None:
+                if primary_error is not None and invocation is not None:
+                    try:
+                        cancelled = await asyncio.to_thread(
+                            route.transport.cancel, invocation.invocation_id,
+                        )
+                        ledger.event_log(
+                            ctx.state.run_id, "worker.invocation.cancel",
+                            "Tool worker cancellation requested after failure",
+                            payload={"leaseId": lease.lease_id,
+                                     "invocationId": invocation.invocation_id,
+                                     "workerId": lease.worker_id, "cancelled": cancelled},
+                        )
+                    except Exception as cleanup_exc:
+                        primary_error = primary_error or cleanup_exc
+                for action, event_kind in (
+                    (route.transport.reset_lease, "worker.lease.reset"),
+                    (route.transport.teardown_lease, "worker.lease.teardown"),
+                ):
+                    try:
+                        state = await asyncio.to_thread(action, lease)
+                        _validate_lease_state(lease, state)
+                        expected_status = "ready" if event_kind.endswith("reset") else "closed"
+                        if state.status != expected_status:
+                            raise PermissionError(
+                                f"worker cleanup did not reach {expected_status} state"
+                            )
+                        ledger.event_log(
+                            ctx.state.run_id, event_kind, "Tool worker lease cleanup",
+                            payload={"leaseId": lease.lease_id,
+                                     "workerId": lease.worker_id, "status": state.status,
+                                     "generation": state.generation},
+                        )
+                    except Exception as cleanup_exc:
+                        primary_error = primary_error or cleanup_exc
+                        ledger.event_log(
+                            ctx.state.run_id, "security.worker_cleanup_failed",
+                            "Tool worker failed closed during cleanup",
+                            payload={"leaseId": lease.lease_id,
+                                     "workerId": lease.worker_id,
+                                     "errorType": type(cleanup_exc).__name__},
+                        )
+        if primary_error is not None:
+            exc = primary_error
             ledger.finish_tool_call(
                 call_id, status="failed", output_path=None, exit_code=None,
             )
@@ -652,6 +736,7 @@ class InvestigationController:
                 initiating_worker_id=payload.get("workerId"),
                 invocation_id=call_id,
                 work_item_id=item["id"],
+                lease_id=lease.lease_id,
             ),
             retention_class=RetentionClass.RUN,
             expires_at=default_expiry(RetentionClass.RUN),
@@ -697,6 +782,40 @@ class InvestigationController:
                 "remoteArtifacts": [artifact.to_dict() for artifact in result.artifacts],
             },
         )
+        for artifact, data in artifact_bytes:
+            remote_outcome = evidence.ingest_remote_artifact(
+                data,
+                Provenance(
+                    run_id=ctx.state.run_id, source=f"rekit:{tool_id}:{artifact.path}",
+                    capture_reason="remote worker artifact transfer", captured_at=captured_at,
+                    environment_id=(f"worker:{route.capabilities.worker_id}:"
+                                    f"{route.capabilities.platform}:"
+                                    f"{route.capabilities.architecture}:"
+                                    f"{route.capabilities.isolation}"),
+                    target_sha256=target_grant.content_sha256, tool_id=tool_id,
+                    worker_id=route.capabilities.worker_id,
+                    initiating_worker_id=payload.get("workerId"),
+                    invocation_id=invocation.invocation_id, work_item_id=item["id"],
+                    lease_id=lease.lease_id,
+                ),
+                expected_sha256=artifact.sha256,
+                media_type=artifact.media_type or "application/octet-stream",
+                retention_class=RetentionClass.RUN,
+                expires_at=default_expiry(RetentionClass.RUN),
+            )
+            remote_record = remote_outcome.record
+            if remote_record is None or remote_record.state is EvidenceState.QUARANTINED:
+                raise RuntimeError("required remote artifact was not retained")
+            remote_path = evidence.root / remote_record.display_path
+            ledger.add_artifact(
+                run_id=ctx.state.run_id, kind="remote-artifact", path=remote_path,
+                logical_path=f"remote-artifact/{artifact.path}",
+                origin=f"rekit:{tool_id}",
+                metadata={"toolId": tool_id, "declaredPath": artifact.path,
+                          "declaredSha256": artifact.sha256, "declaredSize": artifact.size,
+                          "evidenceArtifactId": remote_record.artifact_id,
+                          "provenance": asdict(remote_record.provenance)},
+            )
         if result.exit_code == 0:
             ledger.resolve(
                 item["id"],
@@ -1773,12 +1892,23 @@ def _validate_invocation_result(invocation: Any, result: Any,
                                 worker_id: str) -> None:
     expected = (
         invocation.invocation_id, invocation.run_id, invocation.work_item_id, worker_id,
+        invocation.lease_id,
     )
     actual = (
         result.invocation_id, result.run_id, result.work_item_id, result.worker_id,
+        result.lease_id,
     )
     if actual != expected:
         raise ValueError("tool result provenance does not match the durable invocation")
+
+
+def _validate_lease_state(request: Any, state: Any) -> None:
+    expected = (request.lease_id, request.run_id, request.work_item_id,
+                request.worker_id, request.route_sha256)
+    actual = (state.lease_id, state.run_id, state.work_item_id,
+              state.worker_id, state.route_sha256)
+    if actual != expected:
+        raise ValueError("worker lease state provenance does not match durable authority")
 
 
 def _request_plan(request: RunRequest) -> InvestigationPlan:

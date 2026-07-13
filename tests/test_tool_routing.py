@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import asyncio
+from dataclasses import asdict, replace
+import hashlib
 import json
 import tempfile
 import unittest
@@ -13,6 +15,7 @@ from rekit_factory.models import ModelProfile, WorkerReport
 from rekit_factory.rekit_client import ToolManifest, ToolResult
 from rekit_factory.remote import (
     ArtifactRecord, InvocationRequest, InvocationResult, LocalRekitWorker, WorkerCapabilities,
+    WorkerLeaseRequest, WorkerLeaseState,
 )
 from rekit_factory.scope import (
     ActionAuthority, author_scope, hash_path,
@@ -33,11 +36,19 @@ class FakeTransport:
             isolation=isolation,
         )
         self.requests: list[InvocationRequest] = []
+        self.leases = {}
+        self.lifecycle = []
+        self.cancelled = []
+        self.artifact_data = b'{"result":"clean"}'
 
     def capabilities(self):
         return self._capabilities
 
     def invoke(self, request):
+        state = self.leases.get(request.lease_id)
+        if state is None or state.status != "ready":
+            raise PermissionError("lease not ready")
+        self.leases[request.lease_id] = replace(state, status="dirty")
         self.requests.append(request)
         return InvocationResult(
             invocation_id=request.invocation_id,
@@ -49,12 +60,39 @@ class FakeTransport:
             stdout="remote fixture output",
             stderr="",
             artifacts=(ArtifactRecord(
-                path="reports/scan.json", sha256="b" * 64, size=42,
+                path="reports/scan.json",
+                sha256=hashlib.sha256(self.artifact_data).hexdigest(),
+                size=len(self.artifact_data),
                 media_type="application/json",
             ),),
+            lease_id=request.lease_id,
         )
 
+    def setup_lease(self, request):
+        self.lifecycle.append("setup")
+        state = self.leases.get(request.lease_id)
+        if state is None or state.status == "closed":
+            state = WorkerLeaseState(**asdict(request), status="ready")
+            self.leases[request.lease_id] = state
+        return state
+
+    def reset_lease(self, request):
+        self.lifecycle.append("reset")
+        state = WorkerLeaseState(**asdict(request), status="ready")
+        self.leases[request.lease_id] = state
+        return state
+
+    def teardown_lease(self, request):
+        self.lifecycle.append("teardown")
+        state = WorkerLeaseState(**asdict(request), status="closed")
+        self.leases[request.lease_id] = state
+        return state
+
+    def fetch_artifact(self, invocation_id, artifact):
+        return self.artifact_data
+
     def cancel(self, invocation_id):
+        self.cancelled.append(invocation_id)
         return False
 
     def attach_url(self, invocation_id):
@@ -89,6 +127,17 @@ class FakeBackend:
 
 
 class ToolRoutingTests(unittest.TestCase):
+    def test_cli_rejects_non_string_staged_target_values(self):
+        args = parser().parse_args(["serve", "--remote-worker-env", "LABWORKER"])
+        environment = {
+            "LABWORKER_URL": "https://worker.internal",
+            "LABWORKER_TOKEN": "token",
+            "LABWORKER_STAGED_TARGETS": '{"' + "a" * 64 + '":42}',
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "must be strings"):
+                _load_remote_workers(args)
+
     def test_cli_composition_loads_remote_token_only_from_environment(self):
         target_hash = "a" * 64
         args = parser().parse_args(["serve", "--remote-worker-env", "LABWORKER"])
@@ -224,7 +273,7 @@ class ToolRoutingTests(unittest.TestCase):
                 run_id="run-1", work_item_id="work-1", invocation_id="tool-1",
                 tool_id="scan", target_sha256=hash_path(target), scope=scope,
                 actions=actions, approval_id="question-allow", endpoint=endpoint,
-                account_ref="account:lab", uses_credentials=True,
+                account_ref="account:lab", uses_credentials=True, lease_id="lease-test",
             )
             self.assertEqual("restricted", request.network_policy)
             self.assertEqual("staged-input-read-only", request.mount_policy)
@@ -276,6 +325,14 @@ class ToolRoutingTests(unittest.TestCase):
             metadata = json.loads(artifact["metadata_json"])
             self.assertEqual("windows-analysis", metadata["provenance"]["worker_id"])
             self.assertIsNone(metadata["provenance"]["initiating_worker_id"])
+            self.assertEqual(["setup", "reset", "teardown"], remote.lifecycle)
+            transferred = next(item for item in result["artifacts"]
+                               if item["kind"] == "remote-artifact")
+            transferred_metadata = json.loads(transferred["metadata_json"])
+            self.assertEqual(request.invocation_id,
+                             transferred_metadata["provenance"]["invocation_id"])
+            self.assertEqual(request.lease_id,
+                             transferred_metadata["provenance"]["lease_id"])
 
     def test_local_worker_rehashes_target_at_execution_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,11 +351,17 @@ class ToolRoutingTests(unittest.TestCase):
                 target_path=str(target), target_sha256=hash_path(target),
                 scope_digest=scope.envelope.content_digest, scope_revision=scope.to_dict(),
                 requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+                lease_id="lease-local",
             )
             target.write_text("mutated", encoding="utf-8")
             rekit = FakeRekit()
+            worker = LocalRekitWorker(rekit)
+            worker.setup_lease(WorkerLeaseRequest(
+                lease_id="lease-local", run_id="run-local", work_item_id="work-local",
+                worker_id="local", route_sha256="a" * 64,
+            ))
             with self.assertRaisesRegex(PermissionError, "authorized hash"):
-                LocalRekitWorker(rekit).invoke(request)
+                worker.invoke(request)
             self.assertEqual(0, rekit.calls)
 
     def test_restart_rejects_same_worker_id_with_drifted_isolation(self):
@@ -386,6 +449,32 @@ class ToolRoutingTests(unittest.TestCase):
                         if item["operation"] == "rekit-tool")
             self.assertEqual("failed", tool["status"])
             self.assertEqual([], result["artifacts"])
+
+    def test_failed_invocation_is_cancelled_reset_and_torn_down(self):
+        class FailingTransport(FakeTransport):
+            def invoke(self, request):
+                self.requests.append(request)
+                raise TimeoutError("deterministic timeout")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            remote = FailingTransport("analysis-worker")
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    remote, {target_hash: "input/staged/fixture.txt"},
+                ),),
+            )
+            result = controller.run(RunRequest(
+                target, "scan", tools=("scan",), worker_roles=("analyst",),
+            ))
+            tool = next(item for item in result["workItems"]
+                        if item["operation"] == "rekit-tool")
+            self.assertEqual("failed", tool["status"])
+            self.assertEqual(["setup", "reset", "teardown"], remote.lifecycle)
+            self.assertEqual([remote.requests[0].invocation_id], remote.cancelled)
 
     def test_replacing_run_scope_with_another_valid_revision_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

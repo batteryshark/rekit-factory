@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path, PurePosixPath
@@ -23,6 +23,7 @@ from rekit_factory.scope import (
 NetworkPolicy = Literal["none", "sinkhole", "restricted", "unrestricted"]
 MountPolicy = Literal["none", "staged-input-read-only"]
 InvocationStatus = Literal["done", "failed", "cancelled"]
+LeaseStatus = Literal["ready", "dirty", "closed", "failed"]
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -92,6 +93,50 @@ class WorkerCapabilities(_Envelope):
 
 
 @dataclass(frozen=True)
+class WorkerLeaseRequest(_Envelope):
+    lease_id: str
+    run_id: str
+    work_item_id: str
+    worker_id: str
+    route_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in ("lease_id", "run_id", "work_item_id", "worker_id"):
+            _require_text(getattr(self, name), name)
+        if not _SHA256.fullmatch(self.route_sha256):
+            raise ValueError("route_sha256 must be a lowercase SHA-256 digest")
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> Self:
+        return cls(**cls._fields(value))
+
+
+@dataclass(frozen=True)
+class WorkerLeaseState(_Envelope):
+    lease_id: str
+    run_id: str
+    work_item_id: str
+    worker_id: str
+    route_sha256: str
+    status: LeaseStatus
+    generation: int = 1
+
+    def __post_init__(self) -> None:
+        WorkerLeaseRequest(
+            self.lease_id, self.run_id, self.work_item_id, self.worker_id,
+            self.route_sha256,
+        )
+        if self.status not in {"ready", "dirty", "closed", "failed"}:
+            raise ValueError("unsupported lease status")
+        if isinstance(self.generation, bool) or not isinstance(self.generation, int) or self.generation < 1:
+            raise ValueError("lease generation must be a positive integer")
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> Self:
+        return cls(**cls._fields(value))
+
+
+@dataclass(frozen=True)
 class InvocationRequest(_Envelope):
     run_id: str
     work_item_id: str
@@ -108,6 +153,7 @@ class InvocationRequest(_Envelope):
     account_ref: str | None = None
     uses_credentials: bool = False
     mount_policy: MountPolicy = "none"
+    lease_id: str | None = None
     invocation_id: str = field(default_factory=lambda: f"invoke-{uuid.uuid4().hex[:12]}")
 
     def __post_init__(self) -> None:
@@ -138,6 +184,8 @@ class InvocationRequest(_Envelope):
             raise ValueError("uses_credentials must be a boolean")
         if self.mount_policy not in {"none", "staged-input-read-only"}:
             raise ValueError("unsupported mount_policy")
+        if self.lease_id is not None:
+            _require_text(self.lease_id, "lease_id")
         if any(not isinstance(argument, str) for argument in self.arguments):
             raise ValueError("arguments must contain only strings")
 
@@ -209,6 +257,7 @@ class InvocationResult(_Envelope):
     stdout: str
     stderr: str
     artifacts: tuple[ArtifactRecord, ...] = ()
+    lease_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("invocation_id", "run_id", "work_item_id", "worker_id"):
@@ -219,6 +268,8 @@ class InvocationResult(_Envelope):
             isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
         ):
             raise ValueError("exit_code must be an integer or null")
+        if self.lease_id is not None:
+            _require_text(self.lease_id, "lease_id")
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -236,7 +287,11 @@ class InvocationResult(_Envelope):
 
 class WorkerTransport(Protocol):
     def capabilities(self) -> WorkerCapabilities: ...
+    def setup_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState: ...
+    def reset_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState: ...
+    def teardown_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState: ...
     def invoke(self, request: InvocationRequest) -> InvocationResult: ...
+    def fetch_artifact(self, invocation_id: str, artifact: ArtifactRecord) -> bytes: ...
     def cancel(self, invocation_id: str) -> bool: ...
     def attach_url(self, invocation_id: str) -> str | None: ...
 
@@ -247,6 +302,30 @@ class LocalRekitWorker:
     def __init__(self, rekit: RekitAdapter, *, worker_id: str = "local"):
         self.rekit = rekit
         self.worker_id = worker_id
+        self._leases: dict[str, WorkerLeaseState] = {}
+
+    def setup_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        current = self._leases.get(request.lease_id)
+        if current is not None and current.status != "closed":
+            return current
+        state = WorkerLeaseState(**asdict(request), status="ready",
+                                 generation=1 if current is None else current.generation + 1)
+        self._leases[request.lease_id] = state
+        return state
+
+    def reset_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        current = self._leases.get(request.lease_id)
+        generation = 1 if current is None else current.generation
+        state = WorkerLeaseState(**asdict(request), status="ready", generation=generation)
+        self._leases[request.lease_id] = state
+        return state
+
+    def teardown_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        current = self._leases.get(request.lease_id)
+        generation = 1 if current is None else current.generation
+        state = WorkerLeaseState(**asdict(request), status="closed", generation=generation)
+        self._leases[request.lease_id] = state
+        return state
 
     def capabilities(self) -> WorkerCapabilities:
         tools = self.rekit.list_tools() if hasattr(self.rekit, "list_tools") else []
@@ -259,6 +338,12 @@ class LocalRekitWorker:
         )
 
     def invoke(self, request: InvocationRequest) -> InvocationResult:
+        if request.lease_id is None:
+            raise PermissionError("worker invocation requires an explicit lease")
+        lease = self._leases.get(request.lease_id)
+        if lease is None or lease.status != "ready":
+            raise PermissionError("worker lease is not clean and ready")
+        self._leases[request.lease_id] = replace(lease, status="dirty")
         manifest = self.rekit.manifest(request.tool_id)
         if manifest.requires_permission and not request.approval_id:
             raise PermissionError(f"{request.tool_id} requires a durable approval id")
@@ -280,7 +365,11 @@ class LocalRekitWorker:
             stdout=result.stdout,
             stderr=result.stderr,
             worker_id=self.worker_id,
+            lease_id=request.lease_id,
         )
+
+    def fetch_artifact(self, invocation_id: str, artifact: ArtifactRecord) -> bytes:
+        raise FileNotFoundError("local Rekit worker did not publish remote artifacts")
 
     def cancel(self, invocation_id: str) -> bool:
         return False

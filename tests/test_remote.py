@@ -13,6 +13,7 @@ from rekit_factory.remote import (
     LocalRekitWorker,
     WorkerCapabilities,
     WorkerEvent,
+    WorkerLeaseRequest,
 )
 from rekit_factory.scope import (
     ActionAuthority, AuthorizedScope, ScopeApproval, ScopeEnvelope, TargetGrant,
@@ -171,8 +172,12 @@ class RemoteEnvelopeTests(unittest.TestCase):
             allowed = InvocationRequest(
                 invocation_id="invoke-1", run_id="run-1", work_item_id="work-1",
                 tool_id="fixture-scan", target_path=str(target), approval_id="approval-1",
-                **common,
+                lease_id="lease-local", **common,
             )
+            worker.setup_lease(WorkerLeaseRequest(
+                lease_id="lease-local", run_id="run-1", work_item_id="work-1",
+                worker_id="worker-local", route_sha256="a" * 64,
+            ))
             result = worker.invoke(allowed)
 
             self.assertEqual("invoke-1", result.invocation_id)

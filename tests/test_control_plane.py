@@ -22,7 +22,7 @@ from rekit_factory.models import (
     WorkerTurn,
 )
 from rekit_factory.rekit_client import ToolManifest, ToolResult
-from rekit_factory.remote import InvocationRequest, LocalRekitWorker
+from rekit_factory.remote import InvocationRequest, LocalRekitWorker, WorkerLeaseRequest
 from rekit_factory.store import FactoryLedger
 from muster import resolve_run_dir
 from rekit_factory.scope import (
@@ -672,8 +672,13 @@ class ControlPlaneTests(unittest.TestCase):
                 worker.invoke(request)
             allowed = InvocationRequest(
                 run_id="run-1", work_item_id="work-1", tool_id="exec-observe",
-                target_path=str(target), approval_id="question-answered-allow", **common,
+                target_path=str(target), approval_id="question-answered-allow",
+                lease_id="lease-local", **common,
             )
+            worker.setup_lease(WorkerLeaseRequest(
+                lease_id="lease-local", run_id="run-1", work_item_id="work-1",
+                worker_id="local", route_sha256="a" * 64,
+            ))
             result = worker.invoke(allowed)
             self.assertEqual("done", result.status)
             self.assertTrue(rekit.calls[0][2])

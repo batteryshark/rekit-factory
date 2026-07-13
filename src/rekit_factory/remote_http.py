@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,11 +18,14 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from rekit_factory.remote import (
+    ArtifactRecord,
     InvocationRequest,
     InvocationResult,
     NetworkPolicy,
     WorkerCapabilities,
     WorkerEvent,
+    WorkerLeaseRequest,
+    WorkerLeaseState,
     WorkerTransport,
     validate_invocation_scope,
 )
@@ -65,11 +69,25 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
         self.max_body = max_body
         self.max_response = max_response
         self._lock = threading.Lock()
+        self._lease_state_path = self.input_root / ".rekit-worker-leases.json"
+        self._lease_states = self._load_lease_states()
         self._events: dict[str, list[WorkerEvent]] = {}
         self._results: dict[str, InvocationResult] = {}
         super().__init__(address, RemoteWorkerHTTPRequestHandler)
 
     def submit(self, request: InvocationRequest) -> None:
+        if request.lease_id is None:
+            raise PermissionError("remote invocation requires an explicit worker lease")
+        with self._lock:
+            lease = self._lease_states.get(request.lease_id)
+            if lease is None or lease.status != "ready":
+                raise PermissionError("remote worker lease is not clean and ready")
+            if (lease.run_id, lease.work_item_id, lease.worker_id) != (
+                request.run_id, request.work_item_id, self.worker_capabilities.worker_id,
+            ):
+                raise PermissionError("remote invocation does not match leased authority")
+            self._lease_states[lease.lease_id] = replace(lease, status="dirty")
+            self._persist_lease_states_locked()
         if request.network_policy not in self.allowed_network_policies:
             raise PermissionError(
                 f"network policy {request.network_policy!r} is not enabled on this worker"
@@ -121,12 +139,14 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
                 request.run_id,
                 request.work_item_id,
                 self.worker_capabilities.worker_id,
+                request.lease_id,
             )
             actual = (
                 result.invocation_id,
                 result.run_id,
                 result.work_item_id,
                 result.worker_id,
+                result.lease_id,
             )
             if actual != expected:
                 raise ValueError("worker result provenance does not match the leased invocation")
@@ -140,6 +160,7 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
                 exit_code=None,
                 stdout="",
                 stderr=f"worker invocation failed ({type(exc).__name__})",
+                lease_id=request.lease_id,
             )
         self._append_event(
             request,
@@ -176,6 +197,66 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
         with self._lock:
             return invocation_id in self._events, self._results.get(invocation_id)
 
+    def lifecycle(self, action: str, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        if request.worker_id != self.worker_capabilities.worker_id:
+            raise PermissionError("lease worker identity does not match endpoint")
+        with self._lock:
+            current = self._lease_states.get(request.lease_id)
+        if action == "setup" and current is not None:
+            expected = (request.run_id, request.work_item_id, request.worker_id,
+                        request.route_sha256)
+            actual = (current.run_id, current.work_item_id, current.worker_id,
+                      current.route_sha256)
+            if actual != expected:
+                raise PermissionError("lease identity is already bound to different authority")
+            return current
+        operation = {
+            "setup": self.worker.setup_lease,
+            "reset": self.worker.reset_lease,
+            "teardown": self.worker.teardown_lease,
+        }[action]
+        state = operation(request)
+        expected = (request.lease_id, request.run_id, request.work_item_id,
+                    request.worker_id, request.route_sha256)
+        actual = (state.lease_id, state.run_id, state.work_item_id,
+                  state.worker_id, state.route_sha256)
+        if actual != expected:
+            raise ValueError("worker lease state provenance mismatch")
+        with self._lock:
+            self._lease_states[state.lease_id] = state
+            self._persist_lease_states_locked()
+        return state
+
+    def _load_lease_states(self) -> dict[str, WorkerLeaseState]:
+        if not self._lease_state_path.exists():
+            return {}
+        value = json.loads(self._lease_state_path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("worker lease state file must contain an object")
+        return {key: WorkerLeaseState.from_dict(item) for key, item in value.items()}
+
+    def _persist_lease_states_locked(self) -> None:
+        temporary = self._lease_state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(
+            {key: state.to_dict() for key, state in sorted(self._lease_states.items())},
+            allow_nan=False, sort_keys=True,
+        ), encoding="utf-8")
+        temporary.replace(self._lease_state_path)
+
+    def artifact(self, invocation_id: str, digest: str) -> bytes | None:
+        with self._lock:
+            result = self._results.get(invocation_id)
+        if result is None:
+            return None
+        matches = [item for item in result.artifacts if item.sha256 == digest]
+        if len(matches) != 1:
+            return None
+        artifact = matches[0]
+        data = self.worker.fetch_artifact(invocation_id, artifact)
+        if len(data) != artifact.size or hashlib.sha256(data).hexdigest() != artifact.sha256:
+            raise ValueError("worker artifact bytes do not match declared size and digest")
+        return data
+
 
 class RemoteWorkerHTTPRequestHandler(BaseHTTPRequestHandler):
     server: RemoteWorkerHTTPServer
@@ -187,6 +268,14 @@ class RemoteWorkerHTTPRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/capabilities":
             return self._json(HTTPStatus.OK, self.server.worker_capabilities.to_dict())
         parts = parsed.path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["v1", "invocations"] and parts[3] == "artifacts":
+            try:
+                data = self.server.artifact(unquote(parts[2]), parts[4])
+            except ValueError as exc:
+                return self._error(HTTPStatus.BAD_GATEWAY, str(exc))
+            if data is None:
+                return self._error(HTTPStatus.NOT_FOUND, "unknown invocation artifact")
+            return self._bytes(HTTPStatus.OK, data)
         if len(parts) == 4 and parts[:2] == ["v1", "invocations"]:
             invocation_id, resource = unquote(parts[2]), parts[3]
             if resource == "events":
@@ -227,6 +316,20 @@ class RemoteWorkerHTTPRequestHandler(BaseHTTPRequestHandler):
                 "invocation_id": request.invocation_id,
                 "status": "accepted",
             })
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["v1", "leases"] and parts[3] in {
+            "setup", "reset", "teardown",
+        }:
+            try:
+                request = WorkerLeaseRequest.from_dict(self._read_json())
+                if unquote(parts[2]) != request.lease_id:
+                    raise ValueError("lease path and body identity differ")
+                state = self.server.lifecycle(parts[3], request)
+            except PermissionError as exc:
+                return self._error(HTTPStatus.FORBIDDEN, str(exc))
+            except (KeyError, TypeError, ValueError) as exc:
+                return self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return self._json(HTTPStatus.OK, state.to_dict())
         self._error(HTTPStatus.NOT_FOUND, "not found")
 
     def _authenticated(self) -> bool:
@@ -254,6 +357,16 @@ class RemoteWorkerHTTPRequestHandler(BaseHTTPRequestHandler):
             return self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "response exceeds size limit")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _bytes(self, status: HTTPStatus, body: bytes) -> None:
+        if len(body) > self.server.max_response:
+            return self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "response exceeds size limit")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -293,12 +406,18 @@ class HTTPWorkerTransport:
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("base_url must be an absolute HTTP(S) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("base_url must not contain userinfo")
+        if parsed.query or parsed.fragment:
+            raise ValueError("base_url must not contain a query or fragment")
         if parsed.scheme == "http" and (
             not allow_loopback_http or not _is_loopback_host(parsed.hostname)
         ):
             raise ValueError(
                 "plaintext HTTP is allowed only for loopback with explicit development opt-in"
             )
+        if parsed.path not in {"", "/"}:
+            raise ValueError("base_url path prefixes are not supported")
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token
         self.timeout = timeout
@@ -310,6 +429,20 @@ class HTTPWorkerTransport:
     def capabilities(self) -> WorkerCapabilities:
         _, value = self._request("GET", "/v1/capabilities")
         return WorkerCapabilities.from_dict(value)
+
+    def _lease(self, action: str, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        path = f"/v1/leases/{quote(request.lease_id, safe='')}/{action}"
+        _, value = self._request("POST", path, request.to_dict())
+        return WorkerLeaseState.from_dict(value)
+
+    def setup_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        return self._lease("setup", request)
+
+    def reset_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        return self._lease("reset", request)
+
+    def teardown_lease(self, request: WorkerLeaseRequest) -> WorkerLeaseState:
+        return self._lease("teardown", request)
 
     def invoke(self, request: InvocationRequest) -> InvocationResult:
         self._request("POST", "/v1/invocations", request.to_dict(), expected=(202,))
@@ -326,6 +459,11 @@ class HTTPWorkerTransport:
         path = f"/v1/invocations/{quote(invocation_id, safe='')}/events?after={after}"
         _, value = self._request("GET", path)
         return tuple(WorkerEvent.from_dict(item) for item in value["events"])
+
+    def fetch_artifact(self, invocation_id: str, artifact: ArtifactRecord) -> bytes:
+        path = (f"/v1/invocations/{quote(invocation_id, safe='')}/artifacts/"
+                f"{artifact.sha256}")
+        return self._request_bytes("GET", path)
 
     def cancel(self, invocation_id: str) -> bool:
         return False  # Cancellation requires adapter-specific interrupt semantics.
@@ -368,6 +506,22 @@ class HTTPWorkerTransport:
         if not isinstance(decoded, dict):
             raise RemoteWorkerError("remote worker response must be a JSON object")
         return status, decoded
+
+    def _request_bytes(self, method: str, path: str) -> bytes:
+        request = Request(
+            self.base_url + path, method=method,
+            headers={"Authorization": f"Bearer {self.auth_token}",
+                     "Accept": "application/octet-stream"},
+        )
+        try:
+            response = urlopen(request, timeout=self.timeout)
+            with response:
+                raw = response.read(self.max_response + 1)
+        except HTTPError as exc:
+            raise RemoteWorkerError(f"remote worker HTTP {exc.code}: artifact unavailable") from exc
+        if len(raw) > self.max_response:
+            raise RemoteWorkerError("remote worker response exceeds size limit")
+        return raw
 
 
 def _is_loopback_host(host: str | None) -> bool:

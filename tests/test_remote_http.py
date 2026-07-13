@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+from dataclasses import asdict
+import hashlib
 import tempfile
 import threading
 import unittest
 
-from rekit_factory.remote import InvocationRequest, InvocationResult, WorkerCapabilities
+from rekit_factory.remote import (
+    ArtifactRecord, InvocationRequest, InvocationResult, WorkerCapabilities,
+    WorkerLeaseRequest, WorkerLeaseState,
+)
 from rekit_factory.remote_http import (
     HTTPWorkerTransport,
     RemoteWorkerError,
@@ -53,6 +58,7 @@ class FixtureWorker:
     def __init__(self):
         self.requests: list[InvocationRequest] = []
         self.result_worker_id = "fixture-worker"
+        self.artifact_data = b"fixture artifact"
 
     def capabilities(self) -> WorkerCapabilities:
         return WorkerCapabilities(
@@ -74,7 +80,25 @@ class FixtureWorker:
             exit_code=0,
             stdout=Path(request.target_path).read_text(encoding="utf-8"),
             stderr="",
+            artifacts=(ArtifactRecord(
+                path="reports/result.txt",
+                sha256=hashlib.sha256(self.artifact_data).hexdigest(),
+                size=len(self.artifact_data), media_type="text/plain",
+            ),),
+            lease_id=request.lease_id,
         )
+
+    def setup_lease(self, request):
+        return WorkerLeaseState(**asdict(request), status="ready")
+
+    def reset_lease(self, request):
+        return WorkerLeaseState(**asdict(request), status="ready")
+
+    def teardown_lease(self, request):
+        return WorkerLeaseState(**asdict(request), status="closed")
+
+    def fetch_artifact(self, invocation_id, artifact):
+        return self.artifact_data
 
     def cancel(self, invocation_id: str) -> bool:
         return False
@@ -117,6 +141,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             "target_path": "fixture.txt",
             "target_sha256": "a" * 64,
             "mount_policy": "staged-input-read-only",
+            "lease_id": "lease-http-1",
         }
         values.update(overrides)
         return InvocationRequest(**values)
@@ -132,6 +157,19 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             **overrides,
         )
 
+    def invoke(self, client: HTTPWorkerTransport,
+               request: InvocationRequest) -> InvocationResult:
+        lease = WorkerLeaseRequest(
+            lease_id=request.lease_id, run_id=request.run_id,
+            work_item_id=request.work_item_id, worker_id="fixture-worker",
+            route_sha256="a" * 64,
+        )
+        state = client.setup_lease(lease)
+        if state.status != "ready":
+            state = client.reset_lease(lease)
+        self.assertEqual("ready", state.status)
+        return client.invoke(request)
+
     def test_discovers_capabilities_invokes_and_resumes_ordered_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -141,10 +179,14 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                 self.assertEqual("fixture-worker", capabilities.worker_id)
                 self.assertEqual(("fixture-scan",), capabilities.tools)
 
-                result = client.invoke(self.scoped_request(root / "fixture.txt"))
+                result = self.invoke(client, self.scoped_request(root / "fixture.txt"))
                 self.assertEqual("done", result.status)
                 self.assertEqual("benign fixture", result.stdout)
                 self.assertEqual("run-1", result.run_id)
+                self.assertEqual("lease-http-1", result.lease_id)
+                self.assertEqual(worker.artifact_data, client.fetch_artifact(
+                    result.invocation_id, result.artifacts[0],
+                ))
                 self.assertEqual(
                     (root / "fixture.txt").resolve(),
                     Path(worker.requests[0].target_path).resolve(),
@@ -172,9 +214,9 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             (root / "fixture.txt").write_text("fixture", encoding="utf-8")
             with running_server(root) as (_, client):
                 with self.assertRaisesRegex(RemoteWorkerError, "relative to the staged input"):
-                    client.invoke(self.request(invocation_id="invoke-absolute", target_path="/tmp/a"))
+                    self.invoke(client, self.request(invocation_id="invoke-absolute", target_path="/tmp/a"))
                 with self.assertRaisesRegex(RemoteWorkerError, "network policy"):
-                    client.invoke(self.request(
+                    self.invoke(client, self.request(
                         invocation_id="invoke-network", network_policy="unrestricted"
                     ))
 
@@ -184,7 +226,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             (root / "fixture.txt").write_text("fixture", encoding="utf-8")
             with running_server(root, max_body=300) as (_, client):
                 with self.assertRaisesRegex(RemoteWorkerError, "request body"):
-                    client.invoke(self.request(arguments=("x" * 500,)))
+                    self.invoke(client, self.request(arguments=("x" * 500,)))
 
     def test_rejects_worker_result_with_mismatched_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,7 +234,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             (root / "fixture.txt").write_text("fixture", encoding="utf-8")
             with running_server(root) as (worker, client):
                 worker.result_worker_id = "spoofed-worker"
-                result = client.invoke(self.scoped_request(
+                result = self.invoke(client, self.scoped_request(
                     root / "fixture.txt", invocation_id="invoke-spoofed",
                 ))
                 self.assertEqual("failed", result.status)
@@ -218,6 +260,42 @@ class RemoteHTTPTransportTests(unittest.TestCase):
         HTTPWorkerTransport(
             "http://127.0.0.1:8765", auth_token="token", allow_loopback_http=True,
         )
+        for url, message in (
+            ("https://user:secret@worker.invalid", "userinfo"),
+            ("https://worker.invalid?mode=unsafe", "query or fragment"),
+            ("https://worker.invalid#fragment", "query or fragment"),
+            ("https://worker.invalid/prefix", "path prefixes"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                HTTPWorkerTransport(url, auth_token="token")
+
+    def test_lease_lifecycle_round_trips_exact_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with running_server(Path(tmp)) as (_, client):
+                request = WorkerLeaseRequest(
+                    lease_id="lease-roundtrip", run_id="run-1", work_item_id="work-1",
+                    worker_id="fixture-worker", route_sha256="a" * 64,
+                )
+                self.assertEqual("ready", client.setup_lease(request).status)
+                self.assertEqual("ready", client.reset_lease(request).status)
+                self.assertEqual("closed", client.teardown_lease(request).status)
+
+    def test_dirty_lease_survives_server_restart_and_requires_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            request = self.scoped_request(target, invocation_id="invoke-restart")
+            lease = WorkerLeaseRequest(
+                lease_id=request.lease_id, run_id=request.run_id,
+                work_item_id=request.work_item_id, worker_id="fixture-worker",
+                route_sha256="a" * 64,
+            )
+            with running_server(root) as (_, client):
+                self.assertEqual("done", self.invoke(client, request).status)
+            with running_server(root) as (_, resumed):
+                self.assertEqual("dirty", resumed.setup_lease(lease).status)
+                self.assertEqual("ready", resumed.reset_lease(lease).status)
 
     def test_scope_is_required_even_for_offline_read_only_and_endpoint_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -226,12 +304,12 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             target.write_text("fixture", encoding="utf-8")
             with running_server(root) as (_, client):
                 with self.assertRaisesRegex(RemoteWorkerError, "verified scope is required"):
-                    client.invoke(self.request(
+                    self.invoke(client, self.request(
                         invocation_id="invoke-unscoped", target_sha256=hash_path(target),
                         requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
                     ))
                 with self.assertRaisesRegex(RemoteWorkerError, "endpoint intent requires"):
-                    client.invoke(self.scoped_request(
+                    self.invoke(client, self.scoped_request(
                         target, invocation_id="invoke-offline-endpoint",
                         endpoint="https://injected.invalid/collect",
                     ))
@@ -255,7 +333,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                     requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,
                                        ActionAuthority.NETWORK_ACCESS.value),
                 )
-                self.assertEqual("done", client.invoke(request).status)
+                self.assertEqual("done", self.invoke(client, request).status)
 
                 injected = self.request(
                     invocation_id="invoke-injected",
@@ -268,7 +346,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                                        ActionAuthority.NETWORK_ACCESS.value),
                 )
                 with self.assertRaisesRegex(RemoteWorkerError, "outside the verified scope"):
-                    client.invoke(injected)
+                    self.invoke(client, injected)
 
                 mismatched = self.request(
                     invocation_id="invoke-mismatch",
@@ -281,7 +359,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                                        ActionAuthority.NETWORK_ACCESS.value),
                 )
                 with self.assertRaisesRegex(RemoteWorkerError, "digest"):
-                    client.invoke(mismatched)
+                    self.invoke(client, mismatched)
 
                 missing = self.request(
                     invocation_id="invoke-missing-scope",
@@ -290,7 +368,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                     endpoint=allowed,
                 )
                 with self.assertRaisesRegex(RemoteWorkerError, "verified scope is required"):
-                    client.invoke(missing)
+                    self.invoke(client, missing)
 
     def test_remote_revalidates_opaque_account_and_credential_intent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,21 +397,21 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                     account_ref="account:approved",
                     **common,
                 )
-                self.assertEqual("done", client.invoke(approved).status)
+                self.assertEqual("done", self.invoke(client, approved).status)
                 denied = self.request(
                     invocation_id="invoke-account-denied",
                     account_ref="account:unlisted",
                     **common,
                 )
                 with self.assertRaisesRegex(RemoteWorkerError, "account"):
-                    client.invoke(denied)
+                    self.invoke(client, denied)
 
                 no_account = self.request(
                     invocation_id="invoke-account-missing",
                     **common,
                 )
                 with self.assertRaisesRegex(RemoteWorkerError, "requires an opaque account"):
-                    client.invoke(no_account)
+                    self.invoke(client, no_account)
 
 
 if __name__ == "__main__":

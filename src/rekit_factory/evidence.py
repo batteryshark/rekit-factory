@@ -91,6 +91,7 @@ class Provenance:
     initiating_worker_id: str | None = None
     invocation_id: str | None = None
     work_item_id: str | None = None
+    lease_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("run_id", "source", "capture_reason", "captured_at", "environment_id"):
