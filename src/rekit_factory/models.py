@@ -20,6 +20,7 @@ from muster.pydantic_runtime import (
     load_message_history,
 )
 from rekit_factory.memory import MemoryAction
+from rekit_factory.hypotheses import HypothesisProposal, HypothesisUpdate
 
 
 class WorkerReport(BaseModel):
@@ -28,6 +29,8 @@ class WorkerReport(BaseModel):
     next_actions: list[str] = Field(default_factory=list)
     status_update: str
     proposed_memory_actions: list[MemoryAction] = Field(default_factory=list)
+    proposed_hypotheses: list[HypothesisProposal] = Field(default_factory=list)
+    hypothesis_updates: list[HypothesisUpdate] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -197,7 +200,10 @@ class PydanticWorkerBackend:
                 "Propose durable reasoning updates only through proposed_memory_actions; "
                 "never encode memory writes in summary, observations, or next_actions. "
                 "Each proposal must use the documented typed event vocabulary and evidence "
-                "references. The Factory validates proposals and owns all persistence."
+                "references. Propose testable competing explanations only through "
+                "proposed_hypotheses, and report discriminating-test outcomes only through "
+                "hypothesis_updates with cited observations. The Factory validates proposals, "
+                "scope, transitions, and scheduling and owns all persistence."
             ),
         )
 

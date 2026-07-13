@@ -23,6 +23,7 @@ KNOWN_TYPES = frozenset({
     "goal_set", "workstream_upserted", "attempt_recorded", "decision_recorded",
     "research_question_upserted", "theory_upserted", "next_action_upserted",
     "session_compacted",
+    "hypothesis_upserted", "hypothesis_test_upserted", "hypothesis_observation_recorded",
 })
 ENTITY_TYPES = KNOWN_TYPES - {"session_compacted"}
 REFERENCE_KINDS = frozenset({
@@ -44,6 +45,8 @@ class MemoryAction:
         "goal_set", "workstream_upserted", "attempt_recorded", "decision_recorded",
         "research_question_upserted", "theory_upserted", "next_action_upserted",
         "session_compacted",
+        "hypothesis_upserted", "hypothesis_test_upserted",
+        "hypothesis_observation_recorded",
     ]
     payload: dict[str, Any]
     action_id: str | None = None
@@ -71,6 +74,9 @@ class ProjectMemory:
     questions: dict[str, dict[str, Any]] = field(default_factory=dict)
     theories: dict[str, dict[str, Any]] = field(default_factory=dict)
     next_actions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    hypotheses: dict[str, dict[str, Any]] = field(default_factory=dict)
+    hypothesis_tests: dict[str, dict[str, Any]] = field(default_factory=dict)
+    hypothesis_observations: dict[str, dict[str, Any]] = field(default_factory=dict)
     compaction: dict[str, Any] | None = None
     degraded: bool = False
     diagnostics: list[str] = field(default_factory=list)
@@ -79,7 +85,8 @@ class ProjectMemory:
     def deterministic_dict(self) -> dict[str, Any]:
         value = asdict(self)
         for name in ("workstreams", "attempts", "decisions", "questions",
-                     "theories", "next_actions"):
+                     "theories", "next_actions", "hypotheses", "hypothesis_tests",
+                     "hypothesis_observations"):
             value[name] = {key: value[name][key] for key in sorted(value[name])}
         value["missing_references"] = sorted(
             value["missing_references"], key=lambda item: (item["kind"], item["id"])
@@ -173,6 +180,9 @@ def fold_memory(events: list[MemoryEvent], *, diagnostics: list[str] | None = No
                 "research_question_upserted": memory.questions,
                 "theory_upserted": memory.theories,
                 "next_action_upserted": memory.next_actions,
+                "hypothesis_upserted": memory.hypotheses,
+                "hypothesis_test_upserted": memory.hypothesis_tests,
+                "hypothesis_observation_recorded": memory.hypothesis_observations,
             }[event.type]
             collection[item["id"]] = item
         if reference_exists:
@@ -214,6 +224,22 @@ def memory_context(memory: ProjectMemory, *, max_chars: int = 8_000) -> str:
         if item.get("status") in {"supported", "testing"}:
             text = f"{item.get('claim')} | confidence={item.get('confidence')}"
             sections.append((750, _line("THEORY", text, item)))
+    for item in memory.hypotheses.values():
+        status = item.get("status")
+        text = (
+            f"{item.get('claim')} | status={status} | expected={item.get('expectedObservation')} "
+            f"| falsifier={item.get('falsifier')}"
+        )
+        if status in {"disproved", "contradicted", "blocked"}:
+            sections.append((875, _line("HYPOTHESIS NEGATIVE", text, item)))
+        elif status in {"proposed", "queued", "testing", "supported", "reproduced"}:
+            sections.append((825, _line("HYPOTHESIS", text, item)))
+    for item in memory.hypothesis_observations.values():
+        text = (
+            f"{item.get('hypothesisId')} outcome={item.get('outcome')}: "
+            f"{'; '.join(item.get('observations', []))}"
+        )
+        sections.append((860, _line("HYPOTHESIS EVIDENCE", text, item)))
     for item in memory.next_actions.values():
         if item.get("status") == "pending" and not item.get("blockers"):
             sections.append((700 + int(item.get("priority", 0)),
@@ -248,6 +274,9 @@ def render_markdown(memory: ProjectMemory) -> str:
         ("Research questions", memory.questions.values(), "question"),
         ("Theories", memory.theories.values(), "claim"),
         ("Next actions", memory.next_actions.values(), "text"),
+        ("Hypotheses", memory.hypotheses.values(), "claim"),
+        ("Hypothesis tests", memory.hypothesis_tests.values(), "objective"),
+        ("Hypothesis observations", memory.hypothesis_observations.values(), "reason"),
     )
     for title, values, label in groups:
         lines += [f"## {title}", ""]
@@ -301,14 +330,29 @@ def _validate_action(action: MemoryAction) -> dict[str, Any]:
         "theory_upserted": ("id", "claim", "status", "confidence"),
         "next_action_upserted": ("id", "text", "priority", "status"),
         "session_compacted": ("summary", "unknowns", "references"),
+        "hypothesis_upserted": (
+            "id", "claim", "scope", "expectedObservation", "falsifier", "confidence",
+            "status", "stopCondition", "semanticKey", "references",
+        ),
+        "hypothesis_test_upserted": (
+            "id", "hypothesisId", "objective", "scope", "method", "expected_observation",
+            "falsifying_observation", "information_gain", "risk", "cost_units", "status",
+            "attempts", "references",
+        ),
+        "hypothesis_observation_recorded": (
+            "id", "hypothesisId", "testId", "outcome", "observations", "reason", "references",
+        ),
     }[action.type]
     missing = [name for name in required if name not in payload]
     if missing:
         raise ValueError(f"{action.type} missing fields: {', '.join(missing)}")
     for name in required:
-        if name in {"alternatives", "unknowns", "references"}:
+        if name in {"alternatives", "unknowns", "references", "observations"}:
             if not isinstance(payload[name], list):
                 raise ValueError(f"{action.type}.{name} must be a list")
+        elif name == "stopCondition":
+            if not isinstance(payload[name], dict):
+                raise ValueError("hypothesis stopCondition must be an object")
         elif name == "priority":
             if isinstance(payload[name], bool) or not isinstance(payload[name], int):
                 raise ValueError("next_action_upserted.priority must be an integer")
@@ -324,6 +368,11 @@ def _validate_action(action: MemoryAction) -> dict[str, Any]:
         "research_question_upserted": {"open", "answered", "closed"},
         "theory_upserted": {"proposed", "testing", "supported", "rejected", "disproven"},
         "next_action_upserted": {"pending", "running", "blocked", "completed", "cancelled"},
+        "hypothesis_upserted": {
+            "proposed", "queued", "testing", "supported", "contradicted", "disproved",
+            "reproduced", "retired", "blocked",
+        },
+        "hypothesis_test_upserted": {"proposed", "queued", "leased", "completed", "blocked"},
     }
     if action.type in statuses and payload["status"] not in statuses[action.type]:
         raise ValueError(f"invalid {action.type} status {payload['status']!r}")

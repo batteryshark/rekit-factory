@@ -42,6 +42,12 @@ from rekit_factory.evidence import (
     render_tool_output,
 )
 from rekit_factory.memory import MemoryAction, ProjectMemoryLog, memory_context
+from rekit_factory.hypotheses import (
+    HypothesisMemory,
+    HypothesisUpdate,
+    hypothesis_snapshot,
+    test_priority,
+)
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.scope import (
     ActionAuthority,
@@ -414,6 +420,7 @@ class InvestigationController:
             "artifacts": artifacts,
             "memory": project_memory.deterministic_dict(),
             "memoryContext": memory_context(project_memory),
+            "hypothesisState": hypothesis_snapshot(project_memory),
         }
 
     async def _tool_handler(self, ctx, item: dict[str, Any]) -> None:
@@ -610,6 +617,21 @@ class InvestigationController:
         payload = json.loads(item["payload_json"])
         worker_id = payload["workerId"]
         role = payload["role"]
+        hypothesis_id = payload.get("hypothesisId")
+        hypothesis_test_id = payload.get("hypothesisTestId")
+        if hypothesis_id and hypothesis_test_id:
+            hypothesis_memory = HypothesisMemory(_project_memory_log(ctx.deps.paths))
+            current = hypothesis_memory.log.replay().hypotheses.get(hypothesis_id)
+            if current and current["status"] == "queued":
+                hypothesis_memory.transition(HypothesisUpdate(
+                    hypothesis_id=hypothesis_id, test_id=hypothesis_test_id,
+                    status="testing", confidence=float(current["confidence"]),
+                    reason="Discriminating test leased by durable scheduler",
+                ))
+            if current and current["status"] in {"queued", "testing"}:
+                hypothesis_memory.update_test(
+                    hypothesis_test_id, "leased", increment_attempt=True
+                )
         worker_backend = self.worker_backend(payload.get("modelProfile"))
         session = ledger.worker_session(ctx.state.run_id, worker_id)
         available_tools = tuple(
@@ -731,6 +753,26 @@ class InvestigationController:
                 ctx.deps.paths,
                 getattr(report, "proposed_memory_actions", ()),
             )
+            hypothesis_updates = self._apply_hypothesis_updates(
+                ctx.deps.paths, getattr(report, "hypothesis_updates", ()),
+            )
+            hypotheses_scheduled, hypotheses_rejected = self._schedule_hypotheses(
+                ledger, ctx.deps.paths, ctx.state.run_id, item,
+                worker_backend.profile.name, payload.get("availableTools", ()),
+                getattr(report, "proposed_hypotheses", ()),
+            )
+            if hypothesis_id and hypothesis_test_id and hypothesis_updates == 0:
+                current = HypothesisMemory(_project_memory_log(ctx.deps.paths)).log.replay().hypotheses[
+                    hypothesis_id
+                ]
+                HypothesisMemory(_project_memory_log(ctx.deps.paths)).transition(HypothesisUpdate(
+                    hypothesis_id=hypothesis_id, test_id=hypothesis_test_id,
+                    status="blocked", confidence=float(current["confidence"]),
+                    reason="Test completed without a valid explicit hypothesis outcome",
+                ))
+                HypothesisMemory(_project_memory_log(ctx.deps.paths)).update_test(
+                    hypothesis_test_id, "blocked", outcome="missing-explicit-outcome"
+                )
             ledger.resolve(
                 item["id"],
                 result=report.model_dump(mode="json"),
@@ -748,6 +790,14 @@ class InvestigationController:
                          "memoryActionCount": accepted,
                          "memoryActionRejectedCount": rejected},
             )
+            if hypotheses_scheduled or hypotheses_rejected or hypothesis_updates:
+                ledger.event_log(
+                    ctx.state.run_id, "hypothesis.activity",
+                    "Processed structured hypothesis actions", worker_id=worker_id,
+                    payload={"scheduled": hypotheses_scheduled,
+                             "rejected": hypotheses_rejected,
+                             "updates": hypothesis_updates},
+                )
             self._enqueue_follow_ups(
                 ledger, ctx.state.run_id, item, payload, report.next_actions,
                 ctx.deps.paths, worker_backend.profile.name,
@@ -777,6 +827,19 @@ class InvestigationController:
                 ctx.state.run_id, "worker.failed", f"{type(exc).__name__}: {exc}",
                 worker_id=worker_id,
             )
+            if hypothesis_id and hypothesis_test_id:
+                hypothesis_memory = HypothesisMemory(_project_memory_log(ctx.deps.paths))
+                current = hypothesis_memory.log.replay().hypotheses.get(hypothesis_id)
+                if current and current["status"] == "testing":
+                    hypothesis_memory.transition(HypothesisUpdate(
+                        hypothesis_id=hypothesis_id, test_id=hypothesis_test_id,
+                        status="blocked", confidence=float(current["confidence"]),
+                        reason=(f"Stop condition exhausted after {item['attempts']} attempt(s): "
+                                f"{type(exc).__name__}: {exc}"),
+                    ))
+                    hypothesis_memory.update_test(
+                        hypothesis_test_id, "blocked", outcome="stop-condition-exhausted"
+                    )
             raise
 
     def _append_memory_proposals(self, paths: RunPaths,
@@ -803,6 +866,78 @@ class InvestigationController:
             except (TypeError, ValueError):
                 rejected += 1
         return accepted, rejected
+
+    def _apply_hypothesis_updates(self, paths: RunPaths, updates: Any) -> int:
+        hypotheses = HypothesisMemory(_project_memory_log(paths))
+        accepted = 0
+        for update in updates or ():
+            try:
+                hypotheses.transition(update)
+                accepted += 1
+            except (KeyError, TypeError, ValueError):
+                continue
+        return accepted
+
+    def _schedule_hypotheses(self, ledger: FactoryLedger, paths: RunPaths, run_id: str,
+                             parent_item: dict[str, Any], model_profile: str,
+                             model_tools: Any, proposals: Any) -> tuple[int, int]:
+        hypotheses = HypothesisMemory(_project_memory_log(paths))
+        scheduled = rejected = 0
+        for proposal in proposals or ():
+            try:
+                if proposal.scope != "target" or proposal.proposed_test.scope != "target":
+                    raise ValueError("hypothesis test would broaden target scope")
+                test = proposal.proposed_test
+                prerequisite_rows = {
+                    json.loads(row["payload_json"]).get("hypothesisTestId"): row["id"]
+                    for row in ledger.conn.execute(
+                        "select id, payload_json from work_items "
+                        "where run_id=? and operation='model-worker'", (run_id,),
+                    ).fetchall()
+                }
+                dependencies = [parent_item["id"]]
+                for prerequisite in test.prerequisites:
+                    if prerequisite not in prerequisite_rows:
+                        raise ValueError(f"unknown hypothesis-test prerequisite {prerequisite}")
+                    dependencies.append(prerequisite_rows[prerequisite])
+                if not hypotheses.propose(proposal):
+                    continue
+                if not test.approved or test.authorization != "automatic":
+                    rejected += 1
+                    continue
+                plan_id = f"hypothesis:{proposal.id}:{test.id}"
+                worker_id = ledger.add_planned_worker(
+                    run_id, plan_id, f"hypothesis-test:{proposal.id}", model_profile
+                )
+                ledger.enqueue(
+                    run_id=run_id,
+                    key=stable_key("hypothesis-test", proposal.id, test.id,
+                                   proposal.claim, proposal.scope),
+                    target=parent_item["target"], operation="model-worker",
+                    category="hypothesis-test", title=f"Test hypothesis {proposal.id}",
+                    priority=test_priority(proposal), depends_on=dependencies,
+                    payload={
+                        "workerId": worker_id, "role": f"hypothesis-test:{proposal.id}",
+                        "goal": (
+                            f"Discriminate hypothesis {proposal.id}: {proposal.claim}\n"
+                            f"Test: {test.objective}\nExpected: {test.expected_observation}\n"
+                            f"Falsifier: {test.falsifying_observation}\n"
+                            "Return the outcome only through hypothesis_updates with cited observations."
+                        ),
+                        "modelProfile": model_profile, "availableTools": list(model_tools),
+                        "planId": plan_id, "dedupeKey": stable_key(plan_id),
+                        "costUnits": test.cost_units, "origin": "hypothesis-test",
+                        "evidenceIds": [],
+                        "retryCeiling": proposal.stop_condition.max_attempts - 1,
+                        "hypothesisId": proposal.id, "hypothesisTestId": test.id,
+                        "authorization": test.authorization,
+                    }, state_label="queued",
+                )
+                hypotheses.mark_scheduled(proposal.id, test.id)
+                scheduled += 1
+            except (KeyError, TypeError, ValueError):
+                rejected += 1
+        return scheduled, rejected
 
     def _enqueue_planned_worker(self, ledger: FactoryLedger, run_id: str, target: str,
                                 model_profile: str, model_tools: tuple[str, ...] | list[str],
