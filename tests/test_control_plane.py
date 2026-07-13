@@ -383,7 +383,18 @@ class ControlPlaneTests(unittest.TestCase):
             base = f"http://127.0.0.1:{server.server_port}"
             try:
                 with urlopen(base + "/", timeout=5) as response:
-                    self.assertIn(b"Mission Control", response.read())
+                    page = response.read()
+                    self.assertIn(b"Mission Control", page)
+                    self.assertIn(b'/ui/mission-control.css', page)
+                    self.assertIn(b'/ui/mission-control.js', page)
+                with urlopen(base + "/ui/mission-control.css", timeout=5) as response:
+                    self.assertEqual("text/css; charset=utf-8", response.headers["Content-Type"])
+                    self.assertIn(b"prefers-reduced-motion", response.read())
+                with urlopen(base + "/ui/mission-control.js", timeout=5) as response:
+                    self.assertEqual(
+                        "text/javascript; charset=utf-8", response.headers["Content-Type"]
+                    )
+                    self.assertIn(b"async function boot()", response.read())
                 config = self._request(base + "/api/config")
                 self.assertEqual("deterministic", config["modelProfile"]["model"])
                 self.assertEqual(2, len(config["tools"]))
