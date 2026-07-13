@@ -3,6 +3,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
+import struct
+import zlib
+
+import pytest
 
 from rekit_factory.evidence import (
     AuditAction,
@@ -27,6 +31,23 @@ def provenance(*, source="terminal", reason="fixture proof"):
         tool_id="fixture-scan", worker_id="worker-1", invocation_id="invoke-1",
         work_item_id="work-1",
     )
+
+
+def png_fixture(*, descending=False, note=b""):
+    width, height = 9, 8
+    rows = []
+    for _y in range(height):
+        values = [255 - x * 20 if descending else x * 20 for x in range(width)]
+        rows.append(b"\x00" + bytes(channel for value in values for channel in (value, value, value)))
+
+    def chunk(kind, payload):
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + (chunk(b"tEXt", note) if note else b"")
+            + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b""))
 
 
 def test_raw_and_display_are_independently_hashed_and_secrets_never_project(tmp_path):
@@ -179,3 +200,66 @@ def test_retention_default_is_deterministic():
     now = datetime(2026, 7, 13, tzinfo=timezone.utc)
     assert default_expiry(RetentionClass.EPHEMERAL, now=now) == "2026-07-14T00:00:00Z"
     assert default_expiry(RetentionClass.ARCHIVE, now=now) is None
+
+
+def test_visual_capture_exact_and_perceptual_dedupe_without_desktop_capture(tmp_path):
+    store = EvidenceStore(tmp_path / "evidence", policy=CapturePolicy(allow_screenshots=True))
+    first = store.capture_visual(png_fixture(), provenance(source="gui"), meaningful=True)
+    exact = store.capture_visual(png_fixture(), provenance(source="gui-exact"), meaningful=True)
+    perceptual = store.capture_visual(
+        png_fixture(note=b"fixture-note"), provenance(source="gui-similar"), meaningful=True,
+    )
+
+    assert first.record is not None and first.record.perceptual_hash == "0000000000000000"
+    assert exact.record == first.record and exact.events[0].action is AuditAction.DEDUPED
+    assert perceptual.record == first.record and perceptual.events[0].action is AuditAction.DEDUPED
+    assert "perceptually equivalent" in perceptual.events[0].reason
+
+
+def test_visual_policy_requires_meaningful_frame_and_enforces_desktop_and_budget(tmp_path):
+    rejected = EvidenceStore(tmp_path / "rejected", policy=CapturePolicy(allow_screenshots=True))
+    assert rejected.capture_visual(
+        png_fixture(), provenance(source="gui"), meaningful=False
+    ).record is None
+    assert rejected.capture_visual(
+        png_fixture(), provenance(source="gui"), meaningful=True, full_desktop=True
+    ).record is None
+
+    policy = CapturePolicy(
+        allow_screenshots=True, max_screenshots=1, max_screenshot_bytes=500_000,
+        full_desktop_disposition="quarantine",
+    )
+    store = EvidenceStore(tmp_path / "quarantined", policy=policy)
+    desktop = store.capture_visual(
+        png_fixture(), provenance(source="gui"), meaningful=True, full_desktop=True
+    )
+    exhausted = store.capture_visual(
+        png_fixture(descending=True), provenance(source="gui-second"), meaningful=True
+    )
+    assert desktop.record is not None and desktop.record.state is EvidenceState.QUARANTINED
+    assert desktop.record.quarantine_labels == ("full_desktop",)
+    assert store.display_bytes(desktop.record.artifact_id) is None
+    assert exhausted.record is None and "budget" in exhausted.events[0].reason
+
+
+def test_remote_seam_cot_exclusion_and_public_metadata(tmp_path):
+    store = EvidenceStore(tmp_path / "evidence")
+    data = b"remote proof"
+    outcome = store.ingest_remote_artifact(
+        data, provenance(source="remote-provider"), expected_sha256=hashlib.sha256(data).hexdigest(),
+        media_type="application/octet-stream",
+    )
+    assert outcome.record is not None and outcome.record.kind == "remote-artifact"
+    with pytest.raises(ValueError, match="mismatch"):
+        store.ingest_remote_artifact(
+            data, provenance(), expected_sha256="0" * 64, media_type="application/octet-stream"
+        )
+    reasoning = store.capture(
+        b"private reasoning", provenance(), kind="provider-chain-of-thought", media_type="text/plain"
+    )
+    assert reasoning.record is None and reasoning.events[0].action is AuditAction.WITHHELD
+
+    public = store.public_records("run-fixture")[0]
+    assert public["provenance"]["capture_reason"] == "fixture proof"
+    assert "raw_path" not in public and "display_path" not in public
+    assert "rawPath" not in public and "displayPath" not in public

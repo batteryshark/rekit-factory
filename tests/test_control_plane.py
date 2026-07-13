@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 from rekit_factory.api import FactoryServer, _after
 from rekit_factory.control import InvestigationController, RunRequest
-from rekit_factory.evidence import EvidenceStore
+from rekit_factory.evidence import EvidenceStore, Provenance, hash_target
 from rekit_factory.models import (
     DeferredModelToolCall,
     ModelActivity,
@@ -437,9 +437,12 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn('id="strategySelect"', page)
         self.assertIn('id="retriesPerWorker"', page)
         self.assertIn('value="automatic-only"', page)
+        self.assertIn('id="evidenceLifecycle"', page)
         for field in ("strategy", "concurrency", "retriesPerWorker", "costUnits", "maxWorkers"):
             self.assertIn(field, script)
         self.assertIn("cannot bypass server-side gates", page)
+        self.assertIn("updateEvidence", script)
+        self.assertNotIn("rawPath", script)
 
     def test_loopback_service_restart_is_explicit_and_stops_the_server(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -542,6 +545,31 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn("attachment", response.headers["Content-Disposition"])
                     self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
                     self.assertIn(b"stdout", response.read())
+                evidence_store = EvidenceStore(Path(launched["runDir"]) / "evidence")
+                evidence_record = evidence_store.capture_tool_output(
+                    b"operator-visible proof",
+                    Provenance(
+                        run_id=run_id, source="fixture", capture_reason="API lifecycle proof",
+                        captured_at="2026-07-13T12:00:00Z", environment_id="local:test",
+                        target_sha256=hash_target(target),
+                    ),
+                ).record
+                self.assertIsNotNone(evidence_record)
+                evidence = self._request(base + f"/api/runs/{run_id}/evidence")
+                public_record = next(
+                    item for item in evidence["records"]
+                    if item["artifactId"] == evidence_record.artifact_id
+                )
+                self.assertNotIn("rawPath", public_record)
+                pinned = self._request(
+                    base + f"/api/runs/{run_id}/evidence/{evidence_record.artifact_id}/pin",
+                    {"citationId": "operator:test"},
+                )
+                self.assertIn("operator:test", pinned["record"]["citations"])
+                conflict = self._request(
+                    base + f"/api/runs/{run_id}/evidence/{evidence_record.artifact_id}/delete", {}
+                )
+                self.assertEqual("retention_conflict", conflict["record"]["state"])
             finally:
                 server.shutdown()
                 server.server_close()

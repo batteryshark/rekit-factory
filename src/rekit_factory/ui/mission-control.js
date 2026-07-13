@@ -64,7 +64,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", selected: null, snapshot: null, stream: null, restarting: false};
+const state = {fleet: [], config: null, filter: "all", selected: null, snapshot: null, evidence: [], stream: null, restarting: false};
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
@@ -138,6 +138,8 @@ function activate(element) {
   if (restart) { restartService(); return true; }
   const view = element.closest("[data-view]");
   if (view) { show(view.dataset.view); return true; }
+  const evidenceAction = element.closest("[data-evidence-action]");
+  if (evidenceAction) { updateEvidence(evidenceAction.dataset.evidenceId, evidenceAction.dataset.evidenceAction); return true; }
   const card = element.closest("[data-run]");
   if (card) { openRun(card.dataset.run); return true; }
   const answer = element.closest("[data-answer]");
@@ -234,14 +236,35 @@ async function resolveDecision(runId, questionId, answer) {
 async function openRun(runId) {
   try {
     state.selected = runId;
-    const [snapshot, reportPayload] = await Promise.all([
+    const [snapshot, reportPayload, evidence] = await Promise.all([
       api(`/api/runs/${encodeURIComponent(runId)}`),
       api(`/api/runs/${encodeURIComponent(runId)}/reports`),
+      api(`/api/runs/${encodeURIComponent(runId)}/evidence`),
     ]);
     snapshot.workerReports = reportPayload.reports;
-    state.snapshot = snapshot; renderDetail(); show("detail"); connectEvents(runId);
+    state.snapshot = snapshot; state.evidence = evidence.records || [];
+    renderDetail(); show("detail"); connectEvents(runId);
   }
   catch (error) { toast(error.message, true); }
+}
+
+async function updateEvidence(artifactId, action) {
+  if (!state.selected) return;
+  try {
+    const result = await api(`/api/runs/${encodeURIComponent(state.selected)}/evidence/${encodeURIComponent(artifactId)}/${action}`, {method: "POST", body: JSON.stringify({citationId: `operator:${state.selected}`})});
+    state.evidence = state.evidence.map(item => item.artifactId === artifactId ? result.record : item);
+    renderEvidence();
+    toast(result.event.action === "retention_conflict" ? "Retention conflict: remove the pin or hold before deleting." : `Evidence ${action} recorded.`);
+  } catch (error) { toast(error.message, true); }
+}
+
+function renderEvidence() {
+  const records = state.evidence || [];
+  $("evidenceLifecycle").innerHTML = records.length ? records.map(record => {
+    const pinned = (record.citations || []).includes(`operator:${record.runId}`), inactive = ["deleted", "expired"].includes(record.state);
+    const labels = record.quarantineLabels?.length ? `<span class="evidence-warning">restricted: ${esc(record.quarantineLabels.join(", "))}</span>` : "";
+    return `<article class="evidence-card ${esc(record.state)}"><div class="evidence-head"><div><b>${esc(record.kind)}</b><span>${esc(record.state.replaceAll("_", " "))}</span></div><code>${esc(record.originalSha256.slice(0, 12))}</code></div><div class="evidence-facts"><span>${esc(record.mediaType)}</span><span>${record.rawSize.toLocaleString()} bytes</span><span>${esc(record.retentionClass)}</span>${record.redacted ? "<span>redacted projection</span>" : ""}${record.expiresAt ? `<span>expires ${esc(new Date(record.expiresAt).toLocaleString())}</span>` : ""}${labels}</div><div class="evidence-actions"><button class="btn" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="${pinned ? "unpin" : "pin"}" ${inactive ? "disabled" : ""}>${pinned ? "Unpin" : "Pin"}</button><button class="btn" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="${record.held ? "unhold" : "hold"}" ${inactive ? "disabled" : ""}>${record.held ? "Release hold" : "Hold"}</button><button class="btn red" data-evidence-id="${esc(record.artifactId)}" data-evidence-action="delete" ${inactive ? "disabled" : ""}>Delete</button></div></article>`;
+  }).join("") : `<div class="empty compact"><b>No retained evidence</b>Proof-required captures and their lifecycle state will appear here.</div>`;
 }
 
 function renderDetail() {
@@ -256,6 +279,7 @@ function renderDetail() {
   $("reports").innerHTML = MissionObservability.renderReports(snapshot);
   $("usage").innerHTML = MissionObservability.renderUsage(snapshot);
   $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
+  renderEvidence();
   $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;
   $("activityCount").textContent = events.length;
   $("reportCount").textContent = MissionObservability.reportCount(snapshot);
@@ -267,7 +291,7 @@ function renderDetail() {
 function connectEvents(runId) {
   if (state.stream) state.stream.close();
   state.stream = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
-  state.stream.onmessage = async () => { if (state.selected === runId) { const [snapshot, reportPayload] = await Promise.all([api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/reports`)]); snapshot.workerReports = reportPayload.reports; state.snapshot = snapshot; renderDetail(); } refreshFleet(); };
+  state.stream.onmessage = async () => { if (state.selected === runId) { const [snapshot, reportPayload, evidence] = await Promise.all([api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/reports`), api(`/api/runs/${encodeURIComponent(runId)}/evidence`)]); snapshot.workerReports = reportPayload.reports; state.snapshot = snapshot; state.evidence = evidence.records || []; renderDetail(); } refreshFleet(); };
   state.stream.addEventListener("heartbeat", () => refreshFleet());
   state.stream.onerror = () => { state.stream.close(); setTimeout(() => state.selected === runId && connectEvents(runId), 1500); };
 }

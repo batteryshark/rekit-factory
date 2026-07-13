@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 
 from rekit_factory.control import InvestigationController, RunRequest
+from rekit_factory.evidence import EvidenceStore
 from rekit_factory.scope import AuthorizedScope
 from rekit_factory.strategies import DEFAULT_STRATEGIES
 
@@ -163,6 +164,15 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     raise FileNotFoundError(f"artifact file is unavailable: {artifact['logical_path']}")
                 self._download(path, artifact["logical_path"])
                 return
+            if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "evidence":
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                evidence_root = run_dir / "evidence"
+                if not (evidence_root / "evidence.sqlite3").is_file():
+                    self._json(HTTPStatus.OK, {"runId": parts[2], "records": []})
+                    return
+                records = EvidenceStore(evidence_root).public_records(parts[2])
+                self._json(HTTPStatus.OK, {"runId": parts[2], "records": records})
+                return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "events":
                 run_dir = _find_run(self.server.storage_root, parts[2])
                 after = parse_qs(parsed.query).get("after", [None])[0]
@@ -232,6 +242,35 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, {
                     "runId": parts[2], "started": started,
                     "pendingQuestions": result["pendingQuestions"],
+                })
+                return
+            if len(parts) == 6 and parts[:2] == ["api", "runs"] \
+                    and parts[3] == "evidence":
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                evidence_root = run_dir / "evidence"
+                if not (evidence_root / "evidence.sqlite3").is_file():
+                    raise FileNotFoundError(f"run has no evidence store: {parts[2]}")
+                store = EvidenceStore(evidence_root)
+                artifact_id, action = parts[4], parts[5]
+                citation_id = str(payload.get("citationId") or f"operator:{parts[2]}")
+                if action == "pin":
+                    event = store.pin(artifact_id, citation_id)
+                elif action == "unpin":
+                    event = store.unpin(artifact_id, citation_id)
+                elif action == "hold":
+                    event = store.hold(artifact_id, True)
+                elif action == "unhold":
+                    event = store.hold(artifact_id, False)
+                elif action == "delete":
+                    event = store.request_delete(artifact_id)
+                else:
+                    raise ValueError(f"unknown evidence action: {action}")
+                record = next(item for item in store.public_records(parts[2])
+                              if item["artifactId"] == artifact_id)
+                self._json(HTTPStatus.OK, {
+                    "runId": parts[2], "record": record,
+                    "event": {"action": event.action.value, "reason": event.reason,
+                              "payload": event.payload, "createdAt": event.created_at},
                 })
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
