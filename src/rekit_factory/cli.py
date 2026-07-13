@@ -16,6 +16,8 @@ from rekit_factory.control import (
     default_storage_root,
     enforce_model_profile_concurrency,
 )
+from rekit_factory.campaign_controller import CampaignController
+from rekit_factory.campaign_persistence import CampaignPersistence
 from rekit_factory.knowledge import KnowledgeRoot
 from rekit_factory.models import ModelProfile, PydanticWorkerBackend
 from rekit_factory.rekit_client import FederatedRekitClient
@@ -222,6 +224,20 @@ class _UnusedBackend:
         raise RuntimeError("status-only controller cannot run workers")
 
 
+class _ControlOnlyCampaignRunner:
+    def run(self, _request):  # pragma: no cover - Mission Control never schedules epochs
+        raise RuntimeError("Mission Control campaign authority cannot launch epoch work")
+
+
+def _campaign_control(args: argparse.Namespace) -> CampaignController:
+    args.storage_root.mkdir(parents=True, exist_ok=True)
+    return CampaignController(
+        CampaignPersistence(args.storage_root / "campaigns.db"),
+        _ControlOnlyCampaignRunner(),
+        owner_id="mission-control-api",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -254,8 +270,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "serve":
             from rekit_factory.api import serve
             controller = _controller(args, needs_model=True)
+            campaigns = _campaign_control(args)
             print(f"Rekit Factory API: http://{args.host}:{args.port}", flush=True)
-            restart = serve(controller, host=args.host, port=args.port)
+            try:
+                restart = serve(
+                    controller, host=args.host, port=args.port,
+                    campaign_controller=campaigns,
+                )
+            finally:
+                campaigns.persistence.close()
             if restart:
                 os.execv(
                     sys.executable,

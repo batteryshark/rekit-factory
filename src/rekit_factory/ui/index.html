@@ -30,6 +30,7 @@
     <div class="content">
       <section class="view active" id="view-fleet">
         <div class="view-head"><div><div class="eyebrow">OPERATIONS</div><h1>Mission Control</h1><div class="sub" id="fleetSub">durable investigations across the factory</div></div><div class="grow"></div><div class="stats" id="stats"></div></div>
+        <section class="campaign-board" aria-labelledby="campaignBoardHeading"><header><div><span class="eyebrow">MULTI-EPOCH AUTONOMY</span><h2 id="campaignBoardHeading">Campaign watch</h2><p>Canonical health, bounded authority, and operator gates.</p></div><div class="campaign-board-health" id="campaignBoardHealth" role="status"></div></header><div class="campaign-fleet" id="campaignFleet" aria-live="polite"></div></section>
         <div class="fleet-controls"><div class="filters" id="filters"></div><label class="fleet-search" for="fleetSearch"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input id="fleetSearch" type="search" placeholder="Search target, goal, model…" autocomplete="off"></label></div><div class="fleet-health" id="fleetHealth"></div><div class="fleet" id="fleet"></div>
       </section>
       <section class="view" id="view-inbox">
@@ -101,6 +102,7 @@
     </div>
   </main>
 </div>
+<dialog class="campaign-dialog" id="campaignDialog" aria-labelledby="campaignDialogTitle"><button class="campaign-dialog-close" type="button" data-campaign-close aria-label="Close campaign detail">×</button><div id="campaignDetail"></div></dialog>
 <div class="attention-announcer" id="operatorAttentionAnnouncer" role="status" aria-live="assertive" aria-atomic="true"></div>
 <aside class="operator-attention" id="operatorAttention" role="region" aria-labelledby="operatorAttentionTitle" aria-describedby="operatorAttentionMessage" hidden>
   <button class="attention-dismiss" type="button" data-attention-dismiss aria-label="Dismiss operator attention notification">×</button>
@@ -111,6 +113,7 @@
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script src="/ui/mission-attention.js" defer></script>
 <script src="/ui/mission-outcomes.js" defer></script>
+<script src="/ui/mission-campaigns.js" defer></script>
 <script src="/ui/mission-control.js" defer></script>
 </body>
 </html>

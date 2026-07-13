@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Callable, Protocol
 
 from .campaign_contracts import (
@@ -35,6 +36,14 @@ class CampaignControllerError(ValueError):
 
 class CampaignControllerInterrupted(BaseException):
     """Test-only process interruption at a controller reconciliation boundary."""
+
+
+def _serialized(method):
+    """Serialize one controller and its shared SQLite connection across API/scheduler threads."""
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -176,6 +185,7 @@ class CampaignController:
         if not owner_id or len(owner_id) > 256:
             raise CampaignControllerError("owner_id must be a bounded stable identifier")
         self.persistence = persistence
+        self._lock = threading.RLock()
         self.runner = runner
         self.owner_id = owner_id
         self.lifecycle = lifecycle
@@ -195,6 +205,11 @@ class CampaignController:
     def _fault(self, boundary: str) -> None:
         if self.fault_injector is not None:
             self.fault_injector(boundary)
+
+    def _require_canonical_projection(self, campaign_id: str) -> None:
+        rebuild = self.persistence.rebuild_projection(campaign_id)
+        if rebuild.degraded or not rebuild.matches_live:
+            raise CampaignControllerError("campaign projection is degraded; controls fail closed")
 
     def _contract(self, campaign_id: str) -> CampaignContract:
         row = self.persistence.conn.execute(
@@ -239,6 +254,7 @@ class CampaignController:
                 authority=CAMPAIGN_AUTHORITY,
             ))
 
+    @_serialized
     def start(self, contract: CampaignContract) -> CampaignSnapshot:
         self.persistence.create_campaign(contract, operation_id="controller-create")
         projection = self.persistence.campaign(contract.campaign_id)
@@ -250,6 +266,7 @@ class CampaignController:
         self._lifecycle_start(contract.campaign_id)
         return self.snapshot(contract.campaign_id)
 
+    @_serialized
     def launch(self, epoch: EpochContract, reservation: ResourceUsage) -> EpochLaunch:
         campaign = self._contract(epoch.campaign_id)
         epoch.validate_for(campaign)
@@ -313,6 +330,7 @@ class CampaignController:
             )
         self._fault("execution-staged")
 
+    @_serialized
     def step(self, campaign_id: str, *, phase: CampaignPhase,
              totals: CanonicalOutcomeTotals,
              previous_totals: CanonicalOutcomeTotals = CanonicalOutcomeTotals(),
@@ -582,25 +600,39 @@ class CampaignController:
             )
         self._fault("recommendation-applied")
 
-    def pause(self, campaign_id: str) -> CampaignSnapshot:
+    @_serialized
+    def pause(self, campaign_id: str, *, operation_id: str | None = None,
+              expected_revision: int | None = None) -> CampaignSnapshot:
+        self._require_canonical_projection(campaign_id)
         revision = self.persistence.campaign(campaign_id).revision
         self.persistence.transition_campaign(campaign_id, "suspended",
-            authority="factory-scheduler", operation_id=f"operator-pause:{revision}")
+            authority="factory-scheduler",
+            operation_id=operation_id or f"operator-pause:{revision}",
+            expected_revision=expected_revision)
         return self.snapshot(campaign_id)
 
-    def resume(self, campaign_id: str) -> CampaignSnapshot:
+    @_serialized
+    def resume(self, campaign_id: str, *, operation_id: str | None = None,
+               expected_revision: int | None = None) -> CampaignSnapshot:
+        self._require_canonical_projection(campaign_id)
         revision = self.persistence.campaign(campaign_id).revision
         self.persistence.transition_campaign(campaign_id, "running",
-            authority="factory-scheduler", operation_id=f"operator-resume:{revision}")
+            authority="factory-scheduler",
+            operation_id=operation_id or f"operator-resume:{revision}",
+            expected_revision=expected_revision)
         return self.snapshot(campaign_id)
 
+    @_serialized
     def stop(self, campaign_id: str, reason_code: str,
-             evidence_ids: tuple[str, ...]) -> CampaignSnapshot:
+             evidence_ids: tuple[str, ...], *, operation_id: str = "operator-stop",
+             expected_revision: int | None = None) -> CampaignSnapshot:
+        self._require_canonical_projection(campaign_id)
         projection = self.persistence.campaign(campaign_id)
         outcome = TerminalOutcome(campaign_id, "stopped", reason_code, evidence_ids,
                                   projection.latest_checkpoint_id)
         self.persistence.transition_campaign(campaign_id, "stopped", authority="operator",
-                                             operation_id="operator-stop", terminal=outcome)
+                                             operation_id=operation_id, terminal=outcome,
+                                             expected_revision=expected_revision)
         with self.persistence.conn:
             self.persistence.conn.execute(
                 "update factory_campaign_controller_epochs set recommendation_applied=1,"
@@ -611,6 +643,7 @@ class CampaignController:
         self._lifecycle_terminal(campaign_id, completed=False)
         return self.snapshot(campaign_id)
 
+    @_serialized
     def recover(self, campaign_id: str) -> CampaignSnapshot:
         initial = self.persistence.campaign(campaign_id)
         if initial.status in {"suspended", "stopped"}:
@@ -631,6 +664,7 @@ class CampaignController:
                 return self.snapshot(campaign_id)
         return self.snapshot(campaign_id)
 
+    @_serialized
     def snapshot(self, campaign_id: str) -> CampaignSnapshot:
         projection = self.persistence.campaign(campaign_id)
         recommendation = None
@@ -644,6 +678,7 @@ class CampaignController:
                                 projection.latest_checkpoint_id, projection.cumulative_usage,
                                 recommendation, projection.terminal)
 
+    @_serialized
     def handoff(self, campaign_id: str) -> CampaignHandoff:
         snapshot = self.snapshot(campaign_id)
         rows = self.persistence.conn.execute(
@@ -673,6 +708,85 @@ class CampaignController:
             evidence_tail, run_tail, len(evidence_all), len(runs_all),
             len(evidence_all) > len(evidence_tail) or len(runs_all) > len(run_tail),
         )
+
+    @_serialized
+    def campaign_ids(self) -> tuple[str, ...]:
+        """Return only canonical campaign identities in stable display order."""
+        rows = self.persistence.conn.execute(
+            "select campaign_id from factory_campaigns order by updated_at desc,campaign_id"
+        ).fetchall()
+        return tuple(row[0] for row in rows)
+
+    @_serialized
+    def public_state(self, campaign_id: str) -> dict[str, object]:
+        """Bounded Mission Control projection; never includes logs, paths, or transcripts."""
+        snapshot = self.snapshot(campaign_id)
+        projection = self.persistence.campaign(campaign_id)
+        contract = self._contract(campaign_id)
+        epoch = (None if snapshot.current_epoch_id is None else
+                 self._epoch(campaign_id, snapshot.current_epoch_id))
+        recommendation = disposition = None
+        if snapshot.current_epoch_id is not None:
+            row = self.persistence.conn.execute(
+                "select recommendation_json,recommendation_disposition from "
+                "factory_campaign_controller_epochs where campaign_id=? and epoch_id=?",
+                (campaign_id, snapshot.current_epoch_id),
+            ).fetchone()
+            if row is not None:
+                recommendation = None if row[0] is None else json.loads(row[0])
+                disposition = None if row[0] is None else row[1]
+        usage = snapshot.cumulative_usage
+        remaining = ResourceUsage(*(
+            max(0, getattr(contract.cumulative_budget, field).value - getattr(usage, field))
+            for field in ResourceUsage._ATTRIBUTES
+        ))
+        handoff = self.handoff(campaign_id)
+        rebuild = self.persistence.rebuild_projection(campaign_id)
+        degraded = rebuild.degraded or not rebuild.matches_live
+        allowed = () if degraded else {
+            "requested": ("stop",),
+            "running": ("pause", "stop"),
+            "waiting": ("pause", "stop"),
+            "suspended": ("resume", "stop"),
+        }.get(snapshot.status, ())
+        return {
+            "schemaVersion": 1,
+            "campaignId": campaign_id,
+            "projectId": contract.project_id,
+            "scope": contract.scope.to_dict(),
+            "status": snapshot.status,
+            "revision": projection.revision,
+            "health": {
+                "degraded": degraded,
+                "problemCount": len(rebuild.problems),
+            },
+            "currentEpoch": None if epoch is None else {
+                "epochId": epoch.epoch_id,
+                "ordinal": epoch.ordinal,
+                "workIds": list(epoch.work_ids),
+            },
+            "latestCheckpointId": snapshot.latest_checkpoint_id,
+            "cumulativeUsage": usage.to_dict(),
+            "budget": {
+                "epoch": contract.epoch_budget.to_dict(),
+                "cumulative": contract.cumulative_budget.to_dict(),
+                "remaining": remaining.to_dict(),
+            },
+            "recommendation": recommendation,
+            "recommendationDisposition": disposition,
+            "terminal": None if snapshot.terminal is None else snapshot.terminal.to_dict(),
+            "handoff": {
+                "status": handoff.status,
+                "reasonCode": handoff.reason_code,
+                "checkpointId": handoff.checkpoint_id,
+                "evidenceIds": list(handoff.evidence_ids),
+                "factoryRunIds": list(handoff.factory_run_ids),
+                "evidenceCount": handoff.evidence_count,
+                "factoryRunCount": handoff.factory_run_count,
+                "truncated": handoff.truncated,
+            },
+            "allowedActions": list(allowed),
+        }
 
 
 class InvestigationEpochRunner:

@@ -166,7 +166,10 @@ class CampaignPersistence:
             self.conn = db
             self._owns_connection = False
         else:
-            self.conn = sqlite3.connect(str(db))
+            # The loopback API owns a threaded HTTP server. Writes remain serialized by
+            # SQLite transactions (and the controller's shared lock), but the durable authority
+            # must be usable from the request thread rather than being tied to construction.
+            self.conn = sqlite3.connect(str(db), check_same_thread=False)
             self._owns_connection = True
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -244,15 +247,27 @@ class CampaignPersistence:
     def transition_campaign(self, campaign_id: str, target: CampaignStatus, *,
                             authority: CampaignAuthority, operation_id: str,
                             terminal: TerminalOutcome | None = None,
+                            expected_revision: int | None = None,
                             failure_injector: FailureInjector | None = None) -> CampaignProjection:
         operation_id = _operation(operation_id)
-        payload = _json({"authority": authority, "status": target,
-                         "terminal": None if terminal is None else terminal.to_dict()})
+        payload_value = {"authority": authority, "status": target,
+                         "terminal": None if terminal is None else terminal.to_dict()}
+        # Preserve the byte identity of pre-W-0055 operations so their exact retries
+        # remain valid after upgrading. Optimistic concurrency is content-bound only
+        # for the new operator-facing calls which explicitly supply a revision.
+        if expected_revision is not None:
+            payload_value["expectedRevision"] = expected_revision
+        payload = _json(payload_value)
         with self.conn:
             if self._existing_operation(campaign_id, operation_id,
                                         "campaign.transitioned", payload):
                 return self.campaign(campaign_id)
             current = self._campaign_row(campaign_id)
+            if expected_revision is not None:
+                if type(expected_revision) is not int or expected_revision < 1:
+                    raise CampaignPersistenceError("expected_revision must be a positive integer")
+                if current["revision"] != expected_revision:
+                    raise CampaignPersistenceError("campaign revision is stale")
             validate_campaign_transition(current["status"], target, authority=authority)
             if (terminal is None) != (target in {"requested", "running", "waiting", "suspended"}):
                 raise CampaignPersistenceError("terminal transition must carry exactly one outcome")

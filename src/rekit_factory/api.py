@@ -16,6 +16,8 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 
 from rekit_factory.control import InvestigationController, RunRequest
+from rekit_factory.campaign_controller import CampaignController, CampaignControllerError
+from rekit_factory.campaign_persistence import CampaignPersistenceError
 from rekit_factory.evidence import EvidenceStore
 from rekit_factory.dossiers import DossierNotReady, dossier_list, verify_published_dossier
 from rekit_factory.outcomes import is_worker_report_result
@@ -27,6 +29,7 @@ MAX_BODY = 1_000_000
 UI_ASSETS = {
     "mission-control.css": "text/css; charset=utf-8",
     "mission-attention.js": "text/javascript; charset=utf-8",
+    "mission-campaigns.js": "text/javascript; charset=utf-8",
     "mission-outcomes.js": "text/javascript; charset=utf-8",
     "mission-control.js": "text/javascript; charset=utf-8",
 }
@@ -79,7 +82,9 @@ class DriveSupervisor:
 class FactoryServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, controller: InvestigationController, *, allow_restart: bool = False):
+    def __init__(self, address, controller: InvestigationController, *,
+                 allow_restart: bool = False,
+                 campaign_controller: CampaignController | None = None):
         host = address[0]
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Factory API must bind to a loopback address")
@@ -88,6 +93,8 @@ class FactoryServer(ThreadingHTTPServer):
         self.storage_root = controller.storage_root.resolve()
         self.supervisor = DriveSupervisor(controller)
         self.allow_restart = allow_restart
+        self.campaign_controller = campaign_controller
+        self.campaign_lock = threading.RLock()
         self.instance_id = uuid.uuid4().hex
         self.restart_requested = threading.Event()
 
@@ -149,6 +156,24 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "fleet"]:
                 self._json(HTTPStatus.OK, {"runs": _fleet(self.server.controller)})
+                return
+            if parts == ["api", "campaigns"]:
+                campaigns = self._campaigns()
+                self._json(HTTPStatus.OK, {
+                    "schemaVersion": 1,
+                    "campaigns": campaigns,
+                })
+                return
+            if len(parts) == 3 and parts[:2] == ["api", "campaigns"]:
+                self._json(HTTPStatus.OK, {
+                    "campaign": self._campaign(parts[2]),
+                })
+                return
+            if (len(parts) == 4 and parts[:2] == ["api", "campaigns"]
+                    and parts[3] == "handoff"):
+                self._json(HTTPStatus.OK, {
+                    "handoff": self._campaign(parts[2])["handoff"],
+                })
                 return
             if len(parts) == 3 and parts[:2] == ["api", "runs"]:
                 run_dir = _find_run(self.server.storage_root, parts[2])
@@ -234,6 +259,10 @@ class FactoryHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
         except DossierNotReady as exc:
             self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
+        except (CampaignControllerError, CampaignPersistenceError) as exc:
+            status = (HTTPStatus.NOT_FOUND if "does not exist" in str(exc)
+                      else HTTPStatus.CONFLICT)
+            self._json(status, {"error": str(exc)})
         except Exception as exc:
             self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
                        {"error": f"{type(exc).__name__}: {exc}"})
@@ -282,6 +311,39 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 snapshot["runDir"] = str(run_dir)
                 self._json(HTTPStatus.ACCEPTED, snapshot)
                 return
+            if (len(parts) == 4 and parts[:2] == ["api", "campaigns"]
+                    and parts[3] in {"pause", "resume", "stop"}):
+                controller = self._campaign_controller()
+                operation_id = payload["operationId"]
+                expected_revision = payload["expectedRevision"]
+                with self.server.campaign_lock:
+                    if parts[3] == "pause":
+                        controller.pause(
+                            parts[2], operation_id=operation_id,
+                            expected_revision=expected_revision,
+                        )
+                    elif parts[3] == "resume":
+                        controller.resume(
+                            parts[2], operation_id=operation_id,
+                            expected_revision=expected_revision,
+                        )
+                    else:
+                        evidence_ids = payload["evidenceIds"]
+                        if not isinstance(evidence_ids, list):
+                            raise TypeError("evidenceIds must be an array")
+                        # The durable operator transition is itself the minimum evidence for
+                        # an explicit stop. Browser-supplied values may only add stable IDs.
+                        evidence_ids = sorted(set((
+                            f"operator-control:{operation_id}", *evidence_ids,
+                        )))
+                        controller.stop(
+                            parts[2], payload["reasonCode"], tuple(evidence_ids),
+                            operation_id=operation_id,
+                            expected_revision=expected_revision,
+                        )
+                    campaign = controller.public_state(parts[2])
+                self._json(HTTPStatus.OK, {"campaign": campaign})
+                return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "resume":
                 run_dir = _find_run(self.server.storage_root, parts[2])
                 started = self.server.supervisor.submit(run_dir)
@@ -329,6 +391,10 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 })
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except (CampaignControllerError, CampaignPersistenceError) as exc:
+            status = (HTTPStatus.NOT_FOUND if "does not exist" in str(exc)
+                      else HTTPStatus.CONFLICT)
+            self._json(status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError, FileNotFoundError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": f"{type(exc).__name__}: {exc}"})
         except Exception as exc:
@@ -346,6 +412,25 @@ class FactoryHandler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise TypeError("JSON body must be an object")
         return value
+
+    def _campaign_controller(self) -> CampaignController:
+        controller = self.server.campaign_controller
+        if controller is None:
+            raise FileNotFoundError("campaign service is unavailable")
+        return controller
+
+    def _campaign(self, campaign_id: str) -> dict[str, object]:
+        controller = self._campaign_controller()
+        with self.server.campaign_lock:
+            return controller.public_state(campaign_id)
+
+    def _campaigns(self) -> list[dict[str, object]]:
+        controller = self.server.campaign_controller
+        if controller is None:
+            return []
+        with self.server.campaign_lock:
+            return [controller.public_state(campaign_id)
+                    for campaign_id in controller.campaign_ids()]
 
     def _json(self, status: HTTPStatus, payload: Any) -> None:
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -558,9 +643,13 @@ def _worker_reports(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def serve(controller: InvestigationController, *, host: str = "127.0.0.1",
-          port: int = 8768) -> bool:
+          port: int = 8768,
+          campaign_controller: CampaignController | None = None) -> bool:
     """Serve until stopped, returning true when the CLI should re-exec itself."""
-    server = FactoryServer((host, port), controller, allow_restart=True)
+    server = FactoryServer(
+        (host, port), controller, allow_restart=True,
+        campaign_controller=campaign_controller,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

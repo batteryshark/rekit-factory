@@ -62,7 +62,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, streamCursors: new Map(), restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
+const state = {fleet: [], campaigns: [], campaignSelected: null, campaignListRequest: 0, campaignDetailRequest: 0, campaignAction: null, campaignReturnFocus: null, config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, streamCursors: new Map(), restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -259,6 +259,13 @@ function activate(element) {
   if (view) { show(view.dataset.view); return true; }
   if (element.closest("[data-attention-open]")) { openAttentionInbox(); return true; }
   if (element.closest("[data-attention-dismiss], [data-attention-later]")) { dismissAttention(); return true; }
+  if (element.closest("[data-campaign-close]")) { closeCampaign(); return true; }
+  const campaignAction = element.closest("[data-campaign-action]");
+  if (campaignAction) { transitionCampaign(campaignAction.dataset.campaignId, campaignAction.dataset.campaignAction); return true; }
+  const campaignLink = element.closest("[data-campaign-link]");
+  if (campaignLink) { openCampaignLink(campaignLink); return true; }
+  const campaign = element.closest("[data-campaign]");
+  if (campaign) { openCampaign(campaign.dataset.campaign); return true; }
   const memoryToggle = element.closest("[data-memory-toggle]");
   if (memoryToggle) {
     const body = document.getElementById(memoryToggle.getAttribute("aria-controls"));
@@ -309,10 +316,14 @@ function activate(element) {
 
 document.addEventListener("click", event => activate(event.target));
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && $("campaignDialog").open) { event.preventDefault(); closeCampaign(); return; }
   if (event.key === "Escape" && !$("operatorAttention").hidden) { event.preventDefault(); dismissAttention(); }
   if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-run]")) {
     event.preventDefault();
     activate(event.target);
+  }
+  if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-campaign]")) {
+    event.preventDefault(); openCampaign(event.target.dataset.campaign);
   }
   if (event.target.matches('[role="tab"]') && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
     const tabs = [...event.target.closest('[role="tablist"]').querySelectorAll('[role="tab"]')];
@@ -380,6 +391,100 @@ function targetKind(target) {
   const known = {exe: "PE", dll: "PE", apk: "APK", ipa: "IPA", asar: "ASAR", zip: "ZIP", jar: "JAR", wasm: "WASM", elf: "ELF", dylib: "MACH"};
   const label = known[suffix] || (suffix ? suffix.slice(0, 4).toUpperCase() : "TREE");
   return {label, icon: TARGET_ICONS[label] || TARGET_ICONS.BIN};
+}
+
+function renderCampaigns() {
+  const campaigns = state.campaigns;
+  const needs = campaigns.filter(MissionCampaigns.needsAction).length;
+  const active = campaigns.filter(campaign => ["running", "waiting", "suspended"].includes(campaign.status)).length;
+  const degraded = campaigns.filter(campaign => campaign.health?.degraded === true).length;
+  $("campaignFleet").innerHTML = campaigns.length ? campaigns.map(MissionCampaigns.renderCard).join("") : `<div class="empty compact"><b>No bounded campaigns</b>Campaign health will appear when a multi-epoch controller publishes canonical state.</div>`;
+  $("campaignBoardHealth").innerHTML = `<span class="live"><i></i>${active} active</span><span class="${needs ? "attention" : ""}"><b>${needs}</b> need you</span><span class="${degraded ? "attention" : ""}"><b>${degraded}</b> degraded</span><span><b>${campaigns.length}</b> total</span>`;
+}
+
+async function refreshCampaigns() {
+  const generation = ++state.campaignListRequest;
+  try {
+    const payload = await api("/api/campaigns");
+    if (generation !== state.campaignListRequest) return;
+    state.campaigns = Array.isArray(payload.campaigns) ? payload.campaigns : [];
+    renderCampaigns();
+    if (state.campaignSelected && $("campaignDialog").open && !state.campaignAction) {
+      const current = state.campaigns.find(item => item.campaignId === state.campaignSelected);
+      if (current) $("campaignDetail").innerHTML = MissionCampaigns.renderDetail(current);
+      else closeCampaign();
+    }
+  } catch (error) {
+    if (generation !== state.campaignListRequest) return;
+    $("campaignBoardHealth").innerHTML = `<span class="attention"><b>!</b> projection unavailable</span>`;
+    $("campaignFleet").innerHTML = `<div class="empty compact"><b>Campaign projection unavailable</b>Mission Control will retry the bounded read model automatically.</div>`;
+  }
+}
+
+async function openCampaign(campaignId) {
+  const generation = ++state.campaignDetailRequest;
+  state.campaignReturnFocus = document.activeElement?.closest?.("[data-campaign]") || null;
+  try {
+    const payload = await api(`/api/campaigns/${encodeURIComponent(campaignId)}`);
+    if (generation !== state.campaignDetailRequest) return;
+    const campaign = payload.campaign;
+    if (!campaign || campaign.campaignId !== campaignId) throw new Error("Campaign projection identity mismatch");
+    state.campaignSelected = campaignId;
+    state.campaigns = state.campaigns.some(item => item.campaignId === campaignId) ? state.campaigns.map(item => item.campaignId === campaignId ? campaign : item) : [...state.campaigns, campaign];
+    $("campaignDetail").innerHTML = MissionCampaigns.renderDetail(campaign);
+    if (!$("campaignDialog").open) $("campaignDialog").showModal();
+  } catch (_error) { if (generation === state.campaignDetailRequest) toast("Campaign detail is unavailable; canonical state will be retried.", true); }
+}
+
+function closeCampaign() {
+  state.campaignSelected = null;
+  if ($("campaignDialog").open) $("campaignDialog").close();
+  const previous = state.campaignReturnFocus;
+  state.campaignReturnFocus = null;
+  if (previous?.isConnected) previous.focus({preventScroll: true});
+}
+
+function campaignOperationId(campaignId, action, revision) {
+  // Exact canonical revision makes this stable across reloads and repeated clicks.
+  return {key: null, value: `mission-control:${campaignId}:${action}:${revision}`};
+}
+
+async function transitionCampaign(campaignId, action) {
+  if (state.campaignAction) return;
+  const campaign = state.campaigns.find(item => item.campaignId === campaignId);
+  if (!campaign || !MissionCampaigns.canonicalActions(campaign).includes(action)) {
+    toast("That transition is no longer authorized; refreshing canonical state.", true);
+    await refreshCampaigns(); return;
+  }
+  const prompt = action === "stop" ? "Stop this bounded campaign? This terminal transition cannot be undone." : `${action === "pause" ? "Pause" : "Resume"} this bounded campaign?`;
+  if (!window.confirm(prompt)) return;
+  const operation = campaignOperationId(campaignId, action, campaign.revision);
+  state.campaignAction = `${campaignId}:${action}`;
+  $("campaignDialog").setAttribute("aria-busy", "true");
+  document.querySelectorAll("[data-campaign-action]").forEach(button => { button.disabled = true; });
+  try {
+    const body = {operationId: operation.value, expectedRevision: campaign.revision};
+    if (action === "stop") Object.assign(body, {reasonCode: "operator-stop", evidenceIds: []});
+    const payload = await api(`/api/campaigns/${encodeURIComponent(campaignId)}/${action}`, {method: "POST", body: JSON.stringify(body)});
+    if (!payload.campaign || payload.campaign.campaignId !== campaignId) throw new Error("Campaign transition returned mismatched state");
+    if (operation.key) sessionStorage.removeItem(operation.key);
+    state.campaigns = state.campaigns.map(item => item.campaignId === campaignId ? payload.campaign : item);
+    $("campaignDetail").innerHTML = MissionCampaigns.renderDetail(payload.campaign);
+    renderCampaigns(); toast(`Campaign ${action} recorded.`);
+  } catch (_error) {
+    toast("Campaign transition was not accepted. Canonical state has been refreshed.", true);
+    await refreshCampaigns();
+  } finally { state.campaignAction = null; $("campaignDialog").setAttribute("aria-busy", "false"); }
+}
+
+function openCampaignLink(link) {
+  const runId = link.dataset.campaignLink === "activity" ? link.dataset.campaignRef : null;
+  if (!runId) { toast("No bounded run link is available for this reference.", true); return; }
+  closeCampaign();
+  openRun(runId).then(() => {
+    const tab = link.dataset.campaignLink === "artifacts" ? "artifacts" : "activity";
+    activateDetailTab($(`tab-button-${tab}`), {focus: true});
+  });
 }
 
 function renderFleet() {
@@ -944,8 +1049,10 @@ async function boot() {
   });
   try {
     state.config = await api("/api/config"); renderConfig();
+    $("campaignDialog").addEventListener("cancel", event => { event.preventDefault(); closeCampaign(); });
     $("fleetSearch").addEventListener("input", event => { state.query = event.target.value; renderFleet(); });
-    await refreshFleet(); setInterval(refreshFleet, 2500);
+    await Promise.all([refreshFleet(), refreshCampaigns()]);
+    setInterval(() => { refreshFleet(); refreshCampaigns(); }, 1800);
   }
   catch (error) { toast(error.message, true); }
 }
