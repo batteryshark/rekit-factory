@@ -208,16 +208,63 @@ function connectEvents(runId) {
   state.stream.onerror = () => { state.stream.close(); setTimeout(() => state.selected === runId && connectEvents(runId), 1500); };
 }
 
+function selectedProfile() {
+  const profiles = state.config?.modelProfiles || [];
+  return profiles.find(profile => profile.name === $("profileSelect").value) || state.config?.modelProfile;
+}
+
+function positiveInteger(id, label, {allowZero = false} = {}) {
+  const input = $(id), value = Number(input.value), minimum = allowZero ? 0 : 1;
+  input.setCustomValidity(Number.isInteger(value) && value >= minimum ? "" : `${label} must be a whole number of at least ${minimum}.`);
+  return value;
+}
+
+function renderComposerState() {
+  const profile = selectedProfile(), strategy = $("strategySelect").value;
+  const custom = strategy === "custom-roles";
+  $("customRolesField").hidden = !custom;
+  $("roles").disabled = !custom;
+  const selected = (state.config.strategies || []).find(item => item.name === strategy);
+  $("strategyHint").textContent = selected?.description || "Define a comma-separated set of independent worker roles.";
+  if (profile) {
+    $("effectivePolicy").innerHTML = `<div class="policy-item"><span>structured output</span><b>${esc(profile.structuredOutputMode || "prompted")}</b></div><div class="policy-item"><span>provider concurrency</span><b>${esc(profile.concurrencyLimit ?? "not declared")}</b></div><div class="policy-item"><span>provider retries</span><b>${esc(profile.retryLimit ?? "not declared")}</b></div>`;
+    $("modelStack").textContent = profile.model;
+    if (Number.isInteger(profile.concurrencyLimit)) {
+      $("concurrency").max = profile.concurrencyLimit;
+      if (Number($("concurrency").value) > profile.concurrencyLimit) $("concurrency").value = profile.concurrencyLimit;
+    } else $("concurrency").removeAttribute("max");
+  }
+  const policy = document.querySelector('input[name="safetyPolicy"]:checked')?.value || "supervised";
+  document.querySelectorAll(".safety-option").forEach(option => option.classList.toggle("active", option.querySelector("input").checked));
+  $("gatedPolicyLabel").textContent = policy === "automatic-only" ? "excluded" : "ask me";
+  $("toolPicker").querySelectorAll(".tool").forEach(row => {
+    const input = row.querySelector("input"), excluded = policy === "automatic-only" && input.dataset.gated === "true";
+    if (excluded) input.checked = false;
+    input.disabled = excluded;
+    row.classList.toggle("policy-disabled", excluded);
+  });
+  const checkedTools = $("toolPicker").querySelectorAll("input:checked").length;
+  $("launchSummary").innerHTML = `<div><span>strategy</span><b>${esc(custom ? "custom roles" : strategy)}</b></div><div><span>profile</span><b>${esc(profile?.name || "default")}</b></div><div><span>worker ceiling</span><b>${esc($("maxWorkers").value)} / ${esc($("concurrency").value)} concurrent</b></div><div><span>tool policy</span><b>${esc(policy)} · ${checkedTools} selected</b></div>`;
+}
+
 function renderConfig() {
   const config = state.config, active = config.modelProfile, profiles = config.modelProfiles || [active];
   $("modelStack").textContent = active.model;
   $("profileSelect").innerHTML = profiles.map(profile => `<option value="${esc(profile.name)}" ${profile.name === config.defaultModelProfile ? "selected" : ""}>${esc(profile.name)} · ${esc(profile.model)} · ${esc(profile.apiFormat || "openai")}</option>`).join("");
+  const strategies = config.strategies || [];
+  $("strategySelect").innerHTML = strategies.map(strategy => `<option value="${esc(strategy.name)}">${esc(strategy.name)}</option>`).join("") + `<option value="custom-roles">custom roles</option>`;
   $("profile").innerHTML = profiles.map(profile => `<div class="profile-block"><div class="kv"><span>profile</span><span>${esc(profile.name)}</span></div><div class="kv"><span>provider</span><span>${esc(profile.provider)}</span></div><div class="kv"><span>protocol</span><span>${esc(profile.apiFormat || "openai")}</span></div><div class="kv"><span>model</span><span class="model-name">${esc(profile.model)}</span></div><div class="kv"><span>endpoint</span><span>${esc(profile.baseUrl)}</span></div><div class="kv"><span>secret</span><span>${esc(profile.apiKeySource)}</span></div></div>`).join("");
   $("settings").innerHTML = `<div class="kv"><span>storage root</span><span>${esc(config.storageRoot)}</span></div><div class="kv"><span>API boundary</span><span>loopback only</span></div><div class="kv"><span>event transport</span><span>SSE · resumable ID</span></div><div class="kv"><span>model profiles</span><span>${profiles.length}</span></div>`;
   const tools = config.tools || [];
-  const toolRow = tool => `<label class="tool"><input type="checkbox" value="${esc(tool.id)}"><span class="tool-name">${esc(tool.id)}</span><span class="tier ${tool.requires_permission ? "gated" : ""}">${tool.requires_permission ? "ask" : "auto"} · t${tool.safety_tier}</span></label>`;
+  const toolRow = tool => `<label class="tool"><input type="checkbox" value="${esc(tool.id)}" data-gated="${Boolean(tool.requires_permission)}"><span class="tool-name">${esc(tool.id)}</span><span class="tier ${tool.requires_permission ? "gated" : ""}">${tool.requires_permission ? "ask" : "auto"} · t${tool.safety_tier}</span></label>`;
   $("toolPicker").innerHTML = tools.map(toolRow).join("") || `<div class="hint">No Rekit tools discovered.</div>`;
   $("toolCatalog").innerHTML = tools.map(tool => `<div class="tool"><span class="tool-name">${esc(tool.id)}</span><span class="tier ${tool.requires_permission ? "gated" : ""}">${tool.requires_permission ? "permission" : "automatic"} · tier ${tool.safety_tier}</span></div>`).join("");
+  $("profileSelect").addEventListener("change", renderComposerState);
+  $("strategySelect").addEventListener("change", renderComposerState);
+  document.querySelectorAll('input[name="safetyPolicy"]').forEach(input => input.addEventListener("change", renderComposerState));
+  ["concurrency", "retriesPerWorker", "maxWorkers", "costUnits", "roles"].forEach(id => $(id).addEventListener("input", renderComposerState));
+  $("toolPicker").addEventListener("change", renderComposerState);
+  renderComposerState();
 }
 
 $("runForm").onsubmit = async event => {
@@ -225,7 +272,17 @@ $("runForm").onsubmit = async event => {
   try {
     const modelTools = [...$("toolPicker").querySelectorAll("input:checked")].map(input => input.value);
     const workerRoles = $("roles").value.split(",").map(role => role.trim()).filter(Boolean);
-    const result = await api("/api/runs", {method: "POST", body: JSON.stringify({target: $("target").value, goal: $("goal").value, tools: [], modelTools, workerRoles, modelProfile: $("profileSelect").value, concurrency: 4})});
+    const strategy = $("strategySelect").value;
+    const concurrency = positiveInteger("concurrency", "Concurrent workers");
+    const retriesPerWorker = positiveInteger("retriesPerWorker", "Retries per worker", {allowZero: true});
+    const maxWorkers = positiveInteger("maxWorkers", "Maximum workers");
+    const costUnits = positiveInteger("costUnits", "Cost-unit ceiling");
+    if (concurrency > maxWorkers) $("concurrency").setCustomValidity("Concurrent workers cannot exceed the maximum worker ceiling.");
+    const profile = selectedProfile();
+    if (Number.isInteger(profile?.concurrencyLimit) && concurrency > profile.concurrencyLimit) $("concurrency").setCustomValidity(`This profile allows at most ${profile.concurrencyLimit} concurrent workers.`);
+    if (strategy === "custom-roles" && !workerRoles.length) $("roles").setCustomValidity("Add at least one custom worker role."); else $("roles").setCustomValidity("");
+    if (!$("runForm").reportValidity()) return;
+    const result = await api("/api/runs", {method: "POST", body: JSON.stringify({target: $("target").value, goal: $("goal").value, tools: [], modelTools, workerRoles, modelProfile: $("profileSelect").value, strategy: strategy === "custom-roles" ? null : strategy, concurrency, retriesPerWorker, costUnits, maxWorkers})});
     toast("Investigation launched"); await refreshFleet(); openRun(result.run.id);
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; button.textContent = "Launch Investigation"; }
