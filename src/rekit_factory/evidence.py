@@ -88,6 +88,7 @@ class Provenance:
     target_sha256: str
     tool_id: str | None = None
     worker_id: str | None = None
+    initiating_worker_id: str | None = None
     invocation_id: str | None = None
     work_item_id: str | None = None
 

@@ -14,6 +14,9 @@ from rekit_factory.remote import (
     WorkerCapabilities,
     WorkerEvent,
 )
+from rekit_factory.scope import (
+    ActionAuthority, AuthorizedScope, ScopeApproval, ScopeEnvelope, TargetGrant,
+)
 
 
 class FakeRekit:
@@ -136,9 +139,31 @@ class RemoteEnvelopeTests(unittest.TestCase):
             target.write_bytes(b"fixture")
             rekit = FakeRekit(risky=True)
             worker = LocalRekitWorker(rekit, worker_id="worker-local")
+            envelope = ScopeEnvelope(
+                scope_id="scope-local-envelope", revision=1,
+                valid_from="2026-07-01T00:00:00Z", valid_until="2026-08-01T00:00:00Z",
+                targets=(TargetGrant.from_path(target),),
+                actions=(ActionAuthority.READ_LOCAL_TARGET,
+                         ActionAuthority.EXECUTE_UNTRUSTED),
+            )
+            scope = AuthorizedScope(envelope, ScopeApproval(
+                scope_id=envelope.scope_id, revision=1,
+                content_digest=envelope.content_digest, approved_by="test-operator",
+                approved_at="2026-07-01T00:00:00Z", expires_at="2026-08-01T00:00:00Z",
+                rationale="Exact local envelope fixture",
+            ))
+            common = {
+                "target_sha256": TargetGrant.from_path(target).content_sha256,
+                "scope_digest": scope.envelope.content_digest,
+                "scope_revision": scope.to_dict(),
+                "requested_actions": (
+                    ActionAuthority.READ_LOCAL_TARGET.value,
+                    ActionAuthority.EXECUTE_UNTRUSTED.value,
+                ),
+            }
             denied = InvocationRequest(
                 invocation_id="invoke-1", run_id="run-1", work_item_id="work-1",
-                tool_id="fixture-scan", target_path=str(target),
+                tool_id="fixture-scan", target_path=str(target), **common,
             )
             with self.assertRaises(PermissionError):
                 worker.invoke(denied)
@@ -146,6 +171,7 @@ class RemoteEnvelopeTests(unittest.TestCase):
             allowed = InvocationRequest(
                 invocation_id="invoke-1", run_id="run-1", work_item_id="work-1",
                 tool_id="fixture-scan", target_path=str(target), approval_id="approval-1",
+                **common,
             )
             result = worker.invoke(allowed)
 

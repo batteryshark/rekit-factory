@@ -131,13 +131,16 @@ explicit map from approved target SHA-256 values to pre-staged worker-relative
 paths. Registration rejects duplicate worker IDs, unsafe staged paths, and
 malformed hashes.
 
-Selection filters by tool ID plus requested platform, architecture, isolation,
-interactive, or exact-worker constraints. Matching remotes sort by
+Selection filters by tool ID plus any platform, architecture, isolation,
+interactive, remote-only, or exact-worker constraints declared by the tool catalog.
+Matching remotes sort by
 `(priority, worker_id)`. A configured remote match is preferred over local; if
 that worker lacks an explicit staging entry, routing fails closed instead of
-falling back to the host. The chosen worker ID and remote requirement are stored
-in durable work payloads so a restart with missing or different worker
-configuration cannot silently move the invocation local.
+falling back to the host. The selected capability digest, platform, architecture,
+isolation, interactivity, worker ID, remote requirement, target hash, and opaque
+staged-path digest are stored in durable work payloads. A restart with missing or
+drifted worker configuration therefore cannot silently move the invocation local
+or weaken its isolation.
 
 The controller invokes local and remote tools through the same versioned
 `InvocationRequest`/`InvocationResult` contract. It derives `none` versus exact
@@ -158,7 +161,9 @@ The CLI composition root registers workers with repeated
 authenticated transport, while `<PREFIX>_STAGED_TARGETS` is a JSON object mapping
 target hashes to worker-relative staged paths and `<PREFIX>_PRIORITY` is optional.
 The token remains environment-only and is not copied into the route, run metadata,
-scope revision, invocation body, evidence, or browser projection.
+scope revision, invocation body, evidence, or browser projection. Worker URLs must
+use HTTPS. Plain HTTP is accepted only for a loopback URL when the corresponding
+`<PREFIX>_ALLOW_LOOPBACK_HTTP=1` development opt-in is present.
 
 ## Files and isolation
 

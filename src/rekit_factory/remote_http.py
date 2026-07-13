@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
 import hmac
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import ipaddress
 from pathlib import Path, PurePosixPath
 import threading
 import time
@@ -23,13 +23,7 @@ from rekit_factory.remote import (
     WorkerCapabilities,
     WorkerEvent,
     WorkerTransport,
-)
-from rekit_factory.scope import (
-    ActionAuthority,
-    AuthorizedScope,
-    NetworkMode,
-    hash_path,
-    normalize_endpoint,
+    validate_invocation_scope,
 )
 
 
@@ -116,48 +110,7 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
         ).start()
 
     def _validate_scope(self, request: InvocationRequest, target: Path) -> None:
-        if request.scope_revision is None:
-            if (request.network_policy != "none" or request.account_ref is not None
-                    or request.uses_credentials
-                    or any(value != ActionAuthority.READ_LOCAL_TARGET.value
-                           for value in request.requested_actions)):
-                raise PermissionError("verified scope is required for remote external intent")
-            return  # compatibility for existing network-none staged invocations
-        scope = AuthorizedScope.from_dict(request.scope_revision)
-        now = datetime.now(timezone.utc).isoformat()
-        scope.validate(now=now)
-        if request.scope_digest != scope.envelope.content_digest:
-            raise PermissionError("remote scope digest does not match verified revision")
-        try:
-            actions = tuple(ActionAuthority(value) for value in request.requested_actions)
-        except ValueError as exc:
-            raise PermissionError("remote invocation contains an unknown action authority") from exc
-        if any(action not in scope.envelope.actions
-               or action in scope.envelope.prohibited_actions for action in actions):
-            raise PermissionError("remote action is outside the verified scope")
-        if request.account_ref is not None and request.account_ref not in scope.envelope.account_refs:
-            raise PermissionError("remote account is outside the verified scope")
-        if request.uses_credentials and not scope.envelope.credential_use:
-            raise PermissionError("remote credential use is outside the verified scope")
-        if request.uses_credentials and request.account_ref is None:
-            raise PermissionError("remote credential use requires an opaque account reference")
-        if request.target_sha256 is None or request.target_sha256 not in {
-            target.content_sha256 for target in scope.envelope.targets
-        }:
-            raise PermissionError("remote target hash is outside the verified scope")
-        if hash_path(target) != request.target_sha256:
-            raise PermissionError("staged remote target does not match its authorized hash")
-        if request.network_policy == "none":
-            return
-        if request.network_policy != "restricted":
-            raise PermissionError("verified scope permits only none or exact restricted egress")
-        if (scope.envelope.network_mode is not NetworkMode.EXACT_ENDPOINTS
-                or ActionAuthority.NETWORK_ACCESS not in actions):
-            raise PermissionError("verified scope does not authorize remote network access")
-        if request.endpoint is None:
-            raise PermissionError("exact endpoint is required for restricted remote egress")
-        if normalize_endpoint(request.endpoint) not in scope.envelope.endpoints:
-            raise PermissionError("remote endpoint is outside the verified scope")
+        validate_invocation_scope(request, target)
 
     def _run_invocation(self, request: InvocationRequest) -> None:
         self._append_event(request, "invocation.started", "Invocation started")
@@ -331,6 +284,7 @@ class HTTPWorkerTransport:
         result_timeout: float = 180.0,
         poll_interval: float = 0.05,
         max_response: int = DEFAULT_MAX_RESPONSE,
+        allow_loopback_http: bool = False,
     ):
         if not auth_token:
             raise ValueError("auth_token must be explicit and non-empty")
@@ -339,12 +293,19 @@ class HTTPWorkerTransport:
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("base_url must be an absolute HTTP(S) URL")
+        if parsed.scheme == "http" and (
+            not allow_loopback_http or not _is_loopback_host(parsed.hostname)
+        ):
+            raise ValueError(
+                "plaintext HTTP is allowed only for loopback with explicit development opt-in"
+            )
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token
         self.timeout = timeout
         self.result_timeout = result_timeout
         self.poll_interval = poll_interval
         self.max_response = max_response
+        self.allow_loopback_http = allow_loopback_http
 
     def capabilities(self) -> WorkerCapabilities:
         _, value = self._request("GET", "/v1/capabilities")
@@ -407,3 +368,14 @@ class HTTPWorkerTransport:
         if not isinstance(decoded, dict):
             raise RemoteWorkerError("remote worker response must be a JSON object")
         return status, decoded
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if host is None:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False

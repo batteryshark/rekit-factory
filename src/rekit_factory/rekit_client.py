@@ -18,6 +18,11 @@ class ToolManifest:
     executes_input: str
     network: str
     source: str = "default"
+    required_platform: str | None = None
+    required_architecture: str | None = None
+    required_isolation: str | None = None
+    required_interactive: bool | None = None
+    requires_remote: bool = False
 
     @property
     def requires_permission(self) -> bool:
@@ -56,6 +61,17 @@ class RekitClient:
         except KeyError as exc:
             raise KeyError(f"unknown Rekit tool {tool_id!r}") from exc
         safety = item.get("safety", {})
+        worker = item.get("worker_requirements", {})
+        if not isinstance(worker, dict):
+            raise ValueError(f"Rekit tool {tool_id!r} worker_requirements must be an object")
+        unknown_worker_requirements = set(worker) - {
+            "platform", "architecture", "isolation", "interactive", "remote",
+        }
+        if unknown_worker_requirements:
+            raise ValueError(
+                f"Rekit tool {tool_id!r} has unknown worker requirements: "
+                f"{sorted(unknown_worker_requirements)!r}"
+            )
         return ToolManifest(
             id=tool_id,
             name=str(item.get("name", tool_id)),
@@ -64,6 +80,11 @@ class RekitClient:
             executes_input=str(safety.get("executes_input", "no")),
             network=str(safety.get("network", "none")),
             source=self.source,
+            required_platform=_optional_requirement(worker, "platform", tool_id),
+            required_architecture=_optional_requirement(worker, "architecture", tool_id),
+            required_isolation=_optional_requirement(worker, "isolation", tool_id),
+            required_interactive=_optional_bool(worker, "interactive", tool_id),
+            requires_remote=_optional_bool(worker, "remote", tool_id) or False,
         )
 
     def list_tools(self) -> list[ToolManifest]:
@@ -146,3 +167,21 @@ def _source_label(value: str) -> str:
     if not label or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in label):
         raise ValueError("Rekit source labels must use lowercase letters, digits, '-' or '_'")
     return label
+
+
+def _optional_requirement(value: dict[str, Any], name: str, tool_id: str) -> str | None:
+    item = value.get(name)
+    if item is None:
+        return None
+    if not isinstance(item, str) or not item.strip():
+        raise ValueError(f"Rekit tool {tool_id!r} worker requirement {name!r} must be text")
+    return item
+
+
+def _optional_bool(value: dict[str, Any], name: str, tool_id: str) -> bool | None:
+    item = value.get(name)
+    if item is None:
+        return None
+    if not isinstance(item, bool):
+        raise ValueError(f"Rekit tool {tool_id!r} worker requirement {name!r} must be boolean")
+    return item

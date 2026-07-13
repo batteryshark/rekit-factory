@@ -653,15 +653,25 @@ class ControlPlaneTests(unittest.TestCase):
             target = self._fixture(tmp)
             rekit = FakeRekit(risky=True)
             worker = LocalRekitWorker(rekit)
+            scope = authorized_dynamic_scope(target)
+            common = {
+                "target_sha256": TargetGrant.from_path(target).content_sha256,
+                "scope_digest": scope.envelope.content_digest,
+                "scope_revision": scope.to_dict(),
+                "requested_actions": (
+                    ActionAuthority.READ_LOCAL_TARGET.value,
+                    ActionAuthority.EXECUTE_UNTRUSTED.value,
+                ),
+            }
             request = InvocationRequest(
                 run_id="run-1", work_item_id="work-1", tool_id="exec-observe",
-                target_path=str(target),
+                target_path=str(target), **common,
             )
             with self.assertRaises(PermissionError):
                 worker.invoke(request)
             allowed = InvocationRequest(
                 run_id="run-1", work_item_id="work-1", tool_id="exec-observe",
-                target_path=str(target), approval_id="question-answered-allow",
+                target_path=str(target), approval_id="question-answered-allow", **common,
             )
             result = worker.invoke(allowed)
             self.assertEqual("done", result.status)

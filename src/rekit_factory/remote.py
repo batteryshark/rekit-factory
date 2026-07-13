@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -10,6 +11,13 @@ from typing import Any, ClassVar, Literal, Protocol, Self
 import uuid
 
 from rekit_factory.rekit_client import RekitAdapter, ToolResult
+from rekit_factory.scope import (
+    ActionAuthority,
+    AuthorizedScope,
+    NetworkMode,
+    hash_path,
+    normalize_endpoint,
+)
 
 
 NetworkPolicy = Literal["none", "sinkhole", "restricted", "unrestricted"]
@@ -254,9 +262,13 @@ class LocalRekitWorker:
         manifest = self.rekit.manifest(request.tool_id)
         if manifest.requires_permission and not request.approval_id:
             raise PermissionError(f"{request.tool_id} requires a durable approval id")
+        if request.mount_policy != "none":
+            raise PermissionError("local invocations cannot request a mounted target")
+        target = Path(request.target_path)
+        validate_invocation_scope(request, target)
         result: ToolResult = self.rekit.run(
             request.tool_id,
-            Path(request.target_path),
+            target,
             allow_dynamic=manifest.requires_permission,
         )
         return InvocationResult(
@@ -275,3 +287,51 @@ class LocalRekitWorker:
 
     def attach_url(self, invocation_id: str) -> str | None:
         return None
+
+
+def validate_invocation_scope(request: InvocationRequest, target: Path, *,
+                              now: str | None = None) -> AuthorizedScope:
+    """Revalidate exact scope and intent at either execution boundary."""
+    if request.scope_revision is None or request.scope_digest is None:
+        raise PermissionError("verified scope is required for every invocation")
+    scope = AuthorizedScope.from_dict(request.scope_revision)
+    scope.validate(now=now or datetime.now(timezone.utc).isoformat())
+    if request.scope_digest != scope.envelope.content_digest:
+        raise PermissionError("scope digest does not match verified revision")
+    try:
+        actions = tuple(ActionAuthority(value) for value in request.requested_actions)
+    except ValueError as exc:
+        raise PermissionError("invocation contains an unknown action authority") from exc
+    if not actions:
+        raise PermissionError("invocation requires explicit action intent")
+    if any(action not in scope.envelope.actions
+           or action in scope.envelope.prohibited_actions for action in actions):
+        raise PermissionError("invocation action is outside the verified scope")
+    if request.account_ref is not None and request.account_ref not in scope.envelope.account_refs:
+        raise PermissionError("invocation account is outside the verified scope")
+    if request.uses_credentials and not scope.envelope.credential_use:
+        raise PermissionError("invocation credential use is outside the verified scope")
+    if request.uses_credentials and request.account_ref is None:
+        raise PermissionError("invocation credential use requires an opaque account reference")
+    if request.target_sha256 is None or request.target_sha256 not in {
+        grant.content_sha256 for grant in scope.envelope.targets
+    }:
+        raise PermissionError("invocation target hash is outside the verified scope")
+    if hash_path(target) != request.target_sha256:
+        raise PermissionError("execution target does not match its authorized hash")
+    networked = ActionAuthority.NETWORK_ACCESS in actions
+    if not networked:
+        if request.network_policy != "none":
+            raise PermissionError("non-network invocation requires network-none policy")
+        if request.endpoint is not None:
+            raise PermissionError("endpoint intent requires authorized restricted network access")
+        return scope
+    if request.network_policy != "restricted":
+        raise PermissionError("verified scope permits only exact restricted egress")
+    if scope.envelope.network_mode is not NetworkMode.EXACT_ENDPOINTS:
+        raise PermissionError("verified scope does not authorize exact remote network access")
+    if request.endpoint is None:
+        raise PermissionError("exact endpoint is required for restricted egress")
+    if normalize_endpoint(request.endpoint) not in scope.envelope.endpoints:
+        raise PermissionError("invocation endpoint is outside the verified scope")
+    return scope

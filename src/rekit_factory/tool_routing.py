@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
 from pathlib import PurePosixPath
 import re
 from types import MappingProxyType
@@ -53,6 +55,30 @@ class ToolRoute:
     capabilities: WorkerCapabilities
     remote: bool
     target_path: str
+
+    def binding_payload(self, target_sha256: str) -> dict[str, object]:
+        return {
+            "routeBindingVersion": 1,
+            "toolWorkerId": self.capabilities.worker_id,
+            "toolWorkerPlatform": self.capabilities.platform,
+            "toolWorkerArchitecture": self.capabilities.architecture,
+            "toolWorkerIsolation": self.capabilities.isolation,
+            "toolWorkerInteractive": self.capabilities.interactive,
+            "toolWorkerCapabilitiesSha256": capability_digest(self.capabilities),
+            "toolTargetSha256": target_sha256,
+            "toolTargetPathSha256": _text_digest(self.target_path),
+            "requireRemote": self.remote,
+        }
+
+    def verify_binding(self, payload: Mapping[str, object], target_sha256: str) -> None:
+        if payload.get("routeBindingVersion") != 1:
+            raise PermissionError("durable tool route binding is missing or unsupported")
+        expected = self.binding_payload(target_sha256)
+        mismatched = [name for name, value in expected.items() if payload.get(name) != value]
+        if mismatched:
+            raise PermissionError(
+                "durable tool route binding changed: " + ", ".join(sorted(mismatched))
+            )
 
     def invocation(
         self,
@@ -146,3 +172,14 @@ def _compatible(capabilities: WorkerCapabilities,
         and (requirements.interactive is None
              or capabilities.interactive is requirements.interactive)
     )
+
+
+def capability_digest(capabilities: WorkerCapabilities) -> str:
+    value = capabilities.to_dict()
+    value["tools"] = sorted(value["tools"])
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _text_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -10,7 +12,7 @@ from rekit_factory.control import InvestigationController, RunRequest
 from rekit_factory.models import ModelProfile, WorkerReport
 from rekit_factory.rekit_client import ToolManifest, ToolResult
 from rekit_factory.remote import (
-    ArtifactRecord, InvocationRequest, InvocationResult, WorkerCapabilities,
+    ArtifactRecord, InvocationRequest, InvocationResult, LocalRekitWorker, WorkerCapabilities,
 )
 from rekit_factory.scope import (
     ActionAuthority, author_scope, hash_path,
@@ -111,6 +113,24 @@ class ToolRoutingTests(unittest.TestCase):
         )
         self.assertNotIn("secret-worker-token", repr(bindings))
 
+    def test_cli_plaintext_requires_explicit_loopback_development_opt_in(self):
+        args = parser().parse_args(["serve", "--remote-worker-env", "DEVWORKER"])
+        environment = {
+            "DEVWORKER_URL": "http://127.0.0.1:8765",
+            "DEVWORKER_TOKEN": "secret-worker-token",
+            "DEVWORKER_STAGED_TARGETS": '{"' + "a" * 64 + '":"input/fixture"}',
+            "DEVWORKER_ALLOW_LOOPBACK_HTTP": "1",
+        }
+        transport = FakeTransport("dev-worker")
+        with patch.dict("os.environ", environment, clear=True), patch(
+            "rekit_factory.cli.HTTPWorkerTransport", return_value=transport,
+        ) as constructor:
+            _load_remote_workers(args)
+        constructor.assert_called_once_with(
+            "http://127.0.0.1:8765", auth_token="secret-worker-token",
+            allow_loopback_http=True,
+        )
+
     def test_selection_is_deterministic_and_capability_compatible(self):
         local = FakeTransport(
             "local", platform="local", architecture="native", isolation="host",
@@ -141,6 +161,27 @@ class ToolRoutingTests(unittest.TestCase):
                 "scan", "/local/fixture", target_hash,
                 requirements=WorkerRequirements(platform="linux", require_remote=True),
             )
+
+    def test_manifest_worker_requirements_fail_closed_without_matching_remote(self):
+        class RemoteOnlyRekit(FakeRekit):
+            def manifest(self, tool_id):
+                return ToolManifest(
+                    tool_id, tool_id, "fixture", 0, "no", "none",
+                    required_platform="windows", required_architecture="x86_64",
+                    required_isolation="vm", requires_remote=True,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=RemoteOnlyRekit(),
+                workers=FakeBackend(),
+            )
+            with self.assertRaisesRegex(LookupError, "no capability-compatible"):
+                controller.create(RunRequest(
+                    target, "scan", tools=("scan",), worker_roles=("analyst",),
+                ))
 
     def test_selected_remote_never_falls_back_when_target_is_not_explicitly_staged(self):
         local = FakeTransport("local", platform="local", architecture="native")
@@ -225,10 +266,160 @@ class ToolRoutingTests(unittest.TestCase):
                              if item["operation"] == "rekit-tool")
             self.assertEqual("windows-analysis", tool_item["payload"]["toolWorkerId"])
             self.assertTrue(tool_item["payload"]["requireRemote"])
+            self.assertEqual("vm", tool_item["payload"]["toolWorkerIsolation"])
+            self.assertEqual(target_hash, tool_item["payload"]["toolTargetSha256"])
+            self.assertNotIn("input/staged/fixture.txt", repr(tool_item["payload"]))
             artifact = next(item for item in result["artifacts"]
                             if item["kind"] == "tool-output")
             self.assertIn("windows-analysis", artifact["metadata_json"])
             self.assertIn("reports/scan.json", artifact["metadata_json"])
+            metadata = json.loads(artifact["metadata_json"])
+            self.assertEqual("windows-analysis", metadata["provenance"]["worker_id"])
+            self.assertIsNone(metadata["provenance"]["initiating_worker_id"])
+
+    def test_local_worker_rehashes_target_at_execution_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("authorized", encoding="utf-8")
+            scope = author_scope(
+                target, scope_id="local-boundary", revision=1,
+                actions=(ActionAuthority.READ_LOCAL_TARGET,),
+                approved_by="operator:local", rationale="exact local fixture",
+                approved_at="2026-07-13T05:00:00Z",
+                valid_until="2026-07-14T05:00:00Z",
+                expires_at="2026-07-14T05:00:00Z",
+            )
+            request = InvocationRequest(
+                run_id="run-local", work_item_id="work-local", tool_id="scan",
+                target_path=str(target), target_sha256=hash_path(target),
+                scope_digest=scope.envelope.content_digest, scope_revision=scope.to_dict(),
+                requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+            )
+            target.write_text("mutated", encoding="utf-8")
+            rekit = FakeRekit()
+            with self.assertRaisesRegex(PermissionError, "authorized hash"):
+                LocalRekitWorker(rekit).invoke(request)
+            self.assertEqual(0, rekit.calls)
+
+    def test_restart_rejects_same_worker_id_with_drifted_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            original = FakeTransport("analysis-worker", isolation="vm")
+            first = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    original, {target_hash: "input/staged/fixture.txt"},
+                ),),
+            )
+            run_dir = first.create(RunRequest(
+                target, "scan", tools=("scan",), worker_roles=("analyst",),
+            ))
+            drifted = FakeTransport("analysis-worker", isolation="host")
+            resumed = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    drifted, {target_hash: "input/staged/fixture.txt"},
+                ),),
+            )
+            result = asyncio.run(resumed.drive(run_dir))
+            tool = next(item for item in result["workItems"]
+                        if item["operation"] == "rekit-tool")
+            self.assertEqual("failed", tool["status"])
+            self.assertEqual([], drifted.requests)
+
+    def test_restart_rejects_changed_staged_path_for_same_hash_and_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            first = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    FakeTransport("analysis-worker"),
+                    {target_hash: "input/staged/fixture-a.txt"},
+                ),),
+            )
+            run_dir = first.create(RunRequest(
+                target, "scan", tools=("scan",), worker_roles=("analyst",),
+            ))
+            changed = FakeTransport("analysis-worker")
+            resumed = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    changed, {target_hash: "input/staged/fixture-b.txt"},
+                ),),
+            )
+            result = asyncio.run(resumed.drive(run_dir))
+            tool = next(item for item in result["workItems"]
+                        if item["operation"] == "rekit-tool")
+            self.assertEqual("failed", tool["status"])
+            self.assertEqual([], changed.requests)
+
+    def test_controller_rejects_spoofed_transport_result_before_capture(self):
+        class SpoofedTransport(FakeTransport):
+            def invoke(self, request):
+                result = super().invoke(request)
+                return InvocationResult(
+                    invocation_id=result.invocation_id, run_id=result.run_id,
+                    work_item_id=result.work_item_id, worker_id="other-worker",
+                    status=result.status, exit_code=result.exit_code,
+                    stdout=result.stdout, stderr=result.stderr, artifacts=result.artifacts,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            remote = SpoofedTransport("analysis-worker")
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    remote, {target_hash: "input/staged/fixture.txt"},
+                ),),
+            )
+            result = controller.run(RunRequest(
+                target, "scan", tools=("scan",), worker_roles=("analyst",),
+            ))
+            tool = next(item for item in result["workItems"]
+                        if item["operation"] == "rekit-tool")
+            self.assertEqual("failed", tool["status"])
+            self.assertEqual([], result["artifacts"])
+
+    def test_replacing_run_scope_with_another_valid_revision_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            original = author_scope(
+                target, scope_id="immutable", revision=1,
+                actions=(ActionAuthority.READ_LOCAL_TARGET,),
+                approved_by="operator:scope", rationale="original revision",
+                approved_at="2026-07-13T05:00:00Z",
+                valid_until="2026-07-14T05:00:00Z",
+                expires_at="2026-07-14T05:00:00Z",
+            )
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+            )
+            run_dir = controller.create(RunRequest(
+                target, "scan", tools=("scan",), worker_roles=("analyst",), scope=original,
+            ))
+            replacement = author_scope(
+                target, scope_id="immutable", revision=2,
+                actions=(ActionAuthority.READ_LOCAL_TARGET,),
+                approved_by="operator:scope", rationale="different valid revision",
+                approved_at="2026-07-13T05:00:00Z",
+                valid_until="2026-07-14T05:00:00Z",
+                expires_at="2026-07-14T05:00:00Z",
+            )
+            (Path(run_dir) / "scope.json").write_text(
+                json.dumps(replacement.to_dict(), sort_keys=True), encoding="utf-8",
+            )
+            result = asyncio.run(controller.drive(run_dir))
+            tool = next(item for item in result["workItems"]
+                        if item["operation"] == "rekit-tool")
+            self.assertEqual("failed", tool["status"])
 
 
 if __name__ == "__main__":

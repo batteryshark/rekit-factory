@@ -154,9 +154,17 @@ def _load_remote_workers(args: argparse.Namespace) -> tuple[RemoteWorkerBinding,
             priority = int(os.environ.get(priority_name, "100"))
         except ValueError as exc:
             raise ValueError(f"{priority_name} must be an integer") from exc
+        development_http_name = f"{prefix}_ALLOW_LOOPBACK_HTTP"
+        development_http_value = os.environ.get(development_http_name, "0")
+        if development_http_value not in {"0", "1"}:
+            raise ValueError(f"{development_http_name} must be 0 or 1")
+        transport_options = (
+            {"allow_loopback_http": True} if development_http_value == "1" else {}
+        )
         bindings.append(RemoteWorkerBinding(
             HTTPWorkerTransport(
                 os.environ[names["url"]], auth_token=os.environ[names["token"]],
+                **transport_options,
             ),
             {str(key): str(value) for key, value in staged.items()},
             priority=priority,

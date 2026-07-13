@@ -452,7 +452,10 @@ class InvestigationController:
         payload = json.loads(item["payload_json"])
         tool_id = payload["toolId"]
         manifest = self.rekit.manifest(tool_id)
-        scope = _load_scope(ctx.deps.paths, Path(item["target"]))
+        scope = _load_scope(
+            ctx.deps.paths, Path(item["target"]),
+            expected_binding=_run_scope_binding(ledger, ctx.state.run_id),
+        )
         decision = None
         actions = list(_manifest_actions(manifest))
         requested_action = payload.get("requestedAction")
@@ -471,6 +474,15 @@ class InvestigationController:
                     "invalid",
                 )
         authorized_actions = tuple(dict.fromkeys(actions))
+        if (decision is None and payload.get("endpoint")
+                and ActionAuthority.NETWORK_ACCESS not in authorized_actions):
+            decision = ScopeDecision(
+                False, "scope.endpoint_without_network_authority",
+                (f"scope:{scope.envelope.scope_id}:r{scope.envelope.revision}:"
+                 f"{scope.envelope.content_digest[:12]}"),
+                TargetGrant.from_path(item["target"]).path_fingerprint,
+                opaque_ref("endpoint", payload["endpoint"]), "denied",
+            )
         for action in authorized_actions:
             if decision is not None:
                 break
@@ -567,6 +579,8 @@ class InvestigationController:
                     require_remote=bool(payload.get("requireRemote", False)),
                 ),
             )
+            if payload.get("toolWorkerId") is not None:
+                route.verify_binding(payload, target_grant.content_sha256)
             invocation = route.invocation(
                 run_id=ctx.state.run_id,
                 work_item_id=item["id"],
@@ -581,6 +595,7 @@ class InvestigationController:
                 uses_credentials=bool(payload.get("usesCredentials", False)),
             )
             result = await asyncio.to_thread(route.transport.invoke, invocation)
+            _validate_invocation_result(invocation, result, route.capabilities.worker_id)
         except Exception as exc:
             ledger.finish_tool_call(
                 call_id, status="failed", output_path=None, exit_code=None,
@@ -617,7 +632,8 @@ class InvestigationController:
                 ),
                 target_sha256=hash_target(Path(item["target"])),
                 tool_id=tool_id,
-                worker_id=payload.get("workerId"),
+                worker_id=route.capabilities.worker_id,
+                initiating_worker_id=payload.get("workerId"),
                 invocation_id=call_id,
                 work_item_id=item["id"],
             ),
@@ -1359,13 +1375,12 @@ class InvestigationController:
 
     def _route_payload(self, tool_id: str, target: Path) -> dict[str, Any]:
         target_grant = TargetGrant.from_path(target)
+        manifest = self.rekit.manifest(tool_id)
         route = self.tool_router.select(
             tool_id, str(target), target_grant.content_sha256,
+            requirements=_manifest_worker_requirements(manifest),
         )
-        return {
-            "toolWorkerId": route.capabilities.worker_id,
-            "requireRemote": route.remote,
-        }
+        return route.binding_payload(target_grant.content_sha256)
 
     def _model_tool_results(self, ledger: FactoryLedger, run_id: str,
                             session: dict[str, Any]) -> tuple[ModelToolResult, ...]:
@@ -1466,13 +1481,57 @@ def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,
             raise PermissionError(f"run creation denied: {decision.reason_code}")
 
 
-def _load_scope(paths: RunPaths, target: Path) -> AuthorizedScope:
+def _load_scope(paths: RunPaths, target: Path, *,
+                expected_binding: dict[str, Any] | None = None) -> AuthorizedScope:
     scope_path = paths.run_dir / "scope.json"
     if scope_path.is_file():
-        return AuthorizedScope.from_dict(json.loads(scope_path.read_text(encoding="utf-8")))
+        scope = AuthorizedScope.from_dict(json.loads(scope_path.read_text(encoding="utf-8")))
+        if expected_binding is not None:
+            actual = scope.envelope.public_dict()
+            for name in ("scopeId", "revision", "digest"):
+                if actual.get(name) != expected_binding.get(name):
+                    raise PermissionError(f"run scope binding changed: {name}")
+        return scope
+    if expected_binding is not None:
+        raise PermissionError("run-bound scope record is missing")
     # Pre-scope runs receive only a short-lived, exact-target, network-none grant.
     # Any non-read-only queued work will fail at the dispatch decision matrix.
     return legacy_local_read_only_scope(target, now=utcnow())
+
+
+def _run_scope_binding(ledger: FactoryLedger, run_id: str) -> dict[str, Any] | None:
+    row = ledger.get_run(run_id)
+    if row is None:
+        raise KeyError(run_id)
+    config = json.loads(row["config_json"])
+    value = config.get("scope")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PermissionError("run scope binding is malformed")
+    return value
+
+
+def _manifest_worker_requirements(manifest: Any) -> WorkerRequirements:
+    return WorkerRequirements(
+        platform=getattr(manifest, "required_platform", None),
+        architecture=getattr(manifest, "required_architecture", None),
+        isolation=getattr(manifest, "required_isolation", None),
+        interactive=getattr(manifest, "required_interactive", None),
+        require_remote=bool(getattr(manifest, "requires_remote", False)),
+    )
+
+
+def _validate_invocation_result(invocation: Any, result: Any,
+                                worker_id: str) -> None:
+    expected = (
+        invocation.invocation_id, invocation.run_id, invocation.work_item_id, worker_id,
+    )
+    actual = (
+        result.invocation_id, result.run_id, result.work_item_id, result.worker_id,
+    )
+    if actual != expected:
+        raise ValueError("tool result provenance does not match the durable invocation")
 
 
 def _request_plan(request: RunRequest) -> InvestigationPlan:

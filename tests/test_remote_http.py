@@ -35,6 +35,20 @@ def remote_scope(target_hash: str, endpoint: str, *, account_refs=(), credential
     ))
 
 
+def offline_scope(target_hash: str) -> AuthorizedScope:
+    envelope = ScopeEnvelope(
+        scope_id="scope-offline", revision=1,
+        valid_from="2026-07-01T00:00:00Z", valid_until="2026-08-01T00:00:00Z",
+        targets=(TargetGrant(target_hash, opaque_ref("target-path", "/controller/input")),),
+        actions=(ActionAuthority.READ_LOCAL_TARGET,), network_mode=NetworkMode.NONE,
+    )
+    return AuthorizedScope(envelope, ScopeApproval(
+        scope_id=envelope.scope_id, revision=1, content_digest=envelope.content_digest,
+        approved_by="operator-remote", approved_at="2026-07-01T00:00:00Z",
+        expires_at="2026-08-01T00:00:00Z", rationale="Exact offline fixture",
+    ))
+
+
 class FixtureWorker:
     def __init__(self):
         self.requests: list[InvocationRequest] = []
@@ -85,6 +99,7 @@ def running_server(root: Path, **kwargs):
             f"http://127.0.0.1:{server.server_port}",
             auth_token="test-token",
             poll_interval=0.005,
+            allow_loopback_http=True,
         )
     finally:
         server.shutdown()
@@ -106,6 +121,17 @@ class RemoteHTTPTransportTests(unittest.TestCase):
         values.update(overrides)
         return InvocationRequest(**values)
 
+    def scoped_request(self, target: Path, **overrides) -> InvocationRequest:
+        digest = hash_path(target)
+        scope = offline_scope(digest)
+        return self.request(
+            target_sha256=digest,
+            scope_digest=scope.envelope.content_digest,
+            scope_revision=scope.to_dict(),
+            requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+            **overrides,
+        )
+
     def test_discovers_capabilities_invokes_and_resumes_ordered_events(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -115,7 +141,7 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                 self.assertEqual("fixture-worker", capabilities.worker_id)
                 self.assertEqual(("fixture-scan",), capabilities.tools)
 
-                result = client.invoke(self.request())
+                result = client.invoke(self.scoped_request(root / "fixture.txt"))
                 self.assertEqual("done", result.status)
                 self.assertEqual("benign fixture", result.stdout)
                 self.assertEqual("run-1", result.run_id)
@@ -134,7 +160,9 @@ class RemoteHTTPTransportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with running_server(root) as (_, client):
-                wrong = HTTPWorkerTransport(client.base_url, auth_token="wrong-token")
+                wrong = HTTPWorkerTransport(
+                    client.base_url, auth_token="wrong-token", allow_loopback_http=True,
+                )
                 with self.assertRaisesRegex(RemoteWorkerError, "401"):
                     wrong.capabilities()
 
@@ -164,7 +192,9 @@ class RemoteHTTPTransportTests(unittest.TestCase):
             (root / "fixture.txt").write_text("fixture", encoding="utf-8")
             with running_server(root) as (worker, client):
                 worker.result_worker_id = "spoofed-worker"
-                result = client.invoke(self.request(invocation_id="invoke-spoofed"))
+                result = client.invoke(self.scoped_request(
+                    root / "fixture.txt", invocation_id="invoke-spoofed",
+                ))
                 self.assertEqual("failed", result.status)
                 self.assertEqual("fixture-worker", result.worker_id)
                 self.assertIn("ValueError", result.stderr)
@@ -181,6 +211,30 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                     ("127.0.0.1", 0), worker, auth_token="token", input_root=tmp,
                     allowed_network_policies=(),
                 )
+        with self.assertRaisesRegex(ValueError, "plaintext HTTP"):
+            HTTPWorkerTransport("http://worker.internal/v1", auth_token="token")
+        with self.assertRaisesRegex(ValueError, "plaintext HTTP"):
+            HTTPWorkerTransport("http://127.0.0.1:8765", auth_token="token")
+        HTTPWorkerTransport(
+            "http://127.0.0.1:8765", auth_token="token", allow_loopback_http=True,
+        )
+
+    def test_scope_is_required_even_for_offline_read_only_and_endpoint_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            with running_server(root) as (_, client):
+                with self.assertRaisesRegex(RemoteWorkerError, "verified scope is required"):
+                    client.invoke(self.request(
+                        invocation_id="invoke-unscoped", target_sha256=hash_path(target),
+                        requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+                    ))
+                with self.assertRaisesRegex(RemoteWorkerError, "endpoint intent requires"):
+                    client.invoke(self.scoped_request(
+                        target, invocation_id="invoke-offline-endpoint",
+                        endpoint="https://injected.invalid/collect",
+                    ))
 
     def test_remote_revalidates_scope_hash_revision_and_exact_endpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
