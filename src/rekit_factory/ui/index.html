@@ -82,7 +82,14 @@
     </div>
   </main>
 </div>
+<aside class="operator-attention" id="operatorAttention" role="region" aria-live="assertive" aria-labelledby="operatorAttentionTitle" aria-describedby="operatorAttentionMessage" hidden>
+  <button class="attention-dismiss" type="button" data-attention-dismiss aria-label="Dismiss operator attention notification">×</button>
+  <div class="attention-signal" aria-hidden="true"><i></i><span>!</span></div>
+  <div class="attention-copy"><span class="eyebrow">LIVE OPERATOR GATE</span><b id="operatorAttentionTitle">Operator attention required</b><p id="operatorAttentionMessage">A new decision is waiting in the inbox.</p></div>
+  <div class="attention-actions"><button class="btn primary" type="button" data-attention-open>Open Inbox</button><button class="btn" type="button" data-attention-later>Later</button></div>
+</aside>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/ui/mission-attention.js" defer></script>
 <script src="/ui/mission-control.js" defer></script>
 </body>
 </html>

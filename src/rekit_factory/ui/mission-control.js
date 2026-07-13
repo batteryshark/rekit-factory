@@ -64,7 +64,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false};
+const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false, attention: MissionAttention.createTracker()};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -84,6 +84,37 @@ function toast(message, error = false) {
   element.className = `toast show${error ? " error" : ""}`;
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => { element.className = "toast"; }, 3200);
+}
+
+function dismissAttention() {
+  const element = $("operatorAttention");
+  element.classList.remove("show");
+  element.hidden = true;
+}
+
+function showAttention(runCount, questionCount) {
+  const element = $("operatorAttention");
+  $("operatorAttentionTitle").textContent = runCount === 1 ? "Operator attention required" : "Multiple investigations need attention";
+  $("operatorAttentionMessage").textContent = questionCount === 1
+    ? "A new decision is waiting in the Decision Inbox."
+    : `${questionCount} new decisions are waiting across ${runCount} investigations.`;
+  element.hidden = false;
+  element.classList.remove("show");
+  requestAnimationFrame(() => element.classList.add("show"));
+}
+
+async function announceAttention(transitions) {
+  const claimed = [];
+  for (const run of transitions) {
+    try {
+      const snapshot = await api(`/api/runs/${encodeURIComponent(run.runId)}`);
+      const questionIds = (snapshot.pendingQuestions || []).map(question => question.id).filter(Boolean);
+      if (state.attention.claim(run.runId, questionIds)) claimed.push(questionIds.length);
+    } catch (_error) {
+      state.attention.rearm(run.runId);
+    }
+  }
+  if (claimed.length) showAttention(claimed.length, claimed.reduce((total, count) => total + count, 0));
 }
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -139,6 +170,8 @@ function activate(element) {
   if (restart) { restartService(); return true; }
   const view = element.closest("[data-view]");
   if (view) { show(view.dataset.view); return true; }
+  if (element.closest("[data-attention-open]")) { dismissAttention(); show("inbox"); return true; }
+  if (element.closest("[data-attention-dismiss], [data-attention-later]")) { dismissAttention(); return true; }
   const memoryToggle = element.closest("[data-memory-toggle]");
   if (memoryToggle) {
     const body = document.getElementById(memoryToggle.getAttribute("aria-controls"));
@@ -188,6 +221,7 @@ function activate(element) {
 
 document.addEventListener("click", event => activate(event.target));
 document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !$("operatorAttention").hidden) dismissAttention();
   if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-run]")) {
     event.preventDefault();
     activate(event.target);
@@ -266,7 +300,13 @@ function renderFleet() {
 }
 
 async function refreshFleet() {
-  try { state.fleet = (await api("/api/fleet")).runs; renderFleet(); }
+  try {
+    const runs = (await api("/api/fleet")).runs;
+    const transitions = state.attention.transitions(runs);
+    state.fleet = runs;
+    renderFleet();
+    if (transitions.length) await announceAttention(transitions);
+  }
   catch (error) { $("healthText").textContent = "API unavailable"; toast(error.message, true); }
 }
 
