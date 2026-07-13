@@ -581,6 +581,22 @@ class ControlPlaneTests(unittest.TestCase):
                     "scope": authorized_dynamic_scope(target).to_dict(),
                 }, expected=202)
                 run_id = launched["run"]["id"]
+                self.assertEqual(1, launched["outcomeProjection"]["schemaVersion"])
+                self.assertEqual(
+                    "factory-outcomes/v1", launched["outcomeProjection"]["vocabularyVersion"]
+                )
+                self.assertIsInstance(
+                    launched["outcomeProjection"]["consistency"]["cursor"]["factoryEventRowid"],
+                    int,
+                )
+                with FactoryLedger(Path(launched["runDir"]) / "run.db") as cursor_ledger:
+                    expected_cursor = cursor_ledger.conn.execute(
+                        "select max(rowid) from factory_events where run_id=?", (run_id,),
+                    ).fetchone()[0]
+                self.assertEqual(
+                    expected_cursor,
+                    launched["outcomeProjection"]["consistency"]["cursor"]["factoryEventRowid"],
+                )
                 suspended = self._wait_status(base, run_id, "needs_input")
                 self.assertEqual(1, len(suspended["pendingQuestions"]))
 
@@ -596,6 +612,13 @@ class ControlPlaneTests(unittest.TestCase):
                 )
                 self.assertTrue(answered["started"])
                 completed = self._wait_status(base, run_id, "completed")
+                run_outcome = next(
+                    item for item in completed["outcomeProjection"]["entities"]
+                    if item["entityType"] == "run" and item["entityId"] == run_id
+                )
+                self.assertEqual("terminal", run_outcome["facets"]["execution"]["state"])
+                self.assertEqual("completed", run_outcome["facets"]["completion"]["state"])
+                self.assertEqual("successful", run_outcome["facets"]["disposition"]["state"])
                 self.assertEqual(0, completed["coverage"]["pending"])
                 self.assertEqual("Exercise the API permission path", completed["memory"]["goals"][-1]["text"])
                 self.assertIn("GOAL: Exercise the API permission path", completed["memoryContext"])

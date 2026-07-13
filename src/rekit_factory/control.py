@@ -56,6 +56,7 @@ from rekit_factory.findings import (
     finding_snapshot,
 )
 from rekit_factory.dossiers import DossierPublisher, dossier_list
+from rekit_factory.outcomes import project_outcomes
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.remote import LocalRekitWorker
 from rekit_factory.scope import (
@@ -447,14 +448,25 @@ class InvestigationController:
             "select * from artifacts where run_id=? order by created_at", (paths.run_id,)
         ).fetchall()]
         project_memory = _project_memory_log(paths).replay()
+        memory_projection = project_memory.deterministic_dict()
+        # Publication presence is cheap canonical state.  Byte-level dossier verification is
+        # intentionally reserved for the dedicated dossier route and is never inferred here.
+        dossiers = dossier_list(ledger, paths.run_id)
+        pending_questions = ledger.pending_questions(paths.run_id)
+        workers = ledger.workers(paths.run_id)
+        events = ledger.events(paths.run_id)
+        event_cursor_row = ledger.conn.execute(
+            "select coalesce(max(rowid), 0) as cursor from factory_events where run_id=?",
+            (paths.run_id,),
+        ).fetchone()
         return {
             "run": dict(run) if run is not None else None,
             "meta": _read_meta(paths),
             "coverage": ledger.coverage(paths.run_id),
-            "workers": ledger.workers(paths.run_id),
+            "workers": workers,
             "workItems": work,
-            "events": ledger.events(paths.run_id),
-            "pendingQuestions": ledger.pending_questions(paths.run_id),
+            "events": events,
+            "pendingQuestions": pending_questions,
             "modelCalls": ledger.model_calls(paths.run_id),
             "workerSessions": [
                 {**session,
@@ -464,13 +476,25 @@ class InvestigationController:
             ],
             "toolCalls": ledger.tool_calls(paths.run_id),
             "artifacts": artifacts,
-            "memory": project_memory.deterministic_dict(),
+            "memory": memory_projection,
             "memoryContext": memory_context(project_memory),
             "hypothesisState": hypothesis_snapshot(project_memory),
             "findingState": finding_snapshot(project_memory),
             # Cheap publication projection only. Anchored byte verification belongs to the
             # dedicated dossier route, not the high-frequency generic/SSE snapshot path.
-            "dossiers": dossier_list(ledger, paths.run_id),
+            "dossiers": dossiers,
+            "outcomeProjection": project_outcomes(
+                run=dict(run) if run is not None else None,
+                workers=workers,
+                work_items=work,
+                memory=memory_projection,
+                dossiers=dossiers,
+                pending_questions=pending_questions,
+                cursor={
+                    "factoryEventRowid": int(event_cursor_row["cursor"]),
+                    "memorySequence": project_memory.last_seq,
+                },
+            ),
             "knowledgeReferences": ledger.knowledge_references(paths.run_id),
         }
 
