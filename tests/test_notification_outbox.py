@@ -307,6 +307,53 @@ def test_canonical_projection_boundary_hydrates_then_admits_exactly_once(tmp_pat
     reopened.close()
 
 
+def test_canonical_resolution_supersedes_undelivered_alert_and_bounds_flapping(tmp_path):
+    path = tmp_path / "run.db"
+    empty, waiting = _transition()
+    ledger = FactoryLedger(path)
+    assert ledger.admit_notification_projection("run-1", empty) == []
+    [notification_id] = ledger.admit_notification_projection("run-1", waiting)
+    box = NotificationOutbox(ledger.conn)
+    assert box.get(notification_id)["status"] == "queued"
+
+    assert ledger.admit_notification_projection("run-1", empty) == []
+    resolved = box.get(notification_id)
+    assert resolved["status"] == "superseded"
+    assert resolved["supersededAt"] is not None
+    assert box.claim_due("sender") == []
+
+    # Re-entering the same waiting state addresses the immutable prior identity and cannot
+    # create or revive delivery work.
+    assert ledger.admit_notification_projection("run-1", waiting) == [notification_id]
+    assert box.get(notification_id)["status"] == "superseded"
+    assert ledger.conn.execute(
+        "select count(*) from factory_notification_outbox",
+    ).fetchone()[0] == 1
+    assert box.claim_due("sender") == []
+    ledger.close()
+
+
+def test_resolution_and_baseline_advance_roll_back_together(tmp_path):
+    empty, waiting = _transition()
+    ledger = FactoryLedger(tmp_path / "run.db")
+    ledger.admit_notification_projection("run-1", empty)
+    [notification_id] = ledger.admit_notification_projection("run-1", waiting)
+
+    def crash(boundary):
+        if boundary == "notifications-reconciled":
+            raise RuntimeError("crash after notification reconciliation")
+
+    with pytest.raises(RuntimeError, match="notification reconciliation"):
+        ledger.admit_notification_projection("run-1", empty, failure_injector=crash)
+    assert NotificationOutbox(ledger.conn).get(notification_id)["status"] == "queued"
+    baseline = ledger.conn.execute(
+        "select semantic_sha256 from factory_notification_projection_state where run_id=?",
+        ("run-1",),
+    ).fetchone()[0]
+    assert baseline == waiting["semanticSha256"]
+    ledger.close()
+
+
 def test_projection_and_outbox_rollback_together_at_every_boundary(tmp_path):
     old, new = _transition("finding.reproduced")
     for boundary in ("outbox-admitted", "baseline-advanced"):

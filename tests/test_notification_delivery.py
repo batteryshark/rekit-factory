@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 
 import pytest
@@ -18,6 +19,7 @@ from rekit_factory.notification_delivery import (
     delivery_preview,
 )
 from rekit_factory.notification_policy import notification_candidates
+from rekit_factory.campaign_notification_policy import POLICY_VERSION as CAMPAIGN_POLICY_VERSION
 from rekit_factory.outcomes import project_outcomes
 
 
@@ -44,6 +46,42 @@ def _record():
                 "view": "mission-control", "runId": candidate["runId"], "tab": "decisions",
                 "entityType": candidate["entity"]["entityType"],
                 "entityId": candidate["entity"]["entityId"],
+            },
+        },
+    }
+
+
+def _campaign_record(kind):
+    campaign_id = "campaign-1"
+    marker = {
+        "campaign.budget-threshold": "costUnits:8000",
+        "campaign.terminal": "completed:completion-criteria-met",
+        "campaign.infrastructure-action": "failed:infrastructure-failure",
+    }[kind]
+    message = {
+        "campaign.budget-threshold": "A configured campaign budget threshold was crossed.",
+        "campaign.terminal": "A campaign reached a terminal outcome.",
+        "campaign.infrastructure-action":
+            "A campaign infrastructure failure requires operator attention.",
+    }[kind]
+    identity = {
+        "policyVersion": CAMPAIGN_POLICY_VERSION, "campaignId": campaign_id,
+        "transition": kind, "marker": marker,
+    }
+    dedupe = "sha256:" + hashlib.sha256(json.dumps(
+        identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+    ).encode()).hexdigest()
+    return {
+        "id": "notification-" + dedupe.removeprefix("sha256:"),
+        "payload": {
+            "schemaVersion": 1, "policyVersion": CAMPAIGN_POLICY_VERSION,
+            "dedupeKey": dedupe, "kind": kind,
+            "severity": ("action-required"
+                         if kind == "campaign.infrastructure-action" else "consequential"),
+            "message": message, "transitionMarker": marker,
+            "deepLink": {
+                "view": "mission-control", "tab": "campaigns",
+                "entityType": "campaign", "entityId": campaign_id,
             },
         },
     }
@@ -223,6 +261,47 @@ def test_preview_and_test_channel_are_fixed_bounded_and_redacted():
     assert "/Users/private" not in serialized
     assert "credential:" not in serialized
     assert len(serialized) < 1400
+
+
+@pytest.mark.parametrize(("kind", "title"), [
+    ("campaign.budget-threshold", "Campaign budget threshold"),
+    ("campaign.terminal", "Campaign finished"),
+    ("campaign.infrastructure-action", "Campaign needs you"),
+])
+def test_campaign_delivery_preview_and_webhook_are_exact_redacted_and_linked(kind, title):
+    record = _campaign_record(kind)
+    preview = delivery_preview(record)
+    channel = WebhookChannel(
+        "webhook-campaigns", "https://hooks.example.test/campaigns", "credential:campaigns",
+    )
+    body = json.loads(build_webhook_request(channel, record).body)
+
+    assert preview["title"] == title
+    assert preview["deepLink"] == {
+        "view": "mission-control", "tab": "campaigns",
+        "entityType": "campaign", "entityId": "campaign-1",
+    }
+    assert {key: body[key] for key in preview} == preview
+    assert body["notificationId"] == record["id"]
+    serialized = json.dumps({"preview": preview, "body": body})
+    assert "transitionMarker" not in serialized
+    assert "credential:" not in serialized
+    assert "/Users/" not in serialized
+
+
+@pytest.mark.parametrize("mutation", ["message", "deep-link", "marker", "dedupe"])
+def test_campaign_delivery_rejects_forged_prose_link_marker_and_identity(mutation):
+    record = _campaign_record("campaign.infrastructure-action")
+    if mutation == "message":
+        record["payload"]["message"] = "TOKEN=hostile /Users/private"
+    elif mutation == "deep-link":
+        record["payload"]["deepLink"]["tab"] = "findings"
+    elif mutation == "marker":
+        record["payload"]["transitionMarker"] = "failed:some-other-reason"
+    else:
+        record["payload"]["dedupeKey"] = "sha256:" + "0" * 64
+    with pytest.raises(InvalidDeliveryConfiguration):
+        delivery_preview(record)
 
 
 def test_test_webhook_body_matches_preview_and_uses_stable_test_idempotency():

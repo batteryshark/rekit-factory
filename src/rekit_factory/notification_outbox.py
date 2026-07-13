@@ -16,6 +16,7 @@ import sqlite3
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from rekit_factory.notification_policy import CANDIDATE_SCHEMA_VERSION, POLICY_VERSION
+from rekit_factory.campaign_notification_policy import POLICY_VERSION as CAMPAIGN_POLICY_VERSION
 
 
 OUTBOX_SCHEMA_VERSION = 1
@@ -25,6 +26,9 @@ _KINDS = frozenset({"operator-decision.waiting", "finding.reproduced", "finding.
 _SEVERITIES = frozenset({"action-required", "consequential"})
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _REVISION = re.compile(r"^sha256:[0-9a-f]{64}$")
+_CAMPAIGN_KINDS = frozenset({
+    "campaign.budget-threshold", "campaign.terminal", "campaign.infrastructure-action",
+})
 
 
 class InvalidNotificationCandidate(ValueError):
@@ -66,6 +70,8 @@ def _safe_id(value: Any, field: str) -> str:
 def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
     if type(candidate) is not dict:
         raise InvalidNotificationCandidate("candidate must be a JSON object")
+    if candidate.get("policyVersion") == CAMPAIGN_POLICY_VERSION:
+        return _campaign_payload(candidate)
     exact = {
         "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "runId",
         "entity", "message",
@@ -116,6 +122,46 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "view": "mission-control", "runId": run_id, "tab": tab,
             "entityType": entity_type, "entityId": entity_id,
         },
+    }
+
+
+def _campaign_payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    exact = {
+        "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "campaignId",
+        "transitionMarker", "entity", "message", "deepLink",
+    }
+    if set(candidate) != exact or candidate.get("schemaVersion") != 1:
+        raise InvalidNotificationCandidate("campaign candidate has an invalid schema")
+    campaign_id = _safe_id(candidate.get("campaignId"), "campaignId")
+    marker = _safe_id(candidate.get("transitionMarker"), "transitionMarker")
+    kind, severity = candidate.get("kind"), candidate.get("severity")
+    if kind not in _CAMPAIGN_KINDS or severity not in _SEVERITIES:
+        raise InvalidNotificationCandidate("campaign candidate kind or severity is unsupported")
+    expected_severity = ("action-required" if kind == "campaign.infrastructure-action"
+                         else "consequential")
+    messages = {
+        "campaign.budget-threshold": "A configured campaign budget threshold was crossed.",
+        "campaign.terminal": "A campaign reached a terminal outcome.",
+        "campaign.infrastructure-action":
+            "A campaign infrastructure failure requires operator attention.",
+    }
+    entity = candidate.get("entity")
+    deep_link = candidate.get("deepLink")
+    expected_link = {"view": "mission-control", "tab": "campaigns",
+                     "entityType": "campaign", "entityId": campaign_id}
+    if entity != {"entityType": "campaign", "entityId": campaign_id} \
+            or deep_link != expected_link or severity != expected_severity \
+            or candidate.get("message") != messages[kind]:
+        raise InvalidNotificationCandidate("campaign candidate content is not canonical")
+    identity = {"policyVersion": CAMPAIGN_POLICY_VERSION, "campaignId": campaign_id,
+                "transition": kind, "marker": marker}
+    expected_dedupe = "sha256:" + _digest(_canonical(identity))
+    if candidate.get("dedupeKey") != expected_dedupe:
+        raise InvalidNotificationCandidate("campaign candidate dedupe identity is invalid")
+    return {
+        "schemaVersion": OUTBOX_SCHEMA_VERSION, "policyVersion": CAMPAIGN_POLICY_VERSION,
+        "dedupeKey": expected_dedupe, "kind": kind, "severity": severity,
+        "message": messages[kind], "transitionMarker": marker, "deepLink": expected_link,
     }
 
 
@@ -183,12 +229,13 @@ class NotificationOutbox:
                     ids.append(outbox_id)
                     continue
                 deep_link = payload["deepLink"]
+                routing_id = deep_link.get("runId", deep_link.get("entityId"))
                 self.connection.execute(
                     "insert into factory_notification_outbox "
                     "(id,dedupe_key,run_id,kind,severity,entity_type,entity_id,payload_json,"
                     "payload_sha256,status,next_attempt_at,created_at,updated_at) "
                     "values (?,?,?,?,?,?,?,?,?,'queued',?,?,?)",
-                    (outbox_id, dedupe_key, deep_link["runId"], payload["kind"],
+                    (outbox_id, dedupe_key, routing_id, payload["kind"],
                      payload["severity"], deep_link["entityType"], deep_link["entityId"],
                      payload_json, payload_sha, now, now, now),
                 )
@@ -203,22 +250,34 @@ class NotificationOutbox:
             raise ValueError("notification outbox payload failed integrity verification")
         payload = json.loads(payload_json)
         # Revalidation detects structurally valid but unauthorized database mutation.
-        candidate = {
-            "schemaVersion": CANDIDATE_SCHEMA_VERSION,
-            "policyVersion": payload["policyVersion"], "dedupeKey": payload["dedupeKey"],
-            "kind": payload["kind"], "severity": payload["severity"],
-            "runId": payload["deepLink"]["runId"],
-            "entity": {"entityType": payload["deepLink"]["entityType"],
-                       "entityId": payload["deepLink"]["entityId"]},
-            "message": payload["message"],
-        }
+        if payload.get("policyVersion") == CAMPAIGN_POLICY_VERSION:
+            campaign_id = payload["deepLink"]["entityId"]
+            candidate = {
+                "schemaVersion": 1, "policyVersion": payload["policyVersion"],
+                "dedupeKey": payload["dedupeKey"], "kind": payload["kind"],
+                "severity": payload["severity"], "campaignId": campaign_id,
+                "transitionMarker": payload["transitionMarker"],
+                "entity": {"entityType": "campaign", "entityId": campaign_id},
+                "message": payload["message"], "deepLink": payload["deepLink"],
+            }
+        else:
+            candidate = {
+                "schemaVersion": CANDIDATE_SCHEMA_VERSION,
+                "policyVersion": payload["policyVersion"], "dedupeKey": payload["dedupeKey"],
+                "kind": payload["kind"], "severity": payload["severity"],
+                "runId": payload["deepLink"]["runId"],
+                "entity": {"entityType": payload["deepLink"]["entityType"],
+                           "entityId": payload["deepLink"]["entityId"]},
+                "message": payload["message"],
+            }
         if _payload(candidate) != payload:
             raise ValueError("notification outbox payload is not canonical")
         deep_link = payload["deepLink"]
         expected_id = "notification-" + payload["dedupeKey"].removeprefix("sha256:")
+        routing_id = deep_link.get("runId", deep_link.get("entityId"))
         columns = (
             (row["id"], expected_id), (row["dedupe_key"], payload["dedupeKey"]),
-            (row["run_id"], deep_link["runId"]), (row["kind"], payload["kind"]),
+            (row["run_id"], routing_id), (row["kind"], payload["kind"]),
             (row["severity"], payload["severity"]),
             (row["entity_type"], deep_link["entityType"]),
             (row["entity_id"], deep_link["entityId"]),

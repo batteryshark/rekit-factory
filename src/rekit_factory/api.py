@@ -26,6 +26,15 @@ from rekit_factory.outcomes import is_worker_report_result
 from rekit_factory.notification_outbox import (
     NotificationNotFound, NotificationOutbox, NotificationStateConflict,
 )
+from rekit_factory.notification_configuration import (
+    NotificationConfigurationConflict, NotificationConfigurationStore,
+)
+from rekit_factory.notification_delivery import (
+    CredentialResolver, DesktopChannel, DesktopTransport, WebhookChannel, WebhookTransport,
+    build_test_webhook_request, channel_test_preview, deliver_test_desktop, deliver_webhook,
+    delivery_preview,
+)
+from rekit_factory.notification_supervisor import NotificationDeliverySupervisor
 from rekit_factory.scope import AuthorizedScope
 from rekit_factory.store import FactoryLedger
 
@@ -87,12 +96,126 @@ class DriveSupervisor:
         self.thread.join(timeout=2)
 
 
+class NotificationDeliveryWorker:
+    """Fair bounded scan of durable ledgers, isolated from canonical server work."""
+
+    def __init__(self, server: "FactoryServer", *, poll_seconds: float = 1.0,
+                 ledger_limit: int = 8, delivery_limit: int = 1,
+                 autostart: bool = True):
+        if not isinstance(poll_seconds, (int, float)) or not 0.05 <= poll_seconds <= 60:
+            raise ValueError("notification poll interval is outside its bounded range")
+        if type(ledger_limit) is not int or not 1 <= ledger_limit <= 64 \
+                or type(delivery_limit) is not int or not 1 <= delivery_limit <= 32:
+            raise ValueError("notification worker batch limits are outside their bounded range")
+        self.server = server
+        self.poll_seconds = float(poll_seconds)
+        self.ledger_limit = ledger_limit
+        self.delivery_limit = delivery_limit
+        self._cursor = 0
+        self._stop = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="factory-notification-delivery", daemon=True,
+        )
+        if autostart:
+            self.thread.start()
+
+    def _ledger_paths(self) -> list[Path]:
+        paths = [run_dir / "run.db" for run_dir in _run_dirs(self.server.storage_root)]
+        campaign = self.server.campaign_controller
+        if campaign is not None:
+            try:
+                raw = campaign.persistence.conn.execute("pragma database_list").fetchone()[2]
+                if raw:
+                    paths.append(Path(raw))
+            except (sqlite3.Error, IndexError, TypeError):
+                pass
+        return sorted(set(path.resolve() for path in paths if path.is_file()), key=str)
+
+    def _fair_batch(self, paths: list[Path]) -> list[Path]:
+        if not paths:
+            return []
+        start = self._cursor % len(paths)
+        count = min(len(paths), self.ledger_limit)
+        batch = [paths[(start + offset) % len(paths)] for offset in range(count)]
+        self._cursor = (start + count) % len(paths)
+        return batch
+
+    def run_cycle(self) -> list[dict[str, Any]]:
+        """Run one deterministic cycle; each ledger and adapter failure is isolated."""
+        try:
+            _, selected_refs = self.server.notification_configuration.selected_delivery()
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return []
+        channels: dict[str, DesktopChannel | WebhookChannel] = {}
+        for channel_ref in selected_refs:
+            try:
+                channel = self.server.notification_configuration.channel(channel_ref)
+            except (ValueError, KeyError):
+                continue
+            enabled = (
+                isinstance(channel, DesktopChannel)
+                and self.server.notification_desktop_transport is not None
+            ) or (
+                isinstance(channel, WebhookChannel)
+                and self.server.notification_webhook_transport is not None
+                and self.server.notification_credential_resolver is not None
+            )
+            if enabled:
+                channels[channel_ref] = channel
+        if not channels:
+            return []
+        results: list[dict[str, Any]] = []
+        worker_id = "notification-worker-" + self.server.instance_id
+        for path in self._fair_batch(self._ledger_paths()):
+            if self._stop.is_set():
+                break
+            try:
+                connection = sqlite3.connect(path, timeout=0.25, check_same_thread=False)
+                connection.row_factory = sqlite3.Row
+                try:
+                    batch = NotificationDeliverySupervisor(connection).run_once(
+                        worker_id, channels=channels,
+                        desktop_transport=self.server.notification_desktop_transport,
+                        webhook_transport=self.server.notification_webhook_transport,
+                        credential_resolver=self.server.notification_credential_resolver,
+                        limit=self.delivery_limit, channel_refs=tuple(sorted(channels)),
+                    )
+                    results.extend({"ledger": path.name, **item} for item in batch)
+                finally:
+                    connection.close()
+            except (OSError, sqlite3.Error, ValueError, TypeError, KeyError,
+                    json.JSONDecodeError, RuntimeError):
+                continue
+        return results
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_cycle()
+            except Exception:
+                # Unknown adapter exceptions cannot terminate the durable worker loop.
+                pass
+            self._stop.wait(self.poll_seconds)
+
+    def close(self) -> None:
+        self._stop.set()
+        if self.thread.is_alive():
+            # One in-flight adapter call is permitted per ledger cycle. Environment-owned
+            # adapters are required to be bounded to 30 seconds, matching the concrete adapters.
+            self.thread.join(timeout=35)
+
+
 class FactoryServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, controller: InvestigationController, *,
                  allow_restart: bool = False,
-                 campaign_controller: CampaignController | None = None):
+                 campaign_controller: CampaignController | None = None,
+                 notification_configuration: NotificationConfigurationStore | None = None,
+                 notification_desktop_transport: DesktopTransport | None = None,
+                 notification_webhook_transport: WebhookTransport | None = None,
+                 notification_credential_resolver: CredentialResolver | None = None,
+                 notification_worker_autostart: bool = True):
         host = address[0]
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Factory API must bind to a loopback address")
@@ -103,17 +226,34 @@ class FactoryServer(ThreadingHTTPServer):
         self.allow_restart = allow_restart
         self.campaign_controller = campaign_controller
         self.campaign_lock = threading.RLock()
+        self.notification_configuration = notification_configuration or NotificationConfigurationStore(
+            self.storage_root.parent / ".factory" / "notification-configuration.sqlite3"
+        )
+        self.controller.notification_configuration = self.notification_configuration
+        if self.campaign_controller is not None:
+            self.campaign_controller.notification_configuration = self.notification_configuration
+        self.notification_desktop_transport = notification_desktop_transport
+        self.notification_webhook_transport = notification_webhook_transport
+        self.notification_credential_resolver = notification_credential_resolver
         self.instance_id = uuid.uuid4().hex
         self.restart_requested = threading.Event()
+        self.notification_worker = NotificationDeliveryWorker(
+            self, autostart=notification_worker_autostart,
+        )
 
     def request_restart(self) -> None:
         """Finish the current response, then return control to the CLI for re-exec."""
         if not self.allow_restart:
             raise RuntimeError("service restart is unavailable for this server")
         self.restart_requested.set()
-        threading.Thread(target=self.shutdown, name="factory-restart", daemon=True).start()
+        def restart() -> None:
+            self.notification_worker.close()
+            self.shutdown()
+        threading.Thread(target=restart, name="factory-restart", daemon=True).start()
 
     def server_close(self) -> None:
+        if hasattr(self, "notification_worker"):
+            self.notification_worker.close()
         if hasattr(self, "supervisor"):
             self.supervisor.close()
         super().server_close()
@@ -165,6 +305,11 @@ class FactoryHandler(BaseHTTPRequestHandler):
             if parts == ["api", "fleet"]:
                 self._json(HTTPStatus.OK, {"runs": _fleet(self.server.controller)})
                 return
+            if parts == ["api", "notification-configuration"]:
+                self._json(HTTPStatus.OK, {
+                    "configuration": self.server.notification_configuration.public_snapshot(),
+                })
+                return
             if parts == ["api", "campaigns"]:
                 campaigns = self._campaigns()
                 self._json(HTTPStatus.OK, {
@@ -207,6 +352,26 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     "schemaVersion": 1,
                     "runId": parts[2],
                     "notifications": notifications,
+                })
+                return
+            if (len(parts) == 6 and parts[:2] == ["api", "runs"]
+                    and parts[3] == "notifications" and parts[5] == "preview"):
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                with FactoryLedger(run_dir / "run.db") as ledger:
+                    record = NotificationOutbox(ledger.conn).get(parts[4])
+                if record is None:
+                    raise NotificationNotFound(parts[4])
+                self._json(HTTPStatus.OK, {
+                    "schemaVersion": 1, "runId": parts[2],
+                    "notificationId": parts[4], "preview": delivery_preview(record),
+                })
+                return
+            if (len(parts) == 5 and parts[:2] == ["api", "notification-configuration"]
+                    and parts[2] == "channels" and parts[4] == "test-preview"):
+                channel = self.server.notification_configuration.channel(parts[3])
+                self._json(HTTPStatus.OK, {
+                    "channelRef": channel.channel_id,
+                    "preview": channel_test_preview(channel.channel_id, "mission-control-preview"),
                 })
                 return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "dossiers":
@@ -330,6 +495,53 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 snapshot["runDir"] = str(run_dir)
                 self._json(HTTPStatus.ACCEPTED, snapshot)
                 return
+            if parts == ["api", "notification-configuration"]:
+                expected = {"expectedRevision", "preferencePresetId", "channelRefs"}
+                if set(payload) != expected:
+                    raise ValueError(
+                        "notification configuration body must contain only exact selection fields"
+                    )
+                configuration = self.server.notification_configuration.update(
+                    expected_revision=payload["expectedRevision"],
+                    preference_preset_id=payload["preferencePresetId"],
+                    channel_refs=payload["channelRefs"],
+                )
+                self._json(HTTPStatus.OK, {"configuration": configuration})
+                return
+            if (len(parts) == 5 and parts[:2] == ["api", "notification-configuration"]
+                    and parts[2] == "channels" and parts[4] == "test"):
+                if set(payload) != {"expectedRevision", "testId"}:
+                    raise ValueError(
+                        "channel test body must contain only expectedRevision and testId"
+                    )
+                configuration = self.server.notification_configuration.public_snapshot()
+                if payload["expectedRevision"] != configuration["revision"]:
+                    raise NotificationConfigurationConflict(
+                        "notification configuration revision is stale"
+                    )
+                channel = self.server.notification_configuration.channel(parts[3])
+                preview = channel_test_preview(channel.channel_id, payload["testId"])
+                if isinstance(channel, DesktopChannel):
+                    transport = self.server.notification_desktop_transport
+                    if transport is None:
+                        sent, error_code = False, "transport-unavailable"
+                    else:
+                        attempt = deliver_test_desktop(channel, payload["testId"], transport)
+                        sent, error_code = attempt.sent, attempt.error_code
+                else:
+                    transport = self.server.notification_webhook_transport
+                    resolver = self.server.notification_credential_resolver
+                    if transport is None or resolver is None:
+                        sent, error_code = False, "transport-unavailable"
+                    else:
+                        request = build_test_webhook_request(channel, payload["testId"])
+                        attempt = deliver_webhook(channel, request, resolver, transport)
+                        sent, error_code = attempt.sent, attempt.error_code
+                self._json(HTTPStatus.OK, {
+                    "channelRef": channel.channel_id, "sent": sent,
+                    "errorCode": error_code, "preview": preview,
+                })
+                return
             if (len(parts) == 4 and parts[:2] == ["api", "campaigns"]
                     and parts[3] in {"pause", "resume", "stop"}):
                 controller = self._campaign_controller()
@@ -447,7 +659,7 @@ class FactoryHandler(BaseHTTPRequestHandler):
             status = (HTTPStatus.NOT_FOUND if "does not exist" in str(exc)
                       else HTTPStatus.CONFLICT)
             self._json(status, {"error": str(exc)})
-        except NotificationStateConflict as exc:
+        except (NotificationStateConflict, NotificationConfigurationConflict) as exc:
             self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except NotificationNotFound as exc:
             self._json(HTTPStatus.NOT_FOUND, {
@@ -812,9 +1024,12 @@ def serve(controller: InvestigationController, *, host: str = "127.0.0.1",
           port: int = 8768,
           campaign_controller: CampaignController | None = None) -> bool:
     """Serve until stopped, returning true when the CLI should re-exec itself."""
+    from rekit_factory.notification_supervisor import MacOSDesktopTransport
+
     server = FactoryServer(
         (host, port), controller, allow_restart=True,
         campaign_controller=campaign_controller,
+        notification_desktop_transport=MacOSDesktopTransport(),
     )
     try:
         server.serve_forever()

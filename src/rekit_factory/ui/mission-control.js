@@ -62,7 +62,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], campaigns: [], campaignSelected: null, campaignListRequest: 0, campaignDetailRequest: 0, campaignAction: null, campaignReturnFocus: null, config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], notifications: [], notificationRun: null, stream: null, streamCursors: new Map(), restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
+const state = {fleet: [], campaigns: [], campaignSelected: null, campaignListRequest: 0, campaignDetailRequest: 0, campaignAction: null, campaignReturnFocus: null, config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], notifications: [], notificationRun: null, notificationConfiguration: null, stream: null, streamCursors: new Map(), restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -220,7 +220,7 @@ function show(name) {
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === `view-${name}`));
   document.querySelectorAll(".nav").forEach(nav => nav.classList.toggle("active", nav.dataset.view === name));
   $("crumb").textContent = name.replaceAll("-", " ").toUpperCase();
-  return {generation, ready: name === "inbox" ? loadInbox() : name === "settings" ? loadNotifications() : Promise.resolve()};
+  return {generation, ready: name === "inbox" ? loadInbox() : name === "settings" ? Promise.all([loadNotificationConfiguration(), loadNotifications()]) : Promise.resolve()};
 }
 
 function focusInbox() {
@@ -256,6 +256,11 @@ function activate(element) {
   const restart = element.closest("#restartService, [data-restart-service]");
   if (restart) { restartService(); return true; }
   if (element.closest("[data-notification-refresh]")) { loadNotifications(); return true; }
+  if (element.closest("[data-notification-config-save]")) { saveNotificationConfiguration(); return true; }
+  const channelTest = element.closest("[data-notification-channel-test]");
+  if (channelTest) { testNotificationChannel(channelTest); return true; }
+  const preview = element.closest("[data-notification-preview]");
+  if (preview) { previewNotification(preview); return true; }
   const acknowledgement = element.closest("[data-notification-ack]");
   if (acknowledgement) { acknowledgeNotification(acknowledgement); return true; }
   const notificationLink = element.closest("[data-notification-link]");
@@ -1117,8 +1122,52 @@ function renderNotifications() {
   list.innerHTML = state.notifications.length ? state.notifications.map(notification => {
     const payload = notification.payload, link = payload.deepLink;
     const canAcknowledge = notification.status === "sent";
-    return `<article class="notification-row notification-${esc(notification.status)}"><div class="notification-signal" aria-hidden="true"></div><div><span>${esc(payload.kind.replaceAll(".", " / "))}</span><b>${esc(payload.message)}</b><small>${esc(notification.status)} · ${esc(new Date(notification.updatedAt).toLocaleString())}</small>${notification.lastErrorCode ? `<code>${esc(notification.lastErrorCode)}</code>` : ""}</div><div class="notification-actions"><button class="btn" type="button" data-notification-link data-run="${esc(link.runId)}" data-tab="${esc(link.tab)}">Open ${esc(link.entityType)}</button>${canAcknowledge ? `<button class="btn primary" type="button" data-notification-ack data-notification-id="${esc(notification.id)}" data-notification-revision="${esc(notification.revision)}">Acknowledge</button>` : ""}</div></article>`;
+    return `<article class="notification-row notification-${esc(notification.status)}"><div class="notification-signal" aria-hidden="true"></div><div><span>${esc(payload.kind.replaceAll(".", " / "))}</span><b>${esc(payload.message)}</b><small>${esc(notification.status)} · ${esc(new Date(notification.updatedAt).toLocaleString())}</small>${notification.lastErrorCode ? `<code>${esc(notification.lastErrorCode)}</code>` : ""}</div><div class="notification-actions"><button class="btn" type="button" data-notification-preview data-notification-id="${esc(notification.id)}">Preview</button><button class="btn" type="button" data-notification-link data-run="${esc(link.runId)}" data-tab="${esc(link.tab)}">Open ${esc(link.entityType)}</button>${canAcknowledge ? `<button class="btn primary" type="button" data-notification-ack data-notification-id="${esc(notification.id)}" data-notification-revision="${esc(notification.revision)}">Acknowledge</button>` : ""}</div></article>`;
   }).join("") : `<div class="empty compact"><b>No delivery records</b>This run has no consequential notifications in its durable outbox.</div>`;
+}
+
+function renderNotificationConfiguration() {
+  const configuration = state.notificationConfiguration, root = $("notificationConfiguration");
+  if (!configuration) { root.innerHTML = `<div class="empty compact"><b>Delivery policy unavailable</b></div>`; return; }
+  root.innerHTML = `<label class="notification-field"><span>Delivery policy</span><select id="notificationPreferencePreset">${configuration.preferencePresets.map(preset => `<option value="${esc(preset.id)}" ${preset.id === configuration.preferencePresetId ? "selected" : ""}>${esc(preset.id)} · ${esc(preset.mode)}${preset.parameter === null ? "" : ` · ${esc(preset.parameter)}`}</option>`).join("")}</select></label><div class="notification-field"><span>Enabled channels</span><div class="notification-channel-list">${configuration.channels.map(channel => `<div class="notification-channel"><input id="notification-channel-${esc(channel.ref)}" type="checkbox" data-notification-channel-ref value="${esc(channel.ref)}" ${configuration.channelRefs.includes(channel.ref) ? "checked" : ""}><label for="notification-channel-${esc(channel.ref)}"><b>${esc(channel.ref)}</b><small>${esc(channel.kind)} · endpoint and credentials withheld</small></label><button class="btn" type="button" data-notification-channel-test data-channel-ref="${esc(channel.ref)}">Test</button></div>`).join("")}</div></div>`;
+}
+
+function renderNotificationPreview(preview, channelRef = null) {
+  const root = $("notificationPreview"); root.hidden = false;
+  root.innerHTML = `<header><b>${esc(preview.title)}</b><span>${esc(channelRef || preview.kind)}</span></header><p>${esc(preview.message)}</p><code>${esc(preview.idempotencyKey)}</code>`;
+}
+
+async function loadNotificationConfiguration() {
+  try {
+    const result = await api("/api/notification-configuration");
+    state.notificationConfiguration = result.configuration; renderNotificationConfiguration();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function saveNotificationConfiguration() {
+  const configuration = state.notificationConfiguration;
+  const channelRefs = [...document.querySelectorAll("[data-notification-channel-ref]:checked")].map(input => input.value);
+  try {
+    const result = await api("/api/notification-configuration", {method: "POST", body: JSON.stringify({expectedRevision: configuration.revision, preferencePresetId: $("notificationPreferencePreset").value, channelRefs})});
+    state.notificationConfiguration = result.configuration; renderNotificationConfiguration(); toast("Delivery policy saved");
+  } catch (error) { await loadNotificationConfiguration(); toast(error.message, true); }
+}
+
+async function testNotificationChannel(button) {
+  button.disabled = true;
+  try {
+    const testId = `ui-${crypto.randomUUID()}`;
+    const result = await api(`/api/notification-configuration/channels/${encodeURIComponent(button.dataset.channelRef)}/test`, {method: "POST", body: JSON.stringify({expectedRevision: state.notificationConfiguration.revision, testId})});
+    renderNotificationPreview(result.preview, result.channelRef); toast(result.sent ? "Fixed channel test sent" : `Channel test: ${result.errorCode}`, !result.sent);
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+}
+
+async function previewNotification(button) {
+  try {
+    const result = await api(`/api/runs/${encodeURIComponent(state.notificationRun)}/notifications/${encodeURIComponent(button.dataset.notificationId)}/preview`);
+    renderNotificationPreview(result.preview);
+  } catch (error) { toast(error.message, true); }
 }
 
 async function loadNotifications() {

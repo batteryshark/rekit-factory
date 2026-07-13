@@ -27,6 +27,8 @@ from .campaign_contracts import (
     TerminalOutcome,
     validate_campaign_transition,
 )
+from .campaign_notification_policy import campaign_notification_candidates
+from .notification_outbox import NotificationOutbox
 
 
 FailureInjector = Callable[[str], None]
@@ -354,6 +356,71 @@ create table if not exists factory_campaign_change_requests (
     published_at text not null,
     decided_at text
 );
+create table if not exists factory_campaign_notification_observations (
+    campaign_id text primary key,
+    revision integer not null,
+    state_json text not null,
+    state_sha256 text not null,
+    updated_at text not null
+);
+create table if not exists factory_notification_outbox (
+    id text primary key,
+    dedupe_key text not null unique,
+    run_id text not null,
+    kind text not null,
+    severity text not null,
+    entity_type text not null,
+    entity_id text not null,
+    payload_json text not null,
+    payload_sha256 text not null,
+    status text not null,
+    attempt_count integer not null default 0,
+    next_attempt_at text,
+    lease_token text,
+    lease_expires_at text,
+    last_error_code text,
+    created_at text not null,
+    updated_at text not null,
+    sent_at text,
+    acknowledged_at text,
+    superseded_at text
+);
+create index if not exists idx_factory_notification_outbox_due
+    on factory_notification_outbox(status, next_attempt_at, created_at);
+create table if not exists factory_notification_schedules (
+    schedule_id text primary key,
+    notification_id text not null unique,
+    preferences_id text not null,
+    preferences_revision text not null,
+    preferences_json text not null,
+    preferences_sha256 text not null,
+    schedule_json text not null,
+    schedule_sha256 text not null,
+    disposition text not null,
+    created_at text not null,
+    updated_at text not null
+);
+create table if not exists factory_notification_deliveries (
+    id text primary key,
+    schedule_id text not null,
+    notification_id text not null,
+    channel_ref text not null,
+    phase text not null,
+    status text not null,
+    due_at text,
+    attempt_count integer not null default 0,
+    next_attempt_at text,
+    lease_token text,
+    lease_expires_at text,
+    last_error_code text,
+    created_at text not null,
+    updated_at text not null,
+    sent_at text,
+    superseded_at text,
+    unique(schedule_id, channel_ref, phase)
+);
+create index if not exists idx_factory_notification_deliveries_due
+    on factory_notification_deliveries(status, next_attempt_at, due_at, created_at);
 """
 
 
@@ -406,6 +473,98 @@ class CampaignPersistence:
     def close(self) -> None:
         if self._owns_connection:
             self.conn.close()
+
+    def admit_notification_state(self, campaign_id: str, state: dict[str, object], *,
+                                 budget_thresholds: dict[str, list[int]],
+                                 failure_injector: FailureInjector | None = None
+                                 ) -> list[str]:
+        """Observe one exact public campaign state and advance its outbox atomically."""
+        _identifier(campaign_id, "campaign_id")
+        if type(state) is not dict or state.get("campaignId") != campaign_id:
+            raise CampaignPersistenceError("campaign notification state crossed authority")
+        live = self._campaign_row(campaign_id)
+        contract = json.loads(live["contract_json"])
+        rebuild = self.rebuild_projection(campaign_id)
+        canonical_degraded = (rebuild.degraded or not rebuild.matches_live
+                              or self.health(campaign_id).degraded)
+        expected = {
+            "revision": live["revision"], "status": live["status"],
+            "usage": json.loads(live["cumulative_usage_json"]),
+            "terminal": None if live["terminal_json"] is None
+                        else json.loads(live["terminal_json"]),
+        }
+        if (state.get("revision") != expected["revision"]
+                or state.get("status") != expected["status"]
+                or state.get("cumulativeUsage") != expected["usage"]
+                or state.get("terminal") != expected["terminal"]
+                or state.get("schemaVersion") != 1
+                or state.get("projectId") != contract["projectId"]
+                or state.get("scope") != contract["scope"]
+                or not isinstance(state.get("budget"), dict)
+                or state["budget"].get("cumulative") != contract["cumulativeBudget"]):
+            raise CampaignPersistenceError("campaign notification state is not canonical")
+        health = state.get("health")
+        if type(health) is not dict or health.get("degraded") is not canonical_degraded:
+            raise CampaignPersistenceError("campaign notification health is not canonical")
+        if canonical_degraded:
+            return []
+        state_json = _json(state)
+        state_sha = _digest(state_json)
+        nested = self.conn.in_transaction
+        if nested:
+            self.conn.execute("savepoint campaign_notification_observation")
+        else:
+            self.conn.execute("begin immediate")
+        try:
+            row = self.conn.execute(
+                "select revision,state_json,state_sha256 from "
+                "factory_campaign_notification_observations where campaign_id=?",
+                (campaign_id,),
+            ).fetchone()
+            previous = None
+            if row is not None:
+                if _digest(row["state_json"]) != row["state_sha256"]:
+                    raise CampaignPersistenceError(
+                        "campaign notification baseline failed integrity verification"
+                    )
+                previous = json.loads(row["state_json"])
+                if row["revision"] > state["revision"]:
+                    raise CampaignPersistenceError("campaign notification revision regressed")
+                if row["revision"] == state["revision"]:
+                    if row["state_json"] == state_json:
+                        ids: list[str] = []
+                        if nested:
+                            self.conn.execute("release campaign_notification_observation")
+                        else:
+                            self.conn.commit()
+                        return ids
+            candidates = campaign_notification_candidates(
+                previous, state, budget_thresholds=budget_thresholds,
+            )
+            ids = NotificationOutbox(self.conn).admit(candidates)
+            self._fault(failure_injector, "notification-outbox-admitted")
+            self.conn.execute(
+                "insert into factory_campaign_notification_observations "
+                "(campaign_id,revision,state_json,state_sha256,updated_at) values (?,?,?,?,?) "
+                "on conflict(campaign_id) do update set revision=excluded.revision,"
+                "state_json=excluded.state_json,state_sha256=excluded.state_sha256,"
+                "updated_at=excluded.updated_at",
+                (campaign_id, state["revision"], state_json, state_sha, utcnow()),
+            )
+            self._fault(failure_injector, "notification-baseline-advanced")
+        except BaseException:
+            if nested:
+                self.conn.execute("rollback to campaign_notification_observation")
+                self.conn.execute("release campaign_notification_observation")
+            else:
+                self.conn.rollback()
+            raise
+        else:
+            if nested:
+                self.conn.execute("release campaign_notification_observation")
+            else:
+                self.conn.commit()
+        return ids
 
     @staticmethod
     def _fault(injector: FailureInjector | None, boundary: str) -> None:

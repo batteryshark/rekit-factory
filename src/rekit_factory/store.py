@@ -271,7 +271,10 @@ class FactoryLedger(Ledger):
         erase the last point from which a real transition can be observed.
         """
         from rekit_factory.notification_outbox import NotificationOutbox
-        from rekit_factory.notification_policy import notification_candidates
+        from rekit_factory.notification_policy import (
+            notification_candidates,
+            notification_supersession_ids,
+        )
 
         # This validates the supported schema, vocabulary, semantic digest, and canonical bytes
         # even when there is no previous projection.
@@ -314,9 +317,40 @@ class FactoryLedger(Ledger):
                     self.conn.rollback()
                     return []
                 candidates = notification_candidates(old, projection)
-                admitted = NotificationOutbox(self.conn).admit(candidates)
+                supersession_ids = notification_supersession_ids(old, projection)
+                outbox = NotificationOutbox(self.conn)
+                admitted = outbox.admit(candidates)
                 if failure_injector:
                     failure_injector("outbox-admitted")
+                now = utcnow()
+                for notification_id in supersession_ids:
+                    notification = outbox.get(notification_id)
+                    if notification is None:
+                        continue
+                    delivered = self.conn.execute(
+                        "select 1 from factory_notification_deliveries "
+                        "where notification_id=? and status='sent' limit 1",
+                        (notification_id,),
+                    ).fetchone()
+                    if notification["status"] in {"queued", "failed"} and delivered is None:
+                        self.conn.execute(
+                            "update factory_notification_outbox set status='superseded',"
+                            "next_attempt_at=null,lease_token=null,lease_expires_at=null,"
+                            "superseded_at=?,updated_at=? where id=? "
+                            "and status in ('queued','failed')",
+                            (now, now, notification_id),
+                        )
+                    # An invitation that already escaped preserves its outbox audit lifecycle,
+                    # while every still-pending delivery or escalation is no longer actionable.
+                    self.conn.execute(
+                        "update factory_notification_deliveries set status='superseded',"
+                        "next_attempt_at=null,lease_token=null,lease_expires_at=null,"
+                        "superseded_at=?,updated_at=? where notification_id=? "
+                        "and status in ('queued','failed')",
+                        (now, now, notification_id),
+                    )
+                if failure_injector:
+                    failure_injector("notifications-reconciled")
                 self.conn.execute(
                     "update factory_notification_projection_state set semantic_sha256=?,"
                     "projection_json=?,projection_sha256=?,updated_at=? where run_id=?",

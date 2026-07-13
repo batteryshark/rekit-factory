@@ -15,6 +15,8 @@ from .campaign_contracts import (
     ProgressSignal, ResourceUsage, ScopeBinding, TerminalOutcome,
 )
 from .campaign_lifecycle import CAMPAIGN_AUTHORITY, CampaignLifecycleStore
+from .notification_configuration import NotificationConfigurationStore
+from .notification_supervisor import NotificationDeliverySupervisor
 from .campaign_persistence import (
     CampaignHealthRollup, CampaignPersistence, CampaignPersistenceError,
 )
@@ -30,6 +32,7 @@ CONTROLLER_BOUNDARIES = (
     "launched", "execution-staged", "checkpointed", "recommendation-staged",
     "recommendation-effect", "health-recorded", "recommendation-applied",
 )
+DEFAULT_NOTIFICATION_BUDGET_THRESHOLDS = {"costUnits": [8000, 10000]}
 
 
 class CampaignControllerError(ValueError):
@@ -185,6 +188,8 @@ class CampaignController:
     def __init__(self, persistence: CampaignPersistence, runner: EpochRunner, *,
                  owner_id: str, lifecycle: CampaignLifecycleStore | None = None,
                  policy_config: CampaignPolicyConfig = CampaignPolicyConfig(),
+                 notification_budget_thresholds: dict[str, list[int]] | None = None,
+                 notification_configuration: NotificationConfigurationStore | None = None,
                  fault_injector: Callable[[str], None] | None = None) -> None:
         if not owner_id or len(owner_id) > 256:
             raise CampaignControllerError("owner_id must be a bounded stable identifier")
@@ -194,6 +199,19 @@ class CampaignController:
         self.owner_id = owner_id
         self.lifecycle = lifecycle
         self.policy_config = policy_config
+        configured_thresholds = (DEFAULT_NOTIFICATION_BUDGET_THRESHOLDS
+                                 if notification_budget_thresholds is None
+                                 else notification_budget_thresholds)
+        self.notification_budget_thresholds = {
+            name: list(values) for name, values in configured_thresholds.items()
+        }
+        if notification_configuration is None:
+            database_path = self.persistence.conn.execute("pragma database_list").fetchone()[2]
+            notification_configuration = (None if not database_path else
+                NotificationConfigurationStore(
+                    Path(database_path).parent / ".factory" / "notification-configuration.sqlite3"
+                ))
+        self.notification_configuration = notification_configuration
         self.fault_injector = fault_injector
         self.persistence.conn.executescript(SCHEMA)
         columns = {row[1] for row in self.persistence.conn.execute(
@@ -939,7 +957,7 @@ class CampaignController:
             "waiting": ("pause", "stop"),
             "suspended": ("resume", "stop"),
         }.get(snapshot.status, ())
-        return {
+        state = {
             "schemaVersion": 1,
             "campaignId": campaign_id,
             "projectId": contract.project_id,
@@ -984,6 +1002,29 @@ class CampaignController:
             "changeRequests": [self._public_change_request(item)
                                for item in self.persistence.change_requests(campaign_id)],
         }
+        try:
+            self.persistence.admit_notification_state(
+                campaign_id, state,
+                budget_thresholds=self.notification_budget_thresholds,
+                failure_injector=self.fault_injector,
+            )
+        except Exception:
+            # Notification observation is downstream: canonical campaign reads and
+            # progress remain available when admission is unavailable or corrupt.
+            pass
+        else:
+            if self.notification_configuration is not None:
+                try:
+                    preference, channel_refs = self.notification_configuration.selected_delivery()
+                    supervisor = NotificationDeliverySupervisor(self.persistence.conn)
+                    supervisor.schedule_unscheduled(
+                        preference, project_id=contract.project_id,
+                        campaign_id=campaign_id, channel_refs=channel_refs,
+                        routing_id=campaign_id,
+                    )
+                except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    pass
+        return state
 
 
 class InvestigationEpochRunner:

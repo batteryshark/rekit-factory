@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Any, Literal, Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
+from rekit_factory.campaign_notification_policy import POLICY_VERSION as CAMPAIGN_POLICY_VERSION
 from rekit_factory.notification_policy import POLICY_VERSION
 
 
@@ -27,17 +28,25 @@ _DEDUPE_KEY = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CREDENTIAL_REF = re.compile(r"^credential:[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$")
 _ALLOWED_KINDS = frozenset({
     "operator-decision.waiting", "finding.reproduced", "finding.accepted",
+    "campaign.budget-threshold", "campaign.terminal", "campaign.infrastructure-action",
 })
 _ALLOWED_SEVERITIES = frozenset({"action-required", "consequential"})
 _CANONICAL_MESSAGES = {
     "operator-decision.waiting": "Operator decision is waiting in Mission Control.",
     "finding.reproduced": "A finding reached the reproduced threshold.",
     "finding.accepted": "A finding was accepted by the operator.",
+    "campaign.budget-threshold": "A configured campaign budget threshold was crossed.",
+    "campaign.terminal": "A campaign reached a terminal outcome.",
+    "campaign.infrastructure-action":
+        "A campaign infrastructure failure requires operator attention.",
 }
 _TITLES = {
     "operator-decision.waiting": "Rekit Factory needs you",
     "finding.reproduced": "Finding reproduced",
     "finding.accepted": "Finding accepted",
+    "campaign.budget-threshold": "Campaign budget threshold",
+    "campaign.terminal": "Campaign finished",
+    "campaign.infrastructure-action": "Campaign needs you",
 }
 _TEST_TITLE = "Rekit Factory test"
 _TEST_MESSAGE = "Test notification from Mission Control. No investigation content is included."
@@ -147,10 +156,27 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
         raise InvalidDeliveryConfiguration("delivery record must be an outbox object")
     outbox_id = _safe_id(record.get("id"), "notification id")
     payload = record.get("payload")
-    if type(payload) is not dict or set(payload) != {
+    if type(payload) is not dict or payload.get("schemaVersion") != 1:
+        raise InvalidDeliveryConfiguration("delivery record payload is invalid")
+    if payload.get("policyVersion") == POLICY_VERSION:
+        value = _outcome_delivery(payload)
+    elif payload.get("policyVersion") == CAMPAIGN_POLICY_VERSION:
+        value = _campaign_delivery(payload)
+    else:
+        raise InvalidDeliveryConfiguration("delivery record payload is invalid")
+    dedupe_key = value["idempotencyKey"]
+    expected_notification_id = "notification-" + dedupe_key.removeprefix("sha256:")
+    if outbox_id != expected_notification_id:
+        raise InvalidDeliveryConfiguration("notification id conflicts with idempotency identity")
+    value["notificationId"] = outbox_id
+    return value
+
+
+def _outcome_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if set(payload) != {
         "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "message",
         "deepLink",
-    } or payload.get("schemaVersion") != 1 or payload.get("policyVersion") != POLICY_VERSION:
+    }:
         raise InvalidDeliveryConfiguration("delivery record payload is invalid")
     kind = payload.get("kind")
     severity = payload.get("severity")
@@ -161,9 +187,6 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
             or type(dedupe_key) is not str or _DEDUPE_KEY.fullmatch(dedupe_key) is None \
             or type(deep_link) is not dict:
         raise InvalidDeliveryConfiguration("delivery payload is not canonical")
-    expected_notification_id = "notification-" + dedupe_key.removeprefix("sha256:")
-    if outbox_id != expected_notification_id:
-        raise InvalidDeliveryConfiguration("notification id conflicts with idempotency identity")
     if set(deep_link) != {"view", "runId", "tab", "entityType", "entityId"} \
             or deep_link.get("view") != "mission-control":
         raise InvalidDeliveryConfiguration("delivery deep link is invalid")
@@ -178,7 +201,6 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
         raise InvalidDeliveryConfiguration("delivery deep link is inconsistent")
     return {
         "schemaVersion": DELIVERY_SCHEMA_VERSION,
-        "notificationId": outbox_id,
         "idempotencyKey": dedupe_key,
         "kind": kind,
         "severity": severity,
@@ -188,6 +210,49 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
             "view": "mission-control", "runId": run_id, "tab": expected_tab,
             "entityType": entity_type, "entityId": entity_id,
         },
+    }
+
+
+def _campaign_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if set(payload) != {
+        "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "message",
+        "transitionMarker", "deepLink",
+    }:
+        raise InvalidDeliveryConfiguration("delivery record payload is invalid")
+    kind = payload.get("kind")
+    severity = payload.get("severity")
+    dedupe_key = payload.get("dedupeKey")
+    marker = payload.get("transitionMarker")
+    deep_link = payload.get("deepLink")
+    expected_severity = (
+        "action-required" if kind == "campaign.infrastructure-action" else "consequential"
+    )
+    if kind not in {
+        "campaign.budget-threshold", "campaign.terminal", "campaign.infrastructure-action",
+    } or severity != expected_severity \
+            or payload.get("message") != _CANONICAL_MESSAGES.get(kind) \
+            or type(dedupe_key) is not str or _DEDUPE_KEY.fullmatch(dedupe_key) is None \
+            or type(deep_link) is not dict:
+        raise InvalidDeliveryConfiguration("delivery payload is not canonical")
+    campaign_id = _safe_id(deep_link.get("entityId"), "campaign id")
+    marker = _safe_id(marker, "transition marker")
+    if deep_link != {
+        "view": "mission-control", "tab": "campaigns",
+        "entityType": "campaign", "entityId": campaign_id,
+    }:
+        raise InvalidDeliveryConfiguration("delivery deep link is inconsistent")
+    identity = {
+        "policyVersion": CAMPAIGN_POLICY_VERSION, "campaignId": campaign_id,
+        "transition": kind, "marker": marker,
+    }
+    expected_dedupe = "sha256:" + hashlib.sha256(_canonical_json(identity)).hexdigest()
+    if dedupe_key != expected_dedupe:
+        raise InvalidDeliveryConfiguration("delivery payload dedupe identity is invalid")
+    return {
+        "schemaVersion": DELIVERY_SCHEMA_VERSION,
+        "idempotencyKey": dedupe_key, "kind": kind, "severity": severity,
+        "title": _TITLES[kind], "message": _CANONICAL_MESSAGES[kind],
+        "deepLink": dict(deep_link),
     }
 
 

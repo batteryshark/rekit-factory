@@ -185,10 +185,40 @@ class NotificationDeliverySupervisor:
                     )
         return schedule
 
-    def claim_due(self, worker_id: str, *, limit: int = 32) -> list[dict[str, Any]]:
+    def schedule_unscheduled(self, preferences: NotificationPreferences, *, project_id: str,
+                             campaign_id: str, channel_refs: Sequence[str], routing_id: str,
+                             limit: int = 64) -> list[dict[str, Any]]:
+        """Boundedly reconcile intact pending outbox records that lack a schedule."""
+        routing_id = _safe_id(routing_id, "routing_id")
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("limit must be between 1 and 128")
+        rows = self.connection.execute(
+            "select o.id from factory_notification_outbox o left join "
+            "factory_notification_schedules s on s.notification_id=o.id "
+            "where o.run_id=? and o.status in ('queued','failed') and s.notification_id is null "
+            "order by o.created_at,o.id limit ?", (routing_id, limit),
+        ).fetchall()
+        scheduled: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                scheduled.append(self.schedule(
+                    row["id"], preferences, project_id=project_id, campaign_id=campaign_id,
+                    channel_refs=channel_refs,
+                ))
+            except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+        return scheduled
+
+    def claim_due(self, worker_id: str, *, limit: int = 32,
+                  channel_refs: Sequence[str] | None = None) -> list[dict[str, Any]]:
         worker_id = _safe_id(worker_id, "worker_id")
         if type(limit) is not int or not 1 <= limit <= 128:
             raise ValueError("limit must be between 1 and 128")
+        refs = None if channel_refs is None else tuple(
+            _safe_id(item, "channel_ref") for item in channel_refs
+        )
+        if refs is not None and (not refs or len(refs) > 16 or len(set(refs)) != len(refs)):
+            raise ValueError("channel_refs must be a bounded unique selection")
         now_dt = self.clock()
         now = _timestamp(now_dt)
         expires = _timestamp(now_dt + timedelta(seconds=self.lease_seconds))
@@ -201,6 +231,9 @@ class NotificationDeliverySupervisor:
                 "and attempt_count >= ? and lease_token is not null and lease_expires_at <= ?",
                 (now, self.max_attempts, now),
             )
+            channel_clause = "" if refs is None else (
+                "and d.channel_ref in (" + ",".join("?" for _ in refs) + ") "
+            )
             rows = self.connection.execute(
                 "select d.*,s.schedule_json,s.schedule_sha256,s.preferences_json,"
                 "s.preferences_sha256,s.preferences_id,s.preferences_revision "
@@ -209,8 +242,9 @@ class NotificationDeliverySupervisor:
                 "where d.status in ('queued','failed') and d.attempt_count < ? "
                 "and d.next_attempt_at is not null and d.next_attempt_at <= ? "
                 "and (d.lease_expires_at is null or d.lease_expires_at <= ?) "
+                + channel_clause +
                 "order by d.next_attempt_at,d.created_at,d.id limit ?",
-                (self.max_attempts, now, now, limit),
+                (self.max_attempts, now, now, *(refs or ()), limit),
             ).fetchall()
             for row in rows:
                 if _digest(row["schedule_json"]) != row["schedule_sha256"] \
@@ -324,10 +358,11 @@ class NotificationDeliverySupervisor:
                  desktop_transport: DesktopTransport | None = None,
                  webhook_transport: WebhookTransport | None = None,
                  credential_resolver: CredentialResolver | None = None,
-                 limit: int = 32) -> list[dict[str, Any]]:
+                 limit: int = 32,
+                 channel_refs: Sequence[str] | None = None) -> list[dict[str, Any]]:
         """Deliver one bounded due batch; all adapter failures become durable safe codes."""
         results = []
-        for work in self.claim_due(worker_id, limit=limit):
+        for work in self.claim_due(worker_id, limit=limit, channel_refs=channel_refs):
             channel = channels.get(work["channelRef"])
             if channel is None or channel.channel_id != work["channelRef"]:
                 attempt = DeliveryAttempt(False, "request-invalid")

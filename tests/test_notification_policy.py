@@ -7,6 +7,7 @@ import pytest
 from rekit_factory.notification_policy import (
     InvalidOutcomeProjection,
     notification_candidates,
+    notification_supersession_ids,
 )
 from rekit_factory.outcomes import project_outcomes
 
@@ -81,6 +82,25 @@ def test_self_resolved_decision_never_emits_a_waiting_candidate():
     kinds = [item["kind"] for item in notification_candidates(old, resolved)]
     assert "operator-decision.waiting" not in kinds
     assert kinds == []
+
+
+def test_resolution_targets_the_exact_prior_candidate_and_flaps_reuse_its_identity():
+    empty = _projection()
+    waiting = _projection(questions=[{"id": "question-1", "prompt": "private"}])
+    [candidate] = notification_candidates(empty, waiting)
+    notification_id = "notification-" + candidate["dedupeKey"].removeprefix("sha256:")
+
+    assert notification_supersession_ids(waiting, empty) == [notification_id]
+    assert notification_supersession_ids(empty, waiting) == []
+    assert notification_candidates(empty, waiting)[0]["dedupeKey"] == candidate["dedupeKey"]
+
+
+def test_degraded_observation_cannot_supersede_a_waiting_notification():
+    waiting = _projection(questions=[{"id": "question-1"}])
+    degraded = _projection(run_status="future-paused")
+
+    assert degraded["degraded"] is True
+    assert notification_supersession_ids(waiting, degraded) == []
 
 
 def test_unproven_acceptance_is_suppressed_and_exact_proof_is_the_deep_link():

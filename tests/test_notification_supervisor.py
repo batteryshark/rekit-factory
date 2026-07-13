@@ -154,6 +154,36 @@ def test_escalation_is_durable_and_self_resolution_supersedes_pending_phase(tmp_
     ledger.close()
 
 
+def test_canonical_self_resolution_transactionally_cancels_scheduled_delivery(tmp_path):
+    clock = FakeClock(datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc))
+    ledger = FactoryLedger(tmp_path / "run.db")
+    common = {"workers": (), "work_items": (), "dossiers": (), "memory": {}}
+    empty = project_outcomes(
+        run={"id": "run-1", "status": "running"}, pending_questions=(), **common,
+    )
+    waiting = project_outcomes(
+        run={"id": "run-1", "status": "running"},
+        pending_questions=[{"id": "question-1", "prompt": "private"}], **common,
+    )
+    ledger.admit_notification_projection("run-1", empty)
+    [notification_id] = ledger.admit_notification_projection("run-1", waiting)
+    supervisor = NotificationDeliverySupervisor(ledger.conn, clock=clock)
+    supervisor.schedule(
+        notification_id, _preferences(mode="batched"), project_id="p1", campaign_id="c1",
+        channel_refs=["desktop-local"],
+    )
+
+    assert ledger.admit_notification_projection("run-1", empty) == []
+    assert NotificationOutbox(ledger.conn, clock=clock).get(notification_id)["status"] \
+        == "superseded"
+    [delivery] = supervisor.get_deliveries(notification_id)
+    assert delivery["status"] == "superseded"
+    assert delivery["supersededAt"] is not None
+    clock.advance(minutes=30)
+    assert supervisor.claim_due("sender") == []
+    ledger.close()
+
+
 def test_corrupt_durable_schedule_fails_closed_before_a_lease_is_issued(tmp_path):
     clock = FakeClock(datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc))
     ledger = FactoryLedger(tmp_path / "run.db")

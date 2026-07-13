@@ -90,6 +90,7 @@ def _candidate(campaign_id: str, kind: str, severity: str, message: str, marker:
     dedupe = "sha256:" + hashlib.sha256(_canonical(identity).encode()).hexdigest()
     return {"schemaVersion": 1, "policyVersion": POLICY_VERSION, "dedupeKey": dedupe,
             "kind": kind, "severity": severity, "campaignId": campaign_id,
+            "transitionMarker": marker,
             "entity": {"entityType": "campaign", "entityId": campaign_id},
             "message": message,
             "deepLink": {"view": "mission-control", "tab": "campaigns",

@@ -58,6 +58,8 @@ from rekit_factory.findings import (
     ReproductionAttempt,
     finding_snapshot,
 )
+from rekit_factory.notification_configuration import NotificationConfigurationStore
+from rekit_factory.notification_supervisor import NotificationDeliverySupervisor
 from rekit_factory.dossiers import DossierPublisher, dossier_list
 from rekit_factory.campaign_lifecycle import (
     CAMPAIGN_AUTHORITY,
@@ -220,6 +222,7 @@ class InvestigationController:
                  remote_tool_workers: tuple[RemoteWorkerBinding, ...] = (),
                  knowledge_roots: Iterable[KnowledgeRoot | str | Path] = (),
                  safety_policies: SafetyPolicyCatalog | None = None,
+                 notification_configuration: NotificationConfigurationStore | None = None,
                  terminal_fault_injector: TerminalFaultInjector | None = None,
                  creation_fault_injector: Callable[[str], None] | None = None,
                  worker_semantic_fault_injector: WorkerSemanticFaultInjector | None = None):
@@ -228,6 +231,9 @@ class InvestigationController:
         self.terminal_fault_injector = terminal_fault_injector
         self.creation_fault_injector = creation_fault_injector
         self.worker_semantic_fault_injector = worker_semantic_fault_injector
+        self.notification_configuration = notification_configuration or NotificationConfigurationStore(
+            self.storage_root.parent / ".factory" / "notification-configuration.sqlite3"
+        )
         configured_knowledge = tuple(knowledge_roots)
         self.knowledge = KnowledgeCatalog(configured_knowledge) if configured_knowledge else None
         if isinstance(workers, dict):
@@ -746,6 +752,15 @@ class InvestigationController:
         # temporarily locked notification tables must not make run progress or hydration fail.
         try:
             ledger.admit_notification_projection(paths.run_id, outcome_projection)
+        except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+        try:
+            preference, channel_refs = self.notification_configuration.selected_delivery()
+            supervisor = NotificationDeliverySupervisor(ledger.conn)
+            supervisor.schedule_unscheduled(
+                preference, project_id=meta["projectId"], campaign_id="no-campaign",
+                channel_refs=channel_refs, routing_id=paths.run_id,
+            )
         except (sqlite3.Error, ValueError, TypeError, KeyError, json.JSONDecodeError):
             pass
         return {

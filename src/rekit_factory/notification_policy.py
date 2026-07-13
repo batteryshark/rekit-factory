@@ -202,3 +202,73 @@ def notification_candidates(
                 ))
 
     return sorted(candidates, key=lambda item: (item["kind"], item["entity"]["entityId"]))
+
+
+def notification_supersession_ids(
+    old: Mapping[str, Any] | None,
+    new: Mapping[str, Any],
+) -> list[str]:
+    """Return previously admitted notification ids that no longer require delivery.
+
+    This is deliberately the inverse of the candidate predicates, not a generic entity-removal
+    heuristic.  A degraded observation cannot prove resolution and therefore cancels nothing.
+    Re-entering the same state later retains the original content-addressed id, so a
+    wait/resolve/wait flap cannot create fresh delivery work.
+    """
+    current = _validate_projection(new)
+    if old is None:
+        return []
+    previous = _validate_projection(old)
+    if previous.get("degraded") is not False or current.get("degraded") is not False:
+        return []
+    if previous.get("semanticSha256") == current.get("semanticSha256"):
+        return []
+    old_entities = _entity_map(previous)
+    new_entities = _entity_map(current)
+    if old_entities is None or new_entities is None:
+        return []
+    old_runs = sorted(
+        entity_id for (entity_type, entity_id) in old_entities if entity_type == "run"
+    )
+    new_runs = sorted(
+        entity_id for (entity_type, entity_id) in new_entities if entity_type == "run"
+    )
+    if len(old_runs) != 1 or old_runs != new_runs:
+        return []
+    run_id = old_runs[0]
+    superseded: list[str] = []
+    for (entity_type, entity_id), before in sorted(old_entities.items()):
+        after = new_entities.get((entity_type, entity_id))
+        candidates: list[dict[str, Any]] = []
+        if entity_type == "operator-decision":
+            if _waiting_decision(before) and not _waiting_decision(after):
+                candidates.append(_candidate(
+                    kind="operator-decision.waiting", severity="action-required",
+                    run_id=run_id, entity_id=entity_id,
+                    message="Operator decision is waiting in Mission Control.",
+                ))
+        elif entity_type == "finding":
+            proof_id = _exact_proof_link(old_entities, entity_id)
+            linked_type = "proof-bundle" if proof_id is not None else "finding"
+            linked_id = proof_id or entity_id
+            if (_finding_at(before, "validation", "reproduced")
+                    and not _finding_at(after, "validation", "reproduced")):
+                candidates.append(_candidate(
+                    kind="finding.reproduced", severity="consequential",
+                    run_id=run_id, entity_id=linked_id, entity_type=linked_type,
+                    message="A finding reached the reproduced threshold.",
+                ))
+            if (_finding_at(before, "acceptance", "accepted")
+                    and _finding_at(before, "validation", "reproduced")
+                    and not (_finding_at(after, "acceptance", "accepted")
+                             and _finding_at(after, "validation", "reproduced"))):
+                candidates.append(_candidate(
+                    kind="finding.accepted", severity="consequential",
+                    run_id=run_id, entity_id=linked_id, entity_type=linked_type,
+                    message="A finding was accepted by the operator.",
+                ))
+        superseded.extend(
+            "notification-" + candidate["dedupeKey"].removeprefix("sha256:")
+            for candidate in candidates
+        )
+    return sorted(set(superseded))
