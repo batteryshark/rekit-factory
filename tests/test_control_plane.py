@@ -739,8 +739,14 @@ class ControlPlaneTests(unittest.TestCase):
             after = controller.snapshot(run_dir)
             self.assertIn("artifact-concurrent", {item["id"] for item in after["artifacts"]})
             self.assertEqual("dossier-concurrent", after["dossiers"][0]["id"])
-            self.assertEqual("single-read-transaction",
-                             after["outcomeProjection"]["consistency"]["ledgerRead"])
+            self.assertEqual(
+                "canonical-source-state",
+                after["outcomeProjection"]["consistency"]["mode"],
+            )
+            self.assertEqual(
+                "external-to-projection",
+                after["outcomeProjection"]["consistency"]["sourceRead"],
+            )
 
     def test_general_direction_answer_is_bounded_and_durable(self):
         with tempfile.TemporaryDirectory() as tmp:

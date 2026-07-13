@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
+import hashlib
 import json
 import subprocess
 import sys
@@ -8,8 +10,10 @@ import sys
 import pytest
 
 from rekit_factory.outcomes import (
+    SEMANTIC_CANONICAL_BASE64_FIELD,
     SEMANTIC_IDENTITY_DOMAIN,
     canonical_outcome_semantic_bytes,
+    decode_outcome_semantic_canonical_base64,
     outcome_semantic_sha256,
     project_outcomes,
     verify_outcome_semantic_sha256,
@@ -232,7 +236,7 @@ def test_semantic_identity_domain_is_public_recomputable_and_restart_stable():
     envelope = json.loads(canonical_outcome_semantic_bytes(projection))
     assert envelope["domain"] == SEMANTIC_IDENTITY_DOMAIN
     assert set(envelope["projection"]) == set(projection) - {
-        "semanticSha256", "sourceWatermarks",
+        "semanticCanonicalBase64", "semanticSha256", "sourceWatermarks",
     }
 
     recomputed = subprocess.check_output(
@@ -360,6 +364,64 @@ def test_canonical_domain_rejects_non_json_and_nonfinite_values(bad_value, error
     projection["adversarialField"] = bad_value
     with pytest.raises(error):
         canonical_outcome_semantic_bytes(projection)
+
+
+def test_semantic_canonical_base64_is_byte_exact_for_adversarial_json_numbers_and_keys():
+    projection = _project()
+    projection["adversarialSemantic"] = {
+        "2": 2.0,
+        "10": 10 ** 100,
+        "é": 1e-7,
+        "雪": -0.0,
+    }
+    canonical = canonical_outcome_semantic_bytes(projection)
+    projection[SEMANTIC_CANONICAL_BASE64_FIELD] = base64.b64encode(canonical).decode("ascii")
+    projection["semanticSha256"] = hashlib.sha256(canonical).hexdigest()
+
+    decoded = decode_outcome_semantic_canonical_base64(projection)
+    assert decoded == canonical
+    assert decoded == canonical_outcome_semantic_bytes(projection)
+    assert str(10 ** 100).encode("ascii") in decoded
+    assert b'"2":2.0' in decoded
+    assert b'1e-07' in decoded
+    assert b'-0.0' in decoded
+    assert '"é"'.encode() in decoded
+    assert '"雪"'.encode() in decoded
+    assert verify_outcome_semantic_sha256(projection)
+
+
+def test_semantic_canonical_transport_order_and_mutation_do_not_change_identity():
+    projection = _project(run_status="future-paused")
+    canonical = canonical_outcome_semantic_bytes(projection)
+    identity = projection["semanticSha256"]
+    assert decode_outcome_semantic_canonical_base64(projection) == canonical
+
+    without_transport = deepcopy(projection)
+    without_transport.pop(SEMANTIC_CANONICAL_BASE64_FIELD)
+    assert canonical_outcome_semantic_bytes(without_transport) == canonical
+    assert outcome_semantic_sha256(without_transport) == identity
+
+    reordered = {
+        key: projection[key]
+        for key in reversed(tuple(projection))
+    }
+    assert outcome_semantic_sha256(reordered) == identity
+    assert decode_outcome_semantic_canonical_base64(reordered) == canonical
+
+    mutated = deepcopy(projection)
+    mutated[SEMANTIC_CANONICAL_BASE64_FIELD] = base64.b64encode(
+        canonical + b"transport mutation"
+    ).decode("ascii")
+    assert outcome_semantic_sha256(mutated) == identity
+    assert verify_outcome_semantic_sha256(mutated)
+    with pytest.raises(ValueError, match="does not match"):
+        decode_outcome_semantic_canonical_base64(mutated)
+
+    malformed = deepcopy(projection)
+    malformed[SEMANTIC_CANONICAL_BASE64_FIELD] += "\n"
+    assert outcome_semantic_sha256(malformed) == identity
+    with pytest.raises(ValueError, match="canonical standard Base64"):
+        decode_outcome_semantic_canonical_base64(malformed)
 
 
 def test_dangling_parent_is_diagnostic_and_does_not_create_parent_state():
