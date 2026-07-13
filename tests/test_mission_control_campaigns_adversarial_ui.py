@@ -51,6 +51,12 @@ def test_campaign_surface_preserves_keyboard_mobile_motion_and_bounded_errors():
         "}, 1800)", "link.dataset.campaignRun", "link.dataset.campaignKind",
         "CSS.escape(entityId)", "campaign-linked-target",
         "The canonical record is no longer present in this run.",
+        "decideCampaignChange(changeDecision)",
+        "MissionCampaigns.changeDecisionPayload(campaign, requestId, approved)",
+        "JSON.stringify(decision)",
+        'querySelectorAll("[data-campaign-change-decision], [data-campaign-action]")',
+        "Campaign change response identity mismatch",
+        "/change-decisions",
         "await refreshOpenCampaign(current.campaignId)",
         "state.campaignSelected !== campaignId", "stale links were removed",
         "MissionCampaigns.renderDetail(bounded)",
@@ -67,3 +73,8 @@ def test_campaign_surface_preserves_keyboard_mobile_motion_and_bounded_errors():
     assert "@media(max-width:560px)" in style
     assert "@media(prefers-reduced-motion:reduce)" in style
     assert "campaign-arrive" in style and "campaign-orbit" in style
+    assert ".campaign-change-row" in style and ".campaign-change-actions" in style
+    decision = script[script.index("async function decideCampaignChange"):
+                      script.index("async function openCampaignLink")]
+    assert "proposedContract" not in decision and "replacementContract" not in decision
+    assert "request.diff" not in decision and "request.proposed" not in decision

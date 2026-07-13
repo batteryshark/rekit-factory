@@ -13,6 +13,7 @@
   const tone = value => ({running: "productive", completed: "successful", waiting: "waiting", suspended: "waiting", exhausted: "exhausted", blocked: "blocked", "policy-stopped": "policy-stopped", failed: "failed", stopped: "blocked", requested: "waiting"})[value] || "degraded";
   const limit = value => number(object(value).value ?? value);
   const short = value => String(value || "").slice(0, 12) || "—";
+  const stableId = value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(value);
   const reason = campaign => campaign.terminal?.reasonCode || campaign.recommendation?.reasonCode || campaign.handoff?.reasonCode || "No canonical reason published";
 
   function budgetRows(campaign) {
@@ -27,7 +28,63 @@
   }
 
   function needsAction(campaign) {
-    return campaign.recommendation?.action === "ask-operator" && campaign.recommendationDisposition === "pending";
+    return (campaign.recommendation?.action === "ask-operator" && campaign.recommendationDisposition === "pending") || pendingChanges(campaign).length > 0;
+  }
+
+  function pendingChanges(campaign) {
+    return list(campaign.changeRequests).filter(request => {
+      const value = object(request);
+      return value.status === "pending" && stableId(value.requestId)
+        && stableId(value.currentCampaignId) && stableId(value.proposedCampaignId)
+        && Number.isInteger(value.revision) && value.revision >= 0
+        && value.currentCampaignId === campaign.campaignId;
+    }).slice(0, 32);
+  }
+
+  function changeDecisionPayload(campaign, requestId, approved) {
+    if (typeof approved !== "boolean") return null;
+    const request = pendingChanges(campaign).find(item => item.requestId === requestId);
+    if (!request) return null;
+    const expectedRevision = request.revision;
+    const operationId = `mission-control:${campaign.campaignId}:change:${approved ? "approve" : "reject"}:${expectedRevision}:${requestId}`;
+    return {requestId, approved, expectedRevision, operationId};
+  }
+
+  const CHANGE_BUDGET_FIELDS = ["workItems", "concurrency", "retries", "inputTokens", "outputTokens", "costUnits", "wallSeconds", "toolCalls", "networkCalls", "artifactBytes"];
+  const scalar = value => Array.isArray(value)
+    ? (value.length <= 256 && value.every(stableId) ? value.join(", ") || "none" : "—")
+    : ["string", "number", "boolean"].includes(typeof value) ? String(value) : "—";
+  const pair = (name, values) => {
+    const item = object(values);
+    const current = scalar(item.current), proposed = scalar(item.proposed);
+    return `<div class="campaign-change-row ${current === proposed ? "unchanged" : "changed"}"><span>${safe(name)}</span><code>${safe(current)}</code><i aria-hidden="true">→</i><code>${safe(proposed)}</code></div>`;
+  };
+  function budgetDiff(name, values) {
+    const section = object(values), current = object(section.current), proposed = object(section.proposed);
+    const rows = CHANGE_BUDGET_FIELDS.flatMap(field => {
+      const before = object(current[field]), after = object(proposed[field]);
+      if (!(field in current) && !(field in proposed)) return [];
+      return [pair(field.replace(/([A-Z])/g, " $1"), {current: `${scalar(before.value)} ${scalar(before.unit)}`, proposed: `${scalar(after.value)} ${scalar(after.unit)}`})];
+    });
+    return rows.length ? `<section class="campaign-change-section"><h4>${safe(name)}</h4>${rows.join("")}</section>` : "";
+  }
+  function objectDiff(name, values, fields) {
+    const section = object(values), current = object(section.current), proposed = object(section.proposed);
+    const rows = fields.flatMap(([field, title]) => (field in current || field in proposed) ? [pair(title, {current: current[field], proposed: proposed[field]})] : []);
+    return rows.length ? `<section class="campaign-change-section"><h4>${safe(name)}</h4>${rows.join("")}</section>` : "";
+  }
+  function renderChangeRequest(request, campaignId) {
+    const diff = object(request.diff), scope = object(diff.scope);
+    const components = object(diff.componentVersions);
+    const componentText = value => list(value).slice(0, 64).map(item => {
+      const record = object(item);
+      return stableId(record.name) && stableId(record.version) && /^[0-9a-f]{64}$/.test(record.digest) ? `${record.name}@${record.version} · ${record.digest}` : null;
+    }).filter(Boolean).join(", ") || "—";
+    const scopeHTML = pair("campaign identity", {current: request.currentCampaignId, proposed: request.proposedCampaignId}) + objectDiff("Scope binding", scope, [["scopeId", "scope ID"], ["revision", "revision"], ["digest", "content digest"]]);
+    const completionHTML = objectDiff("Completion criteria", diff.completion, [["coverageBasisPoints", "coverage basis points"], ["resolvedHypotheses", "resolved hypotheses"], ["reproducedFindings", "reproduced findings"], ["requiredArtifactIds", "required artifacts"]]);
+    const policyHTML = objectDiff("Operator policy", diff.operatorPolicy, [["scopeExpansionRequiresApproval", "scope approval"], ["hardCeilingIncreaseRequiresApproval", "ceiling approval"], ["continueAfterRiskRequiresApproval", "risk approval"], ["riskThreshold", "risk threshold"]]);
+    const componentHTML = pair("bound components", {current: componentText(components.current), proposed: componentText(components.proposed)});
+    return `<article class="campaign-change" data-campaign-change="${safe(request.requestId)}"><header><div><span>EXACT AUTHORITY REQUEST</span><b>Review campaign change</b></div><code>${safe(request.requestId)}</code></header><div class="campaign-change-legend"><span>current</span><i></i><span>proposed</span></div><div class="campaign-change-sections">${scopeHTML}${budgetDiff("Epoch ceilings", diff.epochBudget)}${budgetDiff("Cumulative ceilings", diff.cumulativeBudget)}${completionHTML}${policyHTML}<section class="campaign-change-section"><h4>Component versions</h4>${componentHTML}</section></div><div class="campaign-change-actions"><button class="btn red" type="button" data-campaign-change-decision="reject" data-campaign-id="${safe(campaignId)}" data-change-request="${safe(request.requestId)}" data-change-revision="${safe(request.revision)}">Reject</button><button class="btn primary" type="button" data-campaign-change-decision="approve" data-campaign-id="${safe(campaignId)}" data-change-request="${safe(request.requestId)}" data-change-revision="${safe(request.revision)}">Approve exact request</button></div></article>`;
   }
 
   function typedLinks(campaign) {
@@ -72,7 +129,7 @@
   }
 
   function renderDetail(campaign) {
-    const id = campaign.campaignId || "unknown", status = String(campaign.status || "unknown"), health = object(campaign.health), visual = health.degraded ? "degraded" : tone(status), scope = object(campaign.scope), terminal = object(campaign.terminal), recommendation = object(campaign.recommendation), epoch = object(campaign.currentEpoch), handoff = object(campaign.handoff), rows = budgetRows(campaign), actions = canonicalActions(campaign), facts = healthFacts(campaign);
+    const id = campaign.campaignId || "unknown", status = String(campaign.status || "unknown"), health = object(campaign.health), visual = health.degraded ? "degraded" : tone(status), scope = object(campaign.scope), terminal = object(campaign.terminal), recommendation = object(campaign.recommendation), epoch = object(campaign.currentEpoch), handoff = object(campaign.handoff), rows = budgetRows(campaign), actions = canonicalActions(campaign), facts = healthFacts(campaign), changes = pendingChanges(campaign);
     const evidence = list(handoff.evidenceIds).map(value => `<div class="campaign-reference"><span>Evidence</span><code>${safe(value)}</code></div>`);
     const runs = list(handoff.factoryRunIds).map(value => `<button class="campaign-link" type="button" data-campaign-link="activity" data-campaign-ref="${safe(value)}"><span>Run</span><code>${safe(value)}</code></button>`);
     const typed = typedLinks(campaign).map(reference => `<div class="campaign-typed-link"><button class="campaign-link" type="button" data-campaign-link="${safe(reference.surface)}" data-campaign-kind="${safe(reference.kind)}" data-campaign-ref="${safe(reference.entityId)}" data-campaign-run="${safe(reference.runId)}"><span>${safe(label(reference.kind))}</span><code>${safe(reference.entityId)}</code></button><button class="campaign-copy" type="button" data-campaign-copy="${safe(`${reference.kind}:${reference.entityId}`)}" aria-label="Copy ${safe(label(reference.kind))} identifier">Copy ID</button></div>`);
@@ -83,10 +140,11 @@
       <section><h3>Remaining cumulative authority</h3><div class="campaign-budget-table">${rows.length ? rows.map(row => `<div><span>${safe(row.name.replace(/([A-Z])/g, " $1"))}</span><b>${row.remaining}</b><small>${row.used} used / ${row.limit} ${safe(row.unit)}</small></div>`).join("") : `<div class="empty compact"><b>Projection unavailable</b>No budget values were published.</div>`}</div></section>
       ${terminal.reasonCode ? `<section class="campaign-terminal"><h3>Terminal outcome</h3><div><b>${safe(terminal.status || campaign.status)}</b><span>${safe(terminal.reasonCode)}</span><code>${safe(terminal.finalCheckpointId || "no final checkpoint")}</code></div></section>` : ""}
       ${recommendation.recommendationId ? `<section class="campaign-recommendation"><h3>Exact policy recommendation</h3><div><b>${safe(recommendation.action || "pending")}</b><span>${safe(recommendation.reasonCode || "reason unavailable")}</span><code>${safe(recommendation.recommendationId)}</code></div></section>` : ""}
+      ${changes.length ? `<section class="campaign-change-stage"><h3>Pending authority changes</h3>${changes.map(request => renderChangeRequest(request, id)).join("")}</section>` : ""}
       <section><h3>Canonical record links</h3><div class="campaign-links">${typed.join("") || `<div class="empty compact"><b>No resolved records</b>Typed links appear only when a campaign-owned run proves the canonical association.</div>`}</div></section>
       <section><h3>Bounded handoff identifiers</h3><div class="campaign-links">${[...evidence, ...runs].join("") || `<div class="empty compact"><b>No bounded links</b>Evidence and runs will appear here by stable ID.</div>`}</div></section>
       <div class="campaign-actions" data-campaign-actions>${actions.map(action => `<button class="btn ${action === "stop" ? "red" : action === "resume" ? "primary" : ""}" type="button" data-campaign-action="${safe(action)}" data-campaign-id="${safe(id)}">${safe(action[0].toUpperCase() + action.slice(1))}</button>`).join("") || `<span>No operator transition is currently allowed.</span>`}</div>`;
   }
 
-  return {budgetRows, canonicalActions, healthFacts, needsAction, renderCard, renderDetail, statusTone: tone, typedLinks};
+  return {budgetRows, canonicalActions, changeDecisionPayload, healthFacts, needsAction, pendingChanges, renderCard, renderChangeRequest, renderDetail, statusTone: tone, typedLinks};
 });

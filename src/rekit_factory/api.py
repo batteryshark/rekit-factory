@@ -349,6 +349,24 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     campaign = controller.public_state(parts[2])
                 self._json(HTTPStatus.OK, {"campaign": campaign})
                 return
+            if (len(parts) == 4 and parts[:2] == ["api", "campaigns"]
+                    and parts[3] == "change-decisions"):
+                expected = {"requestId", "approved", "expectedRevision", "operationId"}
+                if set(payload) != expected:
+                    raise ValueError("change decision body must contain only exact decision fields")
+                controller = self._campaign_controller()
+                with self.server.campaign_lock:
+                    change, approved_campaign_id = controller.decide_change_request(
+                        parts[2], payload["requestId"], approved=payload["approved"],
+                        expected_revision=payload["expectedRevision"],
+                        operation_id=payload["operationId"],
+                    )
+                    campaign = controller.public_state(parts[2])
+                self._json(HTTPStatus.OK, {
+                    "approvedCampaignId": approved_campaign_id,
+                    "campaign": campaign, "changeRequest": change,
+                })
+                return
             if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "resume":
                 run_dir = _find_run(self.server.storage_root, parts[2])
                 started = self.server.supervisor.submit(run_dir)

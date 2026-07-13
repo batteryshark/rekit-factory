@@ -123,6 +123,40 @@ for (const marker of ["validation", "62.50%", "3 / 9", "1 / 2", "45s", "60s cumu
   assert.ok(Campaigns.renderDetail(observed).includes(marker), marker);
 assert.match(Campaigns.renderCard(observed), /campaign-health-strip/);
 
+// Exact authority requests are server-published, bounded documents. The renderer uses an
+// allowlisted diff vocabulary and never includes goal, reason, path, or replacement-contract
+// fields in decision controls.
+const change = {
+  requestId: "campaign-change-safe", currentCampaignId: "campaign-safe",
+  proposedCampaignId: "campaign-proposed", status: "pending", revision: 1,
+  baseCampaignRevision: 7, applicationStatus: "pending",
+  reason: "private /Users/target TOKEN=secret", goal: "raw goal",
+  diff: {
+    scope: {current: {scopeId: "scope-safe", revision: 2, digest: "a".repeat(64)}, proposed: {scopeId: "scope-safe", revision: 3, digest: "b".repeat(64)}},
+    epochBudget: {current: {workItems: {value: 2, unit: "items"}}, proposed: {workItems: {value: 3, unit: "items"}}},
+    cumulativeBudget: {current: {costUnits: {value: 40, unit: "cost-units"}}, proposed: {costUnits: {value: 60, unit: "cost-units"}}},
+    completion: {current: {coverageBasisPoints: 5000, requiredArtifactIds: ["artifact-a"]}, proposed: {coverageBasisPoints: 7000, requiredArtifactIds: ["artifact-a", "artifact-b"]}},
+    operatorPolicy: {current: {riskThreshold: 20, scopeExpansionRequiresApproval: true}, proposed: {riskThreshold: 10, scopeExpansionRequiresApproval: true}},
+    componentVersions: {current: [{name: "factory", version: "1", digest: "c".repeat(64)}], proposed: [{name: "factory", version: "2", digest: "d".repeat(64)}]},
+  },
+};
+const changing = fixture({changeRequests: [change]});
+assert.strictEqual(Campaigns.pendingChanges(changing).length, 1);
+assert.strictEqual(Campaigns.needsAction(changing), true);
+assert.deepStrictEqual(Object.keys(Campaigns.changeDecisionPayload(changing, change.requestId, true)).sort(), ["approved", "expectedRevision", "operationId", "requestId"]);
+assert.deepStrictEqual(Campaigns.changeDecisionPayload(changing, change.requestId, true), {
+  requestId: change.requestId, approved: true, expectedRevision: 1,
+  operationId: "mission-control:campaign-safe:change:approve:1:campaign-change-safe",
+});
+assert.strictEqual(Campaigns.changeDecisionPayload(changing, "campaign-change-forged", true), null);
+const changeHTML = Campaigns.renderDetail(changing);
+for (const marker of ["Scope binding", "Epoch ceilings", "Cumulative ceilings", "Completion criteria", "Operator policy", "Component versions", "Approve exact request", 'data-change-revision="1"']) assert.ok(changeHTML.includes(marker), marker);
+for (const forbidden of ["/Users/target", "TOKEN=secret", "raw goal", "replacementContract", "proposedContract"]) assert.ok(!changeHTML.includes(forbidden), forbidden);
+assert.strictEqual(Campaigns.pendingChanges(fixture({changeRequests: [{...change, requestId: '<img src=x onerror="bad">'}]})).length, 0);
+const manyComponents = Array.from({length: 64}, (_, index) => ({name: `component-${index}`, version: "1", digest: index.toString(16).padStart(64, "0")}));
+const fullComponentHTML = Campaigns.renderDetail(fixture({changeRequests: [{...change, diff: {...change.diff, componentVersions: {current: manyComponents, proposed: manyComponents}}}]}));
+assert.ok(fullComponentHTML.includes("component-63@1"), "the bounded exact component diff must not be truncated");
+
 // A maximum bounded handoff remains dense but complete, with stable deep-link controls.
 const large = fixture({handoff: {
   reasonCode: "waiting", evidenceCount: 500, factoryRunCount: 500, truncated: true,

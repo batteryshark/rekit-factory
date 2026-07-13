@@ -21,7 +21,7 @@ from .campaign_persistence import (
 from .campaign_policy import (
     AttemptFact, BudgetAccount, BudgetReservation, CampaignPhase, CampaignPolicyConfig,
     CampaignPolicyInput, CampaignPolicyRecommendation, CanonicalOutcomeTotals,
-    evaluate_campaign_policy,
+    evaluate_campaign_policy, validate_campaign_change_approval,
 )
 from .control import InvestigationController, RunRequest
 
@@ -744,7 +744,71 @@ class CampaignController:
         return self.snapshot(campaign_id)
 
     @_serialized
+    def publish_change_request(self, request) -> dict[str, object]:
+        projection = self.persistence.publish_change_request(
+            request, operation_id=f"publish:{request.request_id}",
+        )
+        return self._public_change_request(projection)
+
+    @_serialized
+    def decide_change_request(self, campaign_id: str, request_id: str, *, approved: bool,
+                              expected_revision: int, operation_id: str
+                              ) -> tuple[dict[str, object], str | None]:
+        projection = self.persistence.decide_change_request(
+            campaign_id, request_id, approved=approved,
+            expected_revision=expected_revision, operation_id=operation_id,
+        )
+        approved_campaign_id = None
+        if projection.status == "approved":
+            approved_campaign_id = self._apply_approved_change(projection)
+            projection = self.persistence.change_request(campaign_id, request_id)
+        return self._public_change_request(projection), approved_campaign_id
+
+    def _apply_approved_change(self, projection) -> str:
+        request = projection.request
+        proposed = validate_campaign_change_approval(
+            self._contract(request.current_campaign_id), request, request.request_id,
+        )
+        current = self.persistence.campaign(request.current_campaign_id)
+        if current.status != "stopped":
+            self.stop(request.current_campaign_id, "approved-campaign-change",
+                      (f"campaign-change:{request.request_id}",),
+                      operation_id=f"apply-stop:{request.request_id}")
+        self.start(proposed)
+        self.persistence.mark_change_applied(request.current_campaign_id, request.request_id)
+        return proposed.campaign_id
+
+    def _public_change_request(self, projection) -> dict[str, object]:
+        request = projection.request
+        current_id = request.current_campaign_id
+        current = self._contract(current_id).to_dict()
+        proposed = request.proposed.to_dict()
+        # Goal and arbitrary reason text remain private canonical authority.
+        return {
+            "applicationStatus": projection.application_status,
+            "baseCampaignRevision": projection.base_campaign_revision,
+            "currentCampaignId": current_id,
+            "proposedCampaignId": request.proposed.campaign_id,
+            "requestId": request.request_id,
+            "revision": projection.revision,
+            "status": projection.status,
+            "diff": {
+                name: {"current": current[source], "proposed": proposed[source]}
+                for name, source in (
+                    ("scope", "scope"), ("epochBudget", "epochBudget"),
+                    ("cumulativeBudget", "cumulativeBudget"),
+                    ("completion", "completion"),
+                    ("operatorPolicy", "operatorPolicy"),
+                    ("componentVersions", "components"),
+                )
+            },
+        }
+
+    @_serialized
     def recover(self, campaign_id: str) -> CampaignSnapshot:
+        for change in self.persistence.change_requests(campaign_id):
+            if change.status == "approved" and change.application_status == "pending":
+                self._apply_approved_change(change)
         initial = self.persistence.campaign(campaign_id)
         if initial.status in {"suspended", "stopped"}:
             return self.snapshot(campaign_id)
@@ -917,6 +981,8 @@ class CampaignController:
                 "truncated": handoff.truncated,
             },
             "allowedActions": list(allowed),
+            "changeRequests": [self._public_change_request(item)
+                               for item in self.persistence.change_requests(campaign_id)],
         }
 
 

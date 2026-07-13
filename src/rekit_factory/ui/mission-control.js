@@ -260,6 +260,8 @@ function activate(element) {
   if (element.closest("[data-attention-open]")) { openAttentionInbox(); return true; }
   if (element.closest("[data-attention-dismiss], [data-attention-later]")) { dismissAttention(); return true; }
   if (element.closest("[data-campaign-close]")) { closeCampaign(); return true; }
+  const changeDecision = element.closest("[data-campaign-change-decision]");
+  if (changeDecision) { decideCampaignChange(changeDecision); return true; }
   const campaignAction = element.closest("[data-campaign-action]");
   if (campaignAction) { transitionCampaign(campaignAction.dataset.campaignId, campaignAction.dataset.campaignAction); return true; }
   const campaignLink = element.closest("[data-campaign-link]");
@@ -496,6 +498,51 @@ async function transitionCampaign(campaignId, action) {
     toast("Campaign transition was not accepted. Canonical state has been refreshed.", true);
     await refreshCampaigns();
   } finally { state.campaignAction = null; $("campaignDialog").setAttribute("aria-busy", "false"); }
+}
+
+async function decideCampaignChange(button) {
+  if (state.campaignAction) return;
+  const campaignId = button.dataset.campaignId, requestId = button.dataset.changeRequest;
+  const expectedRevision = Number(button.dataset.changeRevision);
+  const approved = button.dataset.campaignChangeDecision === "approve";
+  const campaign = state.campaigns.find(item => item.campaignId === campaignId);
+  const decision = campaign && MissionCampaigns.changeDecisionPayload(campaign, requestId, approved);
+  if (!decision || decision.expectedRevision !== expectedRevision) {
+    toast("That campaign request is no longer pending; refreshing canonical state.", true);
+    if (campaignId) await refreshOpenCampaign(campaignId);
+    $("campaignDialog").querySelector("[data-campaign-close]")?.focus({preventScroll: true});
+    return;
+  }
+  if (!window.confirm(`${approved ? "Approve" : "Reject"} this exact server-published campaign change?`)) return;
+  state.campaignAction = `${campaignId}:change:${requestId}`;
+  $("campaignDialog").setAttribute("aria-busy", "true");
+  document.querySelectorAll("[data-campaign-change-decision], [data-campaign-action]").forEach(control => { control.disabled = true; });
+  try {
+    const payload = await api(`/api/campaigns/${encodeURIComponent(campaignId)}/change-decisions`, {
+      method: "POST", body: JSON.stringify(decision),
+    });
+    if (!payload.changeRequest || payload.changeRequest.requestId !== requestId) throw new Error("Campaign change response identity mismatch");
+    if (approved && (typeof payload.approvedCampaignId !== "string" || !payload.approvedCampaignId)) throw new Error("Approved campaign identity unavailable");
+    if (!approved && payload.approvedCampaignId !== null) throw new Error("Rejected request returned an approved campaign identity");
+    if (approved) closeCampaign();
+    await refreshCampaigns();
+    if (approved && state.campaigns.some(item => item.campaignId === payload.approvedCampaignId)) await openCampaign(payload.approvedCampaignId);
+    else if (!approved && state.campaignSelected === campaignId) {
+      await refreshOpenCampaign(campaignId);
+      $("campaignDialog").querySelector("[data-campaign-close]")?.focus({preventScroll: true});
+    }
+    toast(`Campaign change ${approved ? "approved" : "rejected"}.`);
+  } catch (_error) {
+    toast("Campaign change decision was not accepted. Canonical state has been refreshed.", true);
+    if (state.campaignSelected === campaignId) await refreshOpenCampaign(campaignId);
+    else await refreshCampaigns();
+    const retry = $("campaignDialog").querySelector(`[data-campaign-change="${CSS.escape(requestId)}"] [data-campaign-change-decision="${approved ? "approve" : "reject"}"]`);
+    (retry || $("campaignDialog").querySelector("[data-campaign-close]"))?.focus({preventScroll: true});
+  } finally {
+    state.campaignAction = null;
+    $("campaignDialog").setAttribute("aria-busy", "false");
+    document.querySelectorAll("[data-campaign-change-decision], [data-campaign-action]").forEach(control => { control.disabled = false; });
+  }
 }
 
 async function openCampaignLink(link) {

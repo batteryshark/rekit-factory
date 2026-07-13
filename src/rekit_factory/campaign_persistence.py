@@ -36,6 +36,8 @@ MAX_HEALTH_HISTORY = 32
 MAX_HEALTH_ARTIFACTS = 256
 MAX_HEALTH_PROBLEMS = 16
 MAX_POLICY_INPUT_BYTES = 262_144
+MAX_CHANGE_COMPONENTS = 64
+MAX_CHANGE_REQUIRED_ARTIFACTS = 256
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 WRITE_BOUNDARIES = (
@@ -198,6 +200,15 @@ class CampaignHealthProjection:
     problem_codes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class CampaignChangeProjection:
+    request: CampaignChangeRequest
+    status: Literal["pending", "approved", "rejected"]
+    revision: int
+    base_campaign_revision: int
+    application_status: Literal["not-applicable", "pending", "applied"]
+
+
 def _validate_health_content(rollup: CampaignHealthRollup,
                              policy_input: dict[str, object],
                              recommendation: dict[str, object],
@@ -330,6 +341,19 @@ create table if not exists factory_campaign_health (
     unique (campaign_id, checkpoint_id),
     unique (campaign_id, recommendation_id)
 );
+create table if not exists factory_campaign_change_requests (
+    campaign_id text not null,
+    request_id text primary key,
+    request_json text not null,
+    status text not null,
+    revision integer not null,
+    base_campaign_revision integer not null,
+    application_status text not null,
+    decision_operation_id text,
+    decision_payload_json text,
+    published_at text not null,
+    decided_at text
+);
 """
 
 
@@ -369,6 +393,15 @@ class CampaignPersistence:
             self._owns_connection = True
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        columns = {row[1] for row in self.conn.execute(
+            "pragma table_info(factory_campaign_change_requests)"
+        )}
+        if "base_campaign_revision" not in columns:
+            self.conn.execute(
+                "alter table factory_campaign_change_requests add column "
+                "base_campaign_revision integer not null default 1"
+            )
+            self.conn.commit()
 
     def close(self) -> None:
         if self._owns_connection:
@@ -819,6 +852,125 @@ class CampaignPersistence:
             self._fault(failure_injector, "decision-projected")
         return request.request_id
 
+    def publish_change_request(self, request: CampaignChangeRequest, *, operation_id: str
+                               ) -> CampaignChangeProjection:
+        operation_id = _operation(operation_id)
+        payload = _json(request.to_dict())
+        with self.conn:
+            if self._existing_operation(request.current_campaign_id, operation_id,
+                                        "campaign.change-request-published", payload):
+                return self.change_request(request.current_campaign_id, request.request_id)
+            campaign_row = self._campaign_row(request.current_campaign_id)
+            if campaign_row["status"] not in {"running", "waiting", "suspended"}:
+                raise CampaignPersistenceError("change requests require active campaign authority")
+            current = CampaignContract.from_dict(json.loads(campaign_row["contract_json"]))
+            for label, candidate in (("current", current), ("proposed", request.proposed)):
+                if len(candidate.components) > MAX_CHANGE_COMPONENTS:
+                    raise CampaignPersistenceError(
+                        f"{label} change authority exceeds 64 component versions"
+                    )
+                if len(candidate.completion.required_artifact_ids) \
+                        > MAX_CHANGE_REQUIRED_ARTIFACTS:
+                    raise CampaignPersistenceError(
+                        f"{label} change authority exceeds 256 required artifacts"
+                    )
+            from .campaign_contracts import requires_operator_decision
+            if not requires_operator_decision(current, request.proposed):
+                raise CampaignPersistenceError("campaign change requires changed authority")
+            if self.conn.execute(
+                "select 1 from factory_campaign_change_requests where request_id=?",
+                (request.request_id,),
+            ).fetchone() is not None:
+                raise CampaignPersistenceError("change request already exists")
+            if self.conn.execute(
+                "select 1 from factory_campaign_change_requests where campaign_id=? "
+                "and status='pending'", (request.current_campaign_id,),
+            ).fetchone() is not None:
+                raise CampaignPersistenceError("campaign already has a pending change request")
+            self._append_event(request.current_campaign_id, operation_id,
+                               "campaign.change-request-published", payload)
+            self.conn.execute(
+                "insert into factory_campaign_change_requests "
+                "(campaign_id,request_id,request_json,status,revision,base_campaign_revision,"
+                "application_status,published_at) values (?,?,?,'pending',1,?,'not-applicable',?)",
+                (request.current_campaign_id, request.request_id, payload,
+                 self._campaign_row(request.current_campaign_id)["revision"], utcnow()),
+            )
+        return self.change_request(request.current_campaign_id, request.request_id)
+
+    def change_request(self, campaign_id: str, request_id: str) -> CampaignChangeProjection:
+        row = self.conn.execute(
+            "select * from factory_campaign_change_requests where campaign_id=? and request_id=?",
+            (campaign_id, request_id),
+        ).fetchone()
+        if row is None:
+            raise CampaignPersistenceError("campaign change request does not exist")
+        return CampaignChangeProjection(
+            CampaignChangeRequest.from_dict(json.loads(row["request_json"])), row["status"],
+            row["revision"], row["base_campaign_revision"], row["application_status"],
+        )
+
+    def change_requests(self, campaign_id: str, *, limit: int = 32
+                        ) -> tuple[CampaignChangeProjection, ...]:
+        if type(limit) is not int or not 1 <= limit <= 32:
+            raise CampaignPersistenceError("change request limit must be between 1 and 32")
+        rows = self.conn.execute(
+            "select request_id from factory_campaign_change_requests where campaign_id=? "
+            "order by published_at desc,request_id limit ?", (campaign_id, limit),
+        ).fetchall()
+        return tuple(self.change_request(campaign_id, row[0]) for row in rows)
+
+    def decide_change_request(self, campaign_id: str, request_id: str, *, approved: bool,
+                              expected_revision: int, operation_id: str,
+                              decided_by: str = "operator") -> CampaignChangeProjection:
+        operation_id = _operation(operation_id)
+        if type(approved) is not bool or type(expected_revision) is not int:
+            raise CampaignPersistenceError("decision fields have invalid exact types")
+        projection = self.change_request(campaign_id, request_id)
+        payload = _json({"approved": approved, "decidedBy": decided_by,
+                         "request": projection.request.to_dict()})
+        row = self.conn.execute(
+            "select * from factory_campaign_change_requests where request_id=?", (request_id,),
+        ).fetchone()
+        if row["decision_operation_id"] is not None:
+            if row["decision_operation_id"] != operation_id \
+                    or row["decision_payload_json"] != payload:
+                raise CampaignPersistenceError("conflicting reuse of change decision")
+            return self.change_request(campaign_id, request_id)
+        if row["revision"] != expected_revision or row["status"] != "pending":
+            raise CampaignPersistenceError("campaign change request revision is stale")
+        if self._campaign_row(campaign_id)["revision"] != row["base_campaign_revision"]:
+            raise CampaignPersistenceError("base campaign revision changed after publication")
+        with self.conn:
+            self._append_event(campaign_id, operation_id, "operator.decided", payload)
+            self.conn.execute(
+                "update factory_campaign_change_requests set status=?,revision=revision+1,"
+                "application_status=?,decision_operation_id=?,decision_payload_json=?,decided_at=? "
+                "where request_id=?",
+                ("approved" if approved else "rejected",
+                 "pending" if approved else "not-applicable", operation_id, payload, utcnow(),
+                 request_id),
+            )
+        return self.change_request(campaign_id, request_id)
+
+    def mark_change_applied(self, campaign_id: str, request_id: str) -> CampaignChangeProjection:
+        projection = self.change_request(campaign_id, request_id)
+        if projection.status != "approved":
+            raise CampaignPersistenceError("only approved change authority can be applied")
+        if projection.application_status == "applied":
+            return projection
+        payload = _json({"approvedCampaignId": projection.request.proposed.campaign_id,
+                         "requestId": request_id})
+        with self.conn:
+            self._append_event(campaign_id, f"apply-complete:{request_id}",
+                               "campaign.change-applied", payload)
+            self.conn.execute(
+                "update factory_campaign_change_requests set application_status='applied',"
+                "revision=revision+1 where request_id=? and application_status='pending'",
+                (request_id,),
+            )
+        return self.change_request(campaign_id, request_id)
+
     def recover(self, campaign_id: str, *, operation_id: str,
                 failure_injector: FailureInjector | None = None) -> CampaignProjection:
         """Conservatively block orphaned leases; absence is never completion."""
@@ -958,6 +1110,9 @@ class CampaignPersistence:
         health_rollups: list[CampaignHealthRollup] = []
         campaign_contract: CampaignContract | None = None
         operations: set[str] = set()
+        change_request_ids: set[str] = set()
+        published_changes: dict[str, dict[str, object]] = {}
+        decided_changes: set[str] = set()
         for expected, row in enumerate(rows, 1):
             if row["campaign_seq"] != expected:
                 problems.append(f"history gap before sequence {row['campaign_seq']}")
@@ -1110,7 +1265,26 @@ class CampaignPersistence:
                     ):
                         raise CampaignPersistenceError("health history regressed")
                     health_rollups.append(health)
-                elif kind not in {"operator.decided", "campaign.recovered"}:
+                elif kind == "campaign.change-request-published":
+                    change = CampaignChangeRequest.from_dict(payload)
+                    if change.current_campaign_id != campaign_id \
+                            or change.request_id in change_request_ids:
+                        raise CampaignPersistenceError("change request history is invalid")
+                    change_request_ids.add(change.request_id)
+                    published_changes[change.request_id] = change.to_dict()
+                elif kind == "operator.decided":
+                    change = CampaignChangeRequest.from_dict(payload["request"])
+                    if type(payload.get("approved")) is not bool:
+                        raise CampaignPersistenceError("operator decision is invalid")
+                    if change.request_id in published_changes:
+                        if payload["request"] != published_changes[change.request_id] \
+                                or change.request_id in decided_changes:
+                            raise CampaignPersistenceError("published decision content is invalid")
+                        decided_changes.add(change.request_id)
+                elif kind == "campaign.change-applied":
+                    if payload.get("requestId") not in decided_changes:
+                        raise CampaignPersistenceError("applied change request is dangling")
+                elif kind != "campaign.recovered":
                     raise CampaignPersistenceError(f"unknown event kind {kind}")
             except (KeyError, TypeError, ValueError) as exc:
                 problems.append(f"impossible event {row['campaign_seq']}: {exc}")
