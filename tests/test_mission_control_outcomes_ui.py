@@ -71,6 +71,7 @@ def test_outcomes_surface_is_packaged_first_class_and_projection_only():
     assert "Canonical facets" in script
     assert "Worker note (unverified)" in script
     assert "safe(report.workerNote)" in script
+    assert ".report-facets" in style
 
 
 def test_outcomes_behavior_is_dom_independent_and_deterministic():
