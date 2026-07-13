@@ -31,6 +31,7 @@ bounded detectors recommend continue, reprioritize, backoff, suspend, ask-operat
 policy-stop, or success with stable reason codes for equivalent attempts, no novelty,
 validation churn, dependency deadlock, environment flapping, and notification churn.
 
-Scope expansion and hard-ceiling increases accept only the exact content-bound
-`CampaignChangeRequest` approval identity. The policy validates this supplied durable fact;
+Every in-place campaign contract change accepts only the exact content-bound
+`CampaignChangeRequest` approval identity, including scope, budgets, completion criteria,
+operator policy, and component versions. The policy validates this supplied durable fact;
 W-0052 persists it and W-0054 alone may execute the resulting authority or recommendation.

@@ -492,6 +492,55 @@ class CampaignPersistence:
             self._fault(failure_injector, "lease-projected")
         return self.campaign(campaign_id)
 
+    def reconcile_epoch_lease(self, campaign_id: str, epoch_id: str, owner_id: str, *,
+                              operation_id: str,
+                              failure_injector: FailureInjector | None = None) -> str:
+        """Re-activate one orphaned lease after its exact runner result was verified.
+
+        Recovery itself never retries work or implies success.  The controller may call this
+        operation only after it has a durable, authority-bound execution result to checkpoint.
+        """
+        operation_id = _operation(operation_id)
+        owner_id = _identifier(owner_id, "lease owner_id")
+        payload = _json({"epochId": epoch_id, "ownerId": owner_id})
+        with self.conn:
+            if self._existing_operation(campaign_id, operation_id,
+                                        "epoch.lease-reconciled", payload):
+                row = self.conn.execute(
+                    "select lease_id from factory_campaign_leases where campaign_id=? "
+                    "and epoch_id=? and owner_id=? and status='active'",
+                    (campaign_id, epoch_id, owner_id),
+                ).fetchone()
+                if row is None:
+                    raise CampaignPersistenceError(
+                        "reconciled lease event has a dangling projection"
+                    )
+                return row["lease_id"]
+            campaign = self._campaign_row(campaign_id)
+            if campaign["status"] != "waiting":
+                raise CampaignPersistenceError(
+                    "orphaned lease reconciliation requires a waiting campaign"
+                )
+            row = self.conn.execute(
+                "select lease_id from factory_campaign_leases where campaign_id=? "
+                "and epoch_id=? and owner_id=? and status='recovery-required'",
+                (campaign_id, epoch_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise CampaignPersistenceError("matching recovery-required lease does not exist")
+            self._append_event(campaign_id, operation_id, "epoch.lease-reconciled", payload)
+            self._fault(failure_injector, "event-appended")
+            self.conn.execute(
+                "update factory_campaign_leases set status='active',updated_at=? "
+                "where lease_id=?", (utcnow(), row["lease_id"]),
+            )
+            self.conn.execute(
+                "update factory_campaigns set status='running',revision=revision+1,updated_at=? "
+                "where campaign_id=?", (utcnow(), campaign_id),
+            )
+            self._fault(failure_injector, "lease-projected")
+        return row["lease_id"]
+
     def _campaign_row(self, campaign_id: str) -> sqlite3.Row:
         row = self.conn.execute(
             "select * from factory_campaigns where campaign_id=?", (campaign_id,),
@@ -536,6 +585,8 @@ class CampaignPersistence:
         terminal = None
         previous = ZERO_DIGEST
         epochs: dict[str, dict[str, Any]] = {}
+        leased_epochs: dict[str, tuple[str, str]] = {}
+        recovery_epochs: set[str] = set()
         checkpoint_ids: set[str] = set()
         operations: set[str] = set()
         for expected, row in enumerate(rows, 1):
@@ -588,9 +639,33 @@ class CampaignPersistence:
                     checkpoint_ids.add(checkpoint.checkpoint_id)
                     latest_checkpoint, usage = checkpoint.checkpoint_id, checkpoint.cumulative_usage
                     revision += 1
+                    leased_epochs.pop(checkpoint.epoch_id, None)
+                    recovery_epochs.discard(checkpoint.epoch_id)
+                elif kind == "epoch.leased":
+                    if payload["epochId"] not in epochs:
+                        raise CampaignPersistenceError("leased epoch is dangling")
+                    if payload["epochId"] in leased_epochs:
+                        raise CampaignPersistenceError("epoch has duplicate lease authority")
+                    leased_epochs[payload["epochId"]] = (
+                        payload["ownerId"], row["operation_id"],
+                    )
                 elif kind == "campaign.recovered" and payload["leases"]:
+                    recovered = {item["epoch_id"] for item in payload["leases"]}
+                    if not recovered.issubset(leased_epochs):
+                        raise CampaignPersistenceError("recovered lease is dangling")
+                    recovery_epochs.update(recovered)
                     status, revision = "waiting", revision + 1
-                elif kind not in {"epoch.leased", "operator.decided", "campaign.recovered"}:
+                elif kind == "epoch.lease-reconciled":
+                    epoch_id = payload["epochId"]
+                    authority = leased_epochs.get(epoch_id)
+                    if status != "waiting" or epoch_id not in recovery_epochs \
+                            or authority is None or authority[0] != payload["ownerId"]:
+                        raise CampaignPersistenceError(
+                            "reconciled lease does not match recovery authority"
+                        )
+                    recovery_epochs.remove(epoch_id)
+                    status, revision = "running", revision + 1
+                elif kind not in {"operator.decided", "campaign.recovered"}:
                     raise CampaignPersistenceError(f"unknown event kind {kind}")
             except (KeyError, TypeError, ValueError) as exc:
                 problems.append(f"impossible event {row['campaign_seq']}: {exc}")

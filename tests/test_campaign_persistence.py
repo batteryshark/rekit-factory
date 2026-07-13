@@ -303,6 +303,32 @@ def test_restart_never_inferrs_completion_and_blocks_orphaned_lease_once(tmp_pat
     ).fetchone()[0] == 1
 
 
+def test_verified_orphan_lease_reconciliation_is_atomic_idempotent_and_rebuildable(tmp_path):
+    store = CampaignPersistence(tmp_path / "factory.db")
+    parent, epoch = setup_leased(store)
+    store.recover(parent.campaign_id, operation_id="recover")
+
+    def interrupt(boundary):
+        if boundary == "lease-projected":
+            raise CampaignWriteInterrupted(boundary)
+
+    with pytest.raises(CampaignWriteInterrupted):
+        store.reconcile_epoch_lease(
+            parent.campaign_id, epoch.epoch_id, "worker-a",
+            operation_id="reconcile", failure_injector=interrupt,
+        )
+    assert store.campaign(parent.campaign_id).status == "waiting"
+    lease_id = store.reconcile_epoch_lease(
+        parent.campaign_id, epoch.epoch_id, "worker-a", operation_id="reconcile",
+    )
+    assert lease_id.startswith("campaign-lease-")
+    assert store.reconcile_epoch_lease(
+        parent.campaign_id, epoch.epoch_id, "worker-a", operation_id="reconcile",
+    ) == lease_id
+    assert store.campaign(parent.campaign_id).status == "running"
+    assert store.rebuild_projection(parent.campaign_id).matches_live
+
+
 def test_concurrent_campaigns_cannot_cross_read_or_mutate_authority(tmp_path):
     store = CampaignPersistence(tmp_path / "factory.db")
     first, first_epoch = setup_leased(store, contract("project-a"), "a")
