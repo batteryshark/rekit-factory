@@ -6,13 +6,16 @@ one sealed manifest plus content-addressed files. Markdown and HTML are pure pro
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 from html import escape
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 from typing import Annotated, Any, Literal
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -27,6 +30,8 @@ _SENSITIVE_NAME = re.compile(
 _SENSITIVE_VALUE = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:sk-ant-|sk-proj-|gh[opsu]_|github_pat_)[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~-]{12,}\b"),
     re.compile(
         r"(?i)\b(?:api[_ -]?key|access[_ -]?token|password|secret)\s*[:=]\s*['\"]?[^\s'\"]{8,}"
     ),
@@ -42,6 +47,9 @@ def _safe_text(value: str, name: str, *, max_length: int = 8_000) -> str:
         raise ValueError(f"{name} must be a non-empty string")
     if len(value) > max_length:
         raise ValueError(f"{name} exceeds {max_length} characters")
+    value = unicodedata.normalize("NFC", value).replace("\r\n", "\n").replace("\r", "\n")
+    if _FORBIDDEN_MATERIAL.search(value):
+        raise ValueError(f"{name} contains prohibited private reasoning or log material")
     if any(pattern.search(value) for pattern in _SENSITIVE_VALUE):
         raise ValueError(f"{name} contains credential-like material")
     return value
@@ -49,6 +57,29 @@ def _safe_text(value: str, name: str, *, max_length: int = 8_000) -> str:
 
 class ProofModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_schema_text(cls, value):
+        """Normalize all schema-v1 strings and reject explicitly forbidden material.
+
+        This is a bounded deny-list, not a claim that arbitrary secrets can be inferred.
+        Included bytes must additionally carry evidence-store display-projection provenance.
+        """
+        def normalize(item):
+            if isinstance(item, str):
+                normalized = unicodedata.normalize("NFC", item).replace("\r\n", "\n").replace("\r", "\n")
+                if _FORBIDDEN_MATERIAL.search(normalized):
+                    raise ValueError("proof bundles cannot contain private reasoning or forbidden log material")
+                if any(pattern.search(normalized) for pattern in _SENSITIVE_VALUE):
+                    raise ValueError("proof bundles cannot contain credential-like text")
+                return normalized
+            if isinstance(item, dict):
+                return {key: normalize(child) for key, child in item.items()}
+            if isinstance(item, (list, tuple)):
+                return type(item)(normalize(child) for child in item)
+            return item
+        return normalize(value)
 
 
 class ContentHash(ProofModel):
@@ -121,6 +152,20 @@ class WorkerIdentity(ProofModel):
     facts: tuple[EnvironmentFact, ...] = ()
 
 
+class OriginIdentity(ProofModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=128)
+    model_profile: str = Field(min_length=1, max_length=128)
+
+
+class ProofPolicyBinding(ProofModel):
+    successful_clean_reproductions: int = Field(ge=1, le=5)
+    require_independent_worker: bool
+    require_independent_session: bool
+    require_clean_environment: bool = True
+    require_distinct_model_profile: bool = False
+
+
 class ToolVersion(ProofModel):
     tool_id: str = Field(min_length=1, max_length=128)
     version: str = Field(min_length=1, max_length=128)
@@ -161,6 +206,12 @@ class IncludedArtifact(ProofModel):
     content_state: Literal["safe", "redacted"]
     retention_class: Literal["run", "project", "pinned"] = "run"
     retention_state: Literal["retained", "held"] = "retained"
+    source_run_id: str = Field(min_length=1, max_length=128)
+    source_artifact_id: str = Field(min_length=1, max_length=128)
+    projection: Literal["display"] = "display"
+    projection_sha256: str
+    capture_policy: str = Field(min_length=1, max_length=128)
+    redaction_policy: str = Field(min_length=1, max_length=128)
 
     @field_validator("citation_id")
     @classmethod
@@ -174,6 +225,13 @@ class IncludedArtifact(ProofModel):
     def valid_digest(cls, value: str) -> str:
         if not _SHA256.fullmatch(value):
             raise ValueError("artifact sha256 must be a lowercase SHA-256 digest")
+        return value
+
+    @field_validator("projection_sha256")
+    @classmethod
+    def valid_projection_digest(cls, value: str) -> str:
+        if not _SHA256.fullmatch(value):
+            raise ValueError("projection_sha256 must be a lowercase SHA-256 digest")
         return value
 
     @field_validator("media_type")
@@ -203,6 +261,8 @@ class IncludedArtifact(ProofModel):
         }
         if self.material_class != material_for_purpose[self.purpose]:
             raise ValueError("artifact purpose and safe material class do not match")
+        if self.sha256 != self.projection_sha256:
+            raise ValueError("included bytes must be the cited evidence-store display projection")
         return self
 
 
@@ -289,6 +349,12 @@ class AttemptSummary(ProofModel):
     outcome: Literal["success", "negative", "flaky", "contradictory", "inconclusive"]
     statement: CitedStatement
     environment_differences: tuple[str, ...] = ()
+    recipe_id: str = Field(min_length=1, max_length=128)
+    worker_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=128)
+    environment_id: str = Field(min_length=1, max_length=256)
+    clean_environment: bool
+    model_profile: str = Field(min_length=1, max_length=128)
 
     @field_validator("environment_differences")
     @classmethod
@@ -334,6 +400,9 @@ class ProofManifest(ProofModel):
     finding_state_sha256: str
     finding_status: FindingStatus
     validation_verdict: ValidationVerdict
+    origin: OriginIdentity
+    proof_policy: ProofPolicyBinding
+    recipe_id: str = Field(min_length=1, max_length=128)
     workers: tuple[WorkerIdentity, ...] = Field(min_length=1)
     prerequisites: Prerequisites
     tool_versions: tuple[ToolVersion, ...]
@@ -368,7 +437,9 @@ class ProofManifest(ProofModel):
             raise ValueError("created_at must be an ISO-8601 timestamp") from exc
         if parsed.tzinfo is None:
             raise ValueError("created_at must include a timezone")
-        return value
+        return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
 
     @field_validator("work_item_ids")
     @classmethod
@@ -392,7 +463,11 @@ class ProofManifest(ProofModel):
             raise ValueError("target/input hash ids must be unique")
         if [action.order for action in self.actions] != list(range(1, len(self.actions) + 1)):
             raise ValueError("proof actions must be ordered contiguously from 1")
-        if len({worker.worker_id for worker in self.workers}) != len(self.workers):
+        worker_identities = {
+            (worker.worker_id, worker.session_id, worker.environment_id)
+            for worker in self.workers
+        }
+        if len(worker_identities) != len(self.workers):
             raise ValueError("worker identities must be unique")
         tool_ids = {tool.tool_id for tool in self.tool_versions}
         if len(tool_ids) != len(self.tool_versions):
@@ -451,14 +526,44 @@ class ProofManifest(ProofModel):
         validated_statuses = {"reproduced", "operator-accepted"}
         if self.validation_verdict == "validated" and self.finding_status not in validated_statuses:
             raise ValueError("only reproduced findings may carry a validated verdict")
-        if self.validation_verdict == "validated" and not any(
-            attempt.outcome == "success" for attempt in self.attempts
-        ):
-            raise ValueError("validated proof requires a recorded successful reproduction")
-        if self.validation_verdict == "validated" and not any(
-            worker.clean for worker in self.workers
-        ):
-            raise ValueError("validated proof requires a clean validation environment")
+        worker_by_identity = {
+            (worker.worker_id, worker.session_id, worker.environment_id): worker
+            for worker in self.workers
+        }
+        for attempt in self.attempts:
+            if attempt.recipe_id != self.recipe_id:
+                raise ValueError("every attempt must use the persisted finding recipe")
+            worker = worker_by_identity.get(
+                (attempt.worker_id, attempt.session_id, attempt.environment_id)
+            )
+            if worker is None:
+                raise ValueError("every attempt must bind to a declared worker identity")
+            if (attempt.clean_environment != worker.clean
+                    or attempt.model_profile != worker.model_profile):
+                raise ValueError("attempt and worker environment identity disagree")
+        qualifying = []
+        for attempt in self.attempts:
+            if attempt.outcome != "success":
+                continue
+            policy = self.proof_policy
+            if policy.require_clean_environment and not attempt.clean_environment:
+                continue
+            if policy.require_independent_worker and attempt.worker_id == self.origin.worker_id:
+                continue
+            if policy.require_independent_session and attempt.session_id == self.origin.session_id:
+                continue
+            if (policy.require_distinct_model_profile
+                    and attempt.model_profile == self.origin.model_profile):
+                continue
+            qualifying.append(attempt)
+        qualifying_identities = {
+            (attempt.worker_id, attempt.session_id, attempt.environment_id)
+            for attempt in qualifying
+        }
+        if (self.validation_verdict == "validated"
+                and len(qualifying_identities)
+                < self.proof_policy.successful_clean_reproductions):
+            raise ValueError("validated proof does not satisfy the persisted W-0024 proof policy")
         if self.finding_status == "operator-accepted" and not any(
             decision.decision == "accepted" for decision in self.operator_decisions
         ):
@@ -494,6 +599,7 @@ class SealedProofBundle(ProofModel):
 class VerificationReport(ProofModel):
     valid: bool
     manifest_sha256: str | None = None
+    trust_anchor_verified: bool = False
     errors: tuple[str, ...] = ()
 
 
@@ -557,7 +663,14 @@ def verify_bundle(bundle_or_path: SealedProofBundle | str | Path, *, root: str |
     if expected_finding_state_sha256 is not None \
             and bundle.manifest.finding_state_sha256 != expected_finding_state_sha256:
         errors.append("finding state is stale")
-    root_path = Path(root).resolve() if root is not None else None
+    trust_anchor_supplied = all(value is not None for value in (
+        expected_scope_digest, expected_scope_revision, expected_finding_state_sha256,
+    ))
+    try:
+        root_path = Path(root).resolve(strict=True) if root is not None else None
+    except OSError:
+        errors.append("artifact root is missing or inaccessible")
+        root_path = None
     included = [artifact for artifact in bundle.manifest.artifacts
                 if isinstance(artifact, IncludedArtifact)]
     if included and root_path is None:
@@ -565,116 +678,186 @@ def verify_bundle(bundle_or_path: SealedProofBundle | str | Path, *, root: str |
     for artifact in included:
         if root_path is None:
             break
-        candidate = root_path.joinpath(*PurePosixPath(artifact.path).parts)
         try:
-            resolved = candidate.resolve(strict=True)
-            resolved.relative_to(root_path)
-        except (OSError, ValueError):
+            size, digest = _hash_regular_file_no_symlinks(
+                root_path, PurePosixPath(artifact.path).parts
+            )
+        except OSError:
             errors.append(f"artifact path escapes or is missing: {artifact.path}")
             continue
-        if not resolved.is_file():
-            errors.append(f"artifact is not a regular file: {artifact.path}")
-            continue
-        data = resolved.read_bytes()
-        if len(data) != artifact.size:
+        if size != artifact.size:
             errors.append(f"artifact size mismatch: {artifact.path}")
-        if sha256(data).hexdigest() != artifact.sha256:
+        if digest != artifact.sha256:
             errors.append(f"artifact hash mismatch: {artifact.path}")
     return VerificationReport(
         valid=not errors, manifest_sha256=bundle.manifest_sha256,
+        trust_anchor_verified=not errors and trust_anchor_supplied,
         errors=tuple(errors),
     )
 
 
-def render_markdown(manifest: ProofManifest) -> str:
-    status = (
-        "VALIDATED" if manifest.validation_verdict == "validated"
-        else manifest.validation_verdict.upper()
-    )
+def _hash_regular_file_no_symlinks(root: Path, parts: tuple[str, ...]) -> tuple[int, str]:
+    """Open beneath a pinned directory, rejecting symlinks, and hash from that same fd."""
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    try:
+        descriptors.append(os.open(root, directory_flags))
+        for part in parts[:-1]:
+            descriptors.append(os.open(part, directory_flags, dir_fd=descriptors[-1]))
+        descriptor = os.open(parts[-1], file_flags, dir_fd=descriptors[-1])
+        descriptors.append(descriptor)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("artifact is not a regular file")
+        digest = sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+        return size, digest.hexdigest()
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def render_markdown(manifest: ProofManifest,
+                    verification: VerificationReport | None = None) -> str:
+    status = _rendered_status(manifest, verification)
     lines = [
-        f"# Proof dossier: {manifest.finding_id}", "",
-        f"**Proof status:** {status}",
+        f"# Proof dossier: {manifest.finding_id}", "", f"**Proof status:** {status}",
         f"**Finding lifecycle:** {manifest.finding_status}",
         f"**Manifest:** `{manifest.manifest_id}` (schema v{manifest.schema_version})", "",
-        "## Scope and provenance", "",
-        f"- Run: `{manifest.run_id}`",
+        "## Scope and provenance", "", f"- Run: `{manifest.run_id}`",
         f"- Scope: `{manifest.scope.scope_id}` revision {manifest.scope.revision}",
+        f"- Scope digest: `{manifest.scope.digest}`",
         f"- Data handling: `{manifest.scope.data_handling}` / `{manifest.scope.export_mode}`",
         f"- Hypothesis: `{manifest.hypothesis_id}`",
-        f"- Finding state: `{manifest.finding_state_sha256}`", "",
-        "## Prerequisites", "",
-        f"- Platform: {manifest.prerequisites.platform}",
-        f"- Architecture: {manifest.prerequisites.architecture}",
-        f"- Isolation: {manifest.prerequisites.isolation}", "",
-        "## Artifacts", "",
+        f"- Finding state: `{manifest.finding_state_sha256}`",
+        f"- Work items: {', '.join(f'`{item}`' for item in manifest.work_item_ids)}",
+        f"- Network policy: `{manifest.network_policy}`",
+        f"- Endpoint refs: {', '.join(f'`{item}`' for item in manifest.endpoint_refs) or '_None._'}",
+        "", "## Target and required inputs", "",
     ]
+    lines += [f"- `{item.id}` — {item.role}; sha256=`{item.sha256}`"
+              for item in manifest.target_inputs]
+    policy = manifest.proof_policy
+    lines += ["", "## Proof policy and origin", "", f"- Recipe: `{manifest.recipe_id}`",
+              f"- Origin: worker=`{manifest.origin.worker_id}`; session=`{manifest.origin.session_id}`; "
+              f"profile=`{manifest.origin.model_profile}`",
+              f"- Required clean successes: {policy.successful_clean_reproductions}",
+              f"- Independent worker: {str(policy.require_independent_worker).lower()}",
+              f"- Independent session: {str(policy.require_independent_session).lower()}",
+              f"- Clean environment: {str(policy.require_clean_environment).lower()}",
+              f"- Distinct model profile: {str(policy.require_distinct_model_profile).lower()}",
+              "", "## Workers", ""]
+    for worker in manifest.workers:
+        lines.append(f"- worker=`{worker.worker_id}`; session=`{worker.session_id}`; "
+                     f"environment=`{worker.environment_id}`; clean={str(worker.clean).lower()}; "
+                     f"profile=`{worker.model_profile}`")
+        lines += [f"  - fact `{fact.name}`={_markdown_text(fact.value)} ({fact.source})"
+                  for fact in worker.facts]
+    lines += ["", "## Prerequisites", "",
+              f"- Platform: {_markdown_text(manifest.prerequisites.platform)}",
+              f"- Architecture: {_markdown_text(manifest.prerequisites.architecture)}",
+              f"- Isolation: {_markdown_text(manifest.prerequisites.isolation)}"]
+    lines += [f"- Fact `{fact.name}`={_markdown_text(fact.value)} ({fact.source})"
+              for fact in manifest.prerequisites.facts]
+    lines += ["", "## Tool and capability versions", ""]
+    lines += ([f"- `{tool.tool_id}` version `{tool.version}`" +
+               (f"; capability=`{tool.capability_id}`/`{tool.capability_version}`"
+                if tool.capability_id else "") for tool in manifest.tool_versions] or ["- _None._"])
+    lines += ["", "## Artifacts", ""]
     for artifact in manifest.artifacts:
         if isinstance(artifact, IncludedArtifact):
-            lines.append(
-                f"- `{artifact.citation_id}` — {artifact.purpose}; `{artifact.path}`; "
-                f"{artifact.size} bytes; `{artifact.media_type}`; {artifact.export_policy}; "
-                f"retention={artifact.retention_class}/{artifact.retention_state}"
-            )
+            lines.append(f"- `{artifact.citation_id}` — {artifact.purpose}; `{artifact.path}`; "
+                         f"{artifact.size} bytes; `{artifact.media_type}`; {artifact.export_policy}; "
+                         f"retention={artifact.retention_class}/{artifact.retention_state}; "
+                         f"source=`{artifact.source_run_id}`/`{artifact.source_artifact_id}`; "
+                         f"projection={artifact.projection}; capture=`{artifact.capture_policy}`; "
+                         f"redaction=`{artifact.redaction_policy}`")
         else:
-            lines.append(
-                f"- `{artifact.citation_id}` — {artifact.purpose}; opaque "
-                f"`{artifact.factory_uri}`; {artifact.export_policy}; "
-                f"retention={artifact.retention_class}/{artifact.retention_state}: {artifact.reason}"
-            )
+            lines.append(f"- `{artifact.citation_id}` — {artifact.purpose}; opaque "
+                         f"`{artifact.factory_uri}`; {artifact.export_policy}; "
+                         f"retention={artifact.retention_class}/{artifact.retention_state}: "
+                         f"{_markdown_text(artifact.reason)}")
     if not manifest.artifacts:
         lines.append("- _None._")
     lines += ["", "## Ordered reproduction actions", ""]
     for action in manifest.actions:
-        command = f" argv={json.dumps(action.argv)}" if action.argv else ""
-        lines.append(f"{action.order}. **{action.action}** — {action.description}{command}")
+        command = f" argv=`{_markdown_code(json.dumps(action.argv))}`" if action.argv else ""
+        citations = ", ".join(f"`{item}`" for item in action.citation_ids) or "_None._"
+        lines.append(f"{action.order}. **{action.action}** — {_markdown_text(action.description)}"
+                     f"{command}; citations={citations}")
+        lines += [f"   - environment `{fact.name}`={_markdown_text(fact.value)} ({fact.source})"
+                  for fact in action.environment]
     lines += ["", "## Expected outcome", "",
-              f"{manifest.expected_outcome.text} {_citation_markdown(manifest.expected_outcome)}",
-              "", "## Observed outcomes", ""]
-    for statement in manifest.observed_outcomes:
-        lines.append(f"- {statement.text} {_citation_markdown(statement)}")
-    for title, values in (
-        ("Observations", manifest.observations),
-        ("Interpretations", manifest.interpretations),
-        ("Limitations", manifest.limitations),
-        ("Contradictions", manifest.contradictions),
-    ):
+              f"{_markdown_text(manifest.expected_outcome.text)} "
+              f"{_citation_markdown(manifest.expected_outcome)}", "", "## Observed outcomes", ""]
+    lines += [f"- {_markdown_text(item.text)} {_citation_markdown(item)}"
+              for item in manifest.observed_outcomes]
+    for title, values in (("Observations", manifest.observations),
+                          ("Interpretations", manifest.interpretations),
+                          ("Limitations", manifest.limitations),
+                          ("Contradictions", manifest.contradictions)):
         lines += ["", f"## {title}", ""]
-        lines += ([f"- {item.text} {_citation_markdown(item)}" for item in values]
+        lines += ([f"- {_markdown_text(item.text)} {_citation_markdown(item)}" for item in values]
                   or ["- _None._"])
     lines += ["", "## Reproduction attempts", ""]
-    lines += ([
-        f"- `{attempt.attempt_id}` — **{attempt.outcome}**: "
-        f"{attempt.statement.text} {_citation_markdown(attempt.statement)}"
-        for attempt in manifest.attempts
-    ] or ["- _None._"])
+    lines += ([f"- `{attempt.attempt_id}` — **{attempt.outcome}**: "
+               f"{_markdown_text(attempt.statement.text)} {_citation_markdown(attempt.statement)}; "
+               f"recipe=`{attempt.recipe_id}`; worker=`{attempt.worker_id}`; "
+               f"session=`{attempt.session_id}`; environment=`{attempt.environment_id}`; "
+               f"clean={str(attempt.clean_environment).lower()}; profile=`{attempt.model_profile}`; "
+               f"differences={_markdown_text('; '.join(attempt.environment_differences)) if attempt.environment_differences else '_None._'}"
+               for attempt in manifest.attempts] or ["- _None._"])
     lines += ["", "## Operator decisions", ""]
-    lines += ([
-        f"- `{decision.decision_id}` — **{decision.decision}**: {decision.rationale} "
-        f"[{', '.join(decision.citation_ids)}]"
-        for decision in manifest.operator_decisions
-    ] or ["- _None._"])
-    lines += ["", "> Verification note: proof status is manifest state; run the offline "
-              "verifier against the sealed manifest and included bytes before relying on it."]
+    lines += ([f"- `{decision.decision_id}` — **{decision.decision}**: "
+               f"{_markdown_text(decision.rationale)} [{', '.join(decision.citation_ids)}]; "
+               f"unmet={_markdown_text('; '.join(decision.unmet_criteria)) if decision.unmet_criteria else '_None._'}"
+               for decision in manifest.operator_decisions] or ["- _None._"])
+    lines += ["", "> Verification note: VALIDATED requires a successful offline verification "
+              "against current durable scope and finding-state trust anchors."]
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_html(manifest: ProofManifest) -> str:
+def render_html(manifest: ProofManifest,
+                verification: VerificationReport | None = None) -> str:
     """Small self-contained HTML projection with no mutable state or external assets."""
-    markdown = render_markdown(manifest)
-    body = "\n".join(
-        f"<div class=\"line\">{escape(line)}</div>" if line else "<br>"
-        for line in markdown.splitlines()
-    )
-    status = escape(manifest.validation_verdict)
-    return (
-        "<!doctype html>\n<html><head><meta charset=\"utf-8\">"
-        f"<title>Proof dossier {escape(manifest.finding_id)}</title>"
-        "<style>body{font:15px/1.5 system-ui;margin:2rem;max-width:72rem}"
-        ".status{font-weight:700}.line{white-space:pre-wrap}</style></head>"
-        f"<body><div class=\"status\" data-verdict=\"{status}\">"
-        f"Verdict: {status}</div>{body}</body></html>\n"
-    )
+    markdown = render_markdown(manifest, verification)
+    body = "\n".join(f"<div class=\"line\">{escape(line)}</div>" if line else "<br>"
+                     for line in markdown.splitlines())
+    status = escape(_rendered_status(manifest, verification).lower())
+    return ("<!doctype html>\n<html><head><meta charset=\"utf-8\">"
+            f"<title>Proof dossier {escape(manifest.finding_id)}</title>"
+            "<style>body{font:15px/1.5 system-ui;margin:2rem;max-width:72rem}"
+            ".status{font-weight:700}.line{white-space:pre-wrap}</style></head>"
+            f"<body><div class=\"status\" data-verdict=\"{status}\">"
+            f"Verdict: {status}</div>{body}</body></html>\n")
 
 
 def _citation_markdown(statement: CitedStatement) -> str:
     return "[" + ", ".join(f"`{item}`" for item in statement.citation_ids) + "]"
+
+
+def _rendered_status(manifest: ProofManifest,
+                     verification: VerificationReport | None) -> str:
+    if manifest.validation_verdict != "validated":
+        return manifest.validation_verdict.upper()
+    if verification is not None and verification.valid and verification.trust_anchor_verified:
+        return "VALIDATED"
+    if verification is not None and any("stale" in error for error in verification.errors):
+        return "STALE"
+    return "UNVERIFIED"
+
+
+def _markdown_text(value: str) -> str:
+    value = _safe_text(value, "dossier text").replace("\n", " ⏎ ").replace("\t", " ")
+    return re.sub(r"([\\`*_{}\[\]()#+.!<>|:/-])", r"\\\1", value)
+
+
+def _markdown_code(value: str) -> str:
+    return value.replace("`", "\\`").replace("\n", " ").replace("\r", " ")

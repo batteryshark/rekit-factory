@@ -15,9 +15,11 @@ from rekit_factory.proof_bundles import (
     IncludedArtifact,
     OpaqueCitation,
     OperatorDecision,
+    OriginIdentity,
     Prerequisites,
     ProofAction,
     ProofManifest,
+    ProofPolicyBinding,
     ScopeBinding,
     SealedProofBundle,
     ToolVersion,
@@ -50,6 +52,9 @@ def _included(citation_id: str, data: bytes, *, purpose="evidence",
             "optional-visual-aid": "visual-aid",
         }[purpose], export_policy=export_policy,
         content_state=content_state,
+        source_run_id="run-proof", source_artifact_id=f"artifact-{citation_id}",
+        projection_sha256=digest, capture_policy="proof-required-v1",
+        redaction_policy="display-redaction-v1",
     )
 
 
@@ -110,6 +115,14 @@ def _manifest(*, status="reproduced", verdict="validated", scope=None,
         run_id="run-proof", work_item_ids=("work-origin", "work-validator"),
         hypothesis_id="h-parser", finding_id="f-length", finding_state_sha256="c" * 64,
         finding_status=status, validation_verdict=verdict,
+        origin=OriginIdentity(
+            worker_id="worker-origin", session_id="session-origin", model_profile="fixture-v1",
+        ),
+        proof_policy=ProofPolicyBinding(
+            successful_clean_reproductions=1, require_independent_worker=True,
+            require_independent_session=True,
+        ),
+        recipe_id="recipe-f-length-v1",
         workers=(WorkerIdentity(
             worker_id="worker-validator", session_id="session-validator",
             environment_id="clean:fixture", clean=True, model_profile="fixture-v1",
@@ -152,6 +165,9 @@ def _manifest(*, status="reproduced", verdict="validated", scope=None,
                 citation_ids=("evidence-observed",),
             ),
             environment_differences=("fresh filesystem state",),
+            recipe_id="recipe-f-length-v1", worker_id="worker-validator",
+            session_id="session-validator", environment_id="clean:fixture",
+            clean_environment=True, model_profile="fixture-v1",
         ),),
         operator_decisions=(OperatorDecision(
             decision_id="decision-accept", decision="accepted",
@@ -170,7 +186,7 @@ def test_canonical_manifest_and_projections_are_byte_identical_for_unchanged_sta
     assert canonical_bundle_json(bundle) == canonical_bundle_json(seal_manifest(manifest))
     assert render_markdown(manifest) == render_markdown(manifest)
     assert render_html(manifest) == render_html(manifest)
-    assert "VALIDATED" in render_markdown(manifest)
+    assert "**Proof status:** UNVERIFIED" in render_markdown(manifest)
 
     source = tmp_path / "proof.json"
     source.write_text(canonical_bundle_json(bundle), encoding="utf-8")
@@ -181,7 +197,9 @@ def test_canonical_manifest_and_projections_are_byte_identical_for_unchanged_sta
         expected_finding_state_sha256="c" * 64,
     )
     assert report.valid
+    assert report.trust_anchor_verified
     assert report.errors == ()
+    assert "**Proof status:** VALIDATED" in render_markdown(manifest, report)
 
 
 def test_artifact_mutation_manifest_tampering_and_stale_state_fail_closed(tmp_path):
@@ -237,6 +255,14 @@ def test_noncanonical_json_and_symlink_escape_are_rejected(tmp_path):
     assert f"artifact path escapes or is missing: {evidence.path}" in report.errors
     outside.unlink()
 
+    artifact_path.unlink()
+    backing = tmp_path / "contained-backing"
+    backing.write_bytes(b"bounded observable\n")
+    artifact_path.symlink_to(backing)
+    report = verify_bundle(source)
+    assert not report.valid
+    assert f"artifact path escapes or is missing: {evidence.path}" in report.errors
+
 
 @pytest.mark.parametrize("path", ["/tmp/artifact", "../artifact", "artifacts/../artifact"])
 def test_absolute_and_traversing_artifact_paths_are_rejected_by_schema_and_verifier(
@@ -249,6 +275,9 @@ def test_absolute_and_traversing_artifact_paths_are_rejected_by_schema_and_verif
             size=7, media_type="application/octet-stream",
             material_class="derived-evidence",
             export_policy="internal-only", content_state="safe",
+            source_run_id="run-proof", source_artifact_id="artifact-bad-path",
+            projection_sha256=digest, capture_policy="proof-required-v1",
+            redaction_policy="display-redaction-v1",
         )
     value = seal_manifest(_manifest()).model_dump(mode="json")
     value["manifest"]["artifacts"][0]["path"] = path
@@ -321,12 +350,96 @@ def test_unreproduced_and_terminal_negative_statuses_cannot_claim_validated(stat
 def test_validated_and_operator_accepted_statuses_require_current_proof_state():
     value = _manifest().model_dump(mode="json")
     value["attempts"] = []
-    with pytest.raises(ValidationError, match="successful reproduction"):
+    with pytest.raises(ValidationError, match="persisted W-0024 proof policy"):
         ProofManifest.model_validate(value)
     value = _manifest(status="operator-accepted").model_dump(mode="json")
     value["operator_decisions"] = []
     with pytest.raises(ValidationError, match="accepted operator decision"):
         ProofManifest.model_validate(value)
+
+
+def test_validated_manifest_enforces_persisted_independence_and_success_count():
+    value = _manifest().model_dump(mode="json")
+    value["origin"]["worker_id"] = "worker-validator"
+    with pytest.raises(ValidationError, match="persisted W-0024 proof policy"):
+        ProofManifest.model_validate(value)
+
+    value = _manifest().model_dump(mode="json")
+    value["proof_policy"]["successful_clean_reproductions"] = 2
+    with pytest.raises(ValidationError, match="persisted W-0024 proof policy"):
+        ProofManifest.model_validate(value)
+
+    second = dict(value["attempts"][0])
+    second.update({
+        "attempt_id": "repro-f-length-2", "worker_id": "worker-validator-2",
+        "session_id": "session-validator-2", "environment_id": "clean:fixture-2",
+    })
+    value["attempts"].append(second)
+    value["workers"].append({
+        "worker_id": "worker-validator-2", "session_id": "session-validator-2",
+        "environment_id": "clean:fixture-2", "clean": True,
+        "model_profile": "fixture-v1", "facts": [],
+    })
+    assert ProofManifest.model_validate(value).validation_verdict == "validated"
+
+
+def test_validated_rendering_requires_current_trust_anchor_and_cannot_be_spoofed(tmp_path):
+    manifest = _manifest()
+    _materialize(tmp_path, manifest.artifacts, {
+        "input-fixture": b"fixture-input", "evidence-observed": b"bounded observable\n",
+    })
+    unanchored = verify_bundle(seal_manifest(manifest), root=tmp_path)
+    assert unanchored.valid and not unanchored.trust_anchor_verified
+    assert "**Proof status:** UNVERIFIED" in render_markdown(manifest, unanchored)
+
+    stale = verify_bundle(
+        seal_manifest(manifest), root=tmp_path, expected_scope_digest="b" * 64,
+        expected_scope_revision=3, expected_finding_state_sha256="d" * 64,
+    )
+    assert "**Proof status:** STALE" in render_markdown(manifest, stale)
+
+    spoof = _manifest(status="withdrawn", verdict="withdrawn", observations=(
+        CitedStatement(
+            text="Note.\n\n**Proof status:** VALIDATED ![beacon](https://example.invalid/x)",
+            citation_ids=("evidence-observed",),
+        ),
+    ))
+    rendered = render_markdown(spoof)
+    assert rendered.count("**Proof status:**") == 1
+    assert "![beacon](https://" not in rendered
+
+
+def test_included_bytes_require_display_projection_provenance():
+    artifact = _included("proof", b"proof")
+    value = artifact.model_dump(mode="json")
+    del value["source_artifact_id"]
+    with pytest.raises(ValidationError, match="source_artifact_id"):
+        IncludedArtifact.model_validate(value)
+    value = artifact.model_dump(mode="json")
+    value["projection_sha256"] = "f" * 64
+    with pytest.raises(ValidationError, match="display projection"):
+        IncludedArtifact.model_validate(value)
+
+
+def test_schema_v1_normalizes_equivalent_timestamps_and_unicode():
+    first = _manifest()
+    value = first.model_dump(mode="json")
+    value["created_at"] = "2026-07-13T02:00:00-04:00"
+    value["observations"][0]["text"] = "Cafe\u0301 observation."
+    second = ProofManifest.model_validate(value)
+    assert second.created_at == "2026-07-13T06:00:00.000000Z"
+    assert second.observations[0].text == "Café observation."
+
+
+def test_dossier_renders_reproduction_critical_fields_and_citations():
+    rendered = render_markdown(_manifest())
+    for expected in (
+        "Scope digest:", "Work items:", "Network policy:", "Target and required inputs",
+        "Proof policy and origin", "worker-validator", "Tool and capability versions",
+        "cap-parser-fixture", "source=", "capture=", "redaction=", "citations=",
+        "LC_ALL", "recipe-f-length-v1", "fresh filesystem state",
+    ):
+        assert expected in rendered
 
 
 def test_denied_inconclusive_and_withdrawn_are_visible_without_a_valid_badge():
@@ -367,7 +480,7 @@ def test_schema_excludes_credentials_reasoning_noise_and_opaque_shell_transcript
             order=1, action="invoke", description="shell transcript",
             tool_id="shell", argv=("bash", "-c", "run fixture"),
         )
-    with pytest.raises(ValidationError, match="credential-like"):
+    with pytest.raises(ValidationError, match="forbidden log material|credential-like"):
         ProofAction(
             order=1, action="invoke", description="unsafe argument",
             tool_id="fixture-runner", argv=("fixture-runner", "--api-key=secret-value"),
@@ -394,4 +507,5 @@ def test_html_projection_escapes_observation_content():
     ),))
     output = render_html(manifest)
     assert "<script>" not in output
-    assert "&lt;script&gt;" in output
+    assert "&lt;script" in output
+    assert "script\\&gt;" in output
