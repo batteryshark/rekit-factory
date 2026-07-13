@@ -17,6 +17,10 @@ from rekit_factory.control import InvestigationController, RunRequest
 
 
 MAX_BODY = 1_000_000
+UI_ASSETS = {
+    "mission-control.css": "text/css; charset=utf-8",
+    "mission-control.js": "text/javascript; charset=utf-8",
+}
 
 
 class DriveSupervisor:
@@ -91,6 +95,9 @@ class FactoryHandler(BaseHTTPRequestHandler):
         try:
             if parts in ([], ["mission-control"]):
                 self._html((Path(__file__).with_name("ui") / "index.html").read_bytes())
+                return
+            if len(parts) == 2 and parts[0] == "ui" and parts[1] in UI_ASSETS:
+                self._asset(parts[1], UI_ASSETS[parts[1]])
                 return
             if parts == ["api", "config"]:
                 tools = []
@@ -194,8 +201,15 @@ class FactoryHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _html(self, body: bytes) -> None:
+        self._static(body, "text/html; charset=utf-8")
+
+    def _asset(self, name: str, content_type: str) -> None:
+        body = (Path(__file__).with_name("ui") / name).read_bytes()
+        self._static(body, content_type)
+
+    def _static(self, body: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
