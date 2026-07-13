@@ -137,6 +137,14 @@ class HypothesisMemory:
         current = memory.hypotheses.get(update.hypothesis_id)
         if current is None:
             raise KeyError(update.hypothesis_id)
+        test = memory.hypothesis_tests.get(update.test_id)
+        if test is None:
+            raise KeyError(update.test_id)
+        if test.get("hypothesisId") != update.hypothesis_id:
+            raise ValueError(
+                f"test {update.test_id!r} does not belong to hypothesis "
+                f"{update.hypothesis_id!r}"
+            )
         previous = current["status"]
         if update.status == previous:
             return

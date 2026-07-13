@@ -7,9 +7,12 @@ import tempfile
 
 from muster import resolve_run_dir
 
-from rekit_factory.control import InvestigationController, RunRequest, _target_snapshot
+from rekit_factory.control import (
+    InvestigationController, RunRequest, _project_memory_log, _target_snapshot,
+)
 from rekit_factory.hypotheses import (
     DiscriminatingTestProposal,
+    HypothesisMemory,
     HypothesisProposal,
     HypothesisUpdate,
     StopCondition,
@@ -143,6 +146,44 @@ def test_controller_rejects_out_of_scope_hypothesis_work():
         ))
         assert result["hypothesisState"]["hypotheses"] == []
         assert not [item for item in result["workItems"] if item["category"] == "hypothesis-test"]
+
+
+def test_leased_test_worker_cannot_satisfy_outcome_with_another_hypothesis_update():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = _target(tmp)
+        controller = InvestigationController(
+            storage_root=Path(tmp) / "runs", rekit=NoopRekit(), workers=HypothesisBackend(),
+        )
+        run_dir = controller.create(RunRequest(
+            target, "Bind outcomes to their leased test", worker_roles=("recon",),
+        ))
+        paths = resolve_run_dir(run_dir)
+        hypotheses = HypothesisMemory(_project_memory_log(paths))
+        hypotheses.propose(hypothesis(
+            "h-table", "A lookup table controls validation",
+            "Indexed value reaches verdict", "No indexed flow", 90,
+        ))
+        hypotheses.propose(hypothesis(
+            "h-checksum", "A checksum controls validation",
+            "Checksum comparison reaches verdict", "No checksum comparison", 80,
+        ))
+        hypotheses.mark_scheduled("h-table", "test-h-table")
+        hypotheses.mark_scheduled("h-checksum", "test-h-checksum")
+
+        accepted = controller._apply_hypothesis_updates(
+            paths,
+            [HypothesisUpdate(
+                hypothesis_id="h-checksum", test_id="test-h-checksum",
+                status="testing", confidence=.5, reason="unrelated leased test",
+            )],
+            expected_hypothesis_id="h-table",
+            expected_test_id="test-h-table",
+        )
+
+        assert accepted == 0
+        memory = _project_memory_log(paths).replay()
+        assert memory.hypotheses["h-table"]["status"] == "queued"
+        assert memory.hypotheses["h-checksum"]["status"] == "queued"
 
 
 class ExhaustingBackend(HypothesisBackend):

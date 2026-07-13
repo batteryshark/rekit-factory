@@ -116,3 +116,21 @@ def test_scope_and_cost_stop_conditions_are_validated_before_scheduling():
             id="costly", objective="costly", method="scan", expected_observation="x",
             falsifying_observation="y", information_gain=10, risk=1, cost_units=21,
         ))
+
+
+def test_outcome_cannot_cross_hypothesis_and_test_identity():
+    with tempfile.TemporaryDirectory() as tmp:
+        hypotheses = HypothesisMemory(ProjectMemoryLog(tmp))
+        hypotheses.propose(proposal())
+        hypotheses.propose(proposal("h-b", "The checksum controls validation"))
+        hypotheses.mark_scheduled("h-a", "test-h-a")
+
+        with pytest.raises(ValueError, match="does not belong"):
+            hypotheses.transition(HypothesisUpdate(
+                hypothesis_id="h-a", test_id="test-h-b", status="testing",
+                confidence=.45, reason="misbound model update",
+            ))
+
+        memory = ProjectMemoryLog(tmp).replay()
+        assert memory.hypotheses["h-a"]["status"] == "queued"
+        assert memory.hypothesis_tests["test-h-b"]["status"] == "proposed"

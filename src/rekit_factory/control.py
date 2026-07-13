@@ -755,6 +755,8 @@ class InvestigationController:
             )
             hypothesis_updates = self._apply_hypothesis_updates(
                 ctx.deps.paths, getattr(report, "hypothesis_updates", ()),
+                expected_hypothesis_id=hypothesis_id,
+                expected_test_id=hypothesis_test_id,
             )
             hypotheses_scheduled, hypotheses_rejected = self._schedule_hypotheses(
                 ledger, ctx.deps.paths, ctx.state.run_id, item,
@@ -867,11 +869,23 @@ class InvestigationController:
                 rejected += 1
         return accepted, rejected
 
-    def _apply_hypothesis_updates(self, paths: RunPaths, updates: Any) -> int:
+    def _apply_hypothesis_updates(
+        self,
+        paths: RunPaths,
+        updates: Any,
+        *,
+        expected_hypothesis_id: str | None = None,
+        expected_test_id: str | None = None,
+    ) -> int:
         hypotheses = HypothesisMemory(_project_memory_log(paths))
         accepted = 0
         for update in updates or ():
             try:
+                if (expected_hypothesis_id is not None
+                        and update.hypothesis_id != expected_hypothesis_id):
+                    raise ValueError("test worker cannot update another hypothesis")
+                if expected_test_id is not None and update.test_id != expected_test_id:
+                    raise ValueError("test worker cannot report another discriminating test")
                 hypotheses.transition(update)
                 accepted += 1
             except (KeyError, TypeError, ValueError):
