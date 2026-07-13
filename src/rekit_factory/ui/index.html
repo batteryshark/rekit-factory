@@ -23,6 +23,7 @@
       <div class="crumb"><span>REKIT</span><b>/</b><span>FACTORY</span><b>/</b><strong id="crumb">MISSION CONTROL</strong></div>
       <div class="top-spacer"></div>
       <div class="health"><i></i><span id="healthText">connecting</span></div>
+      <button class="btn restart-btn" id="restartService" type="button" title="Restart the local Factory service and reload this page"><span aria-hidden="true">↻</span> Restart UI</button>
       <button class="btn primary" data-view="newrun">+ New Run</button>
     </header>
     <div class="content">
@@ -70,7 +71,7 @@
         </div>
       </section>
       <section class="view" id="view-tools"><div class="view-head"><div><div class="eyebrow">CAPABILITIES</div><h1>Tools &amp; Models</h1><div class="sub">the configured brain and Rekit rack exposed to this factory</div></div></div><div class="layout2"><div class="panel"><h3>Rekit tools</h3><div class="tools" id="toolCatalog"></div></div><div class="panel"><h3>Active model profile</h3><div id="profile"></div></div></div></section>
-      <section class="view" id="view-settings"><div class="view-head"><div><div class="eyebrow">SYSTEM</div><h1>Settings</h1><div class="sub">local storage and runtime boundaries</div></div></div><div class="panel settings-panel"><h3>Factory</h3><div class="side-kv" id="settings"></div></div></section>
+      <section class="view" id="view-settings"><div class="view-head"><div><div class="eyebrow">SYSTEM</div><h1>Settings</h1><div class="sub">local storage and runtime boundaries</div></div></div><div class="panel settings-panel"><h3>Factory</h3><div class="side-kv" id="settings"></div><div class="service-actions"><div><b>Reload service code</b><span>Restarts the loopback Factory process with the same command and reloads Mission Control when it is ready.</span></div><button class="btn" type="button" data-restart-service><span aria-hidden="true">↻</span> Restart UI service</button></div></div></section>
     </div>
   </main>
 </div>

@@ -59,7 +59,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", selected: null, snapshot: null, stream: null};
+const state = {fleet: [], config: null, filter: "all", selected: null, snapshot: null, stream: null, restarting: false};
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
@@ -80,6 +80,47 @@ function toast(message, error = false) {
   toast.timer = setTimeout(() => { element.className = "toast"; }, 3200);
 }
 
+const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+function setRestartState(restarting) {
+  state.restarting = restarting;
+  document.body.classList.toggle("service-restarting", restarting);
+  document.querySelectorAll("#restartService, [data-restart-service]").forEach(button => {
+    button.disabled = restarting || state.config?.restartAvailable === false;
+    button.innerHTML = restarting ? `<span class="restart-spinner" aria-hidden="true">↻</span> Restarting…` : `<span aria-hidden="true">↻</span> ${button.id === "restartService" ? "Restart UI" : "Restart UI service"}`;
+  });
+  if (restarting) $("healthText").textContent = "restarting service";
+}
+
+async function restartService() {
+  if (state.restarting) return;
+  const previousInstance = state.config?.serviceInstance;
+  setRestartState(true);
+  if (state.stream) state.stream.close();
+  try {
+    await api("/api/restart", {method: "POST", body: "{}"});
+    toast("Factory is restarting…");
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      await delay(300);
+      try {
+        const response = await fetch(`/api/config?restart=${Date.now()}`, {cache: "no-store"});
+        if (!response.ok) continue;
+        const config = await response.json();
+        if (config.serviceInstance && config.serviceInstance !== previousInstance) {
+          window.location.reload();
+          return;
+        }
+      } catch (_error) { /* Downtime is expected while the process is replaced. */ }
+    }
+    throw new Error("Factory did not return within 20 seconds");
+  } catch (error) {
+    setRestartState(false);
+    toast(error.message, true);
+    refreshFleet();
+  }
+}
+
 function show(name) {
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === `view-${name}`));
   document.querySelectorAll(".nav").forEach(nav => nav.classList.toggle("active", nav.dataset.view === name));
@@ -88,6 +129,8 @@ function show(name) {
 }
 
 function activate(element) {
+  const restart = element.closest("#restartService, [data-restart-service]");
+  if (restart) { restartService(); return true; }
   const view = element.closest("[data-view]");
   if (view) { show(view.dataset.view); return true; }
   const card = element.closest("[data-run]");
@@ -255,6 +298,7 @@ function renderConfig() {
   $("strategySelect").innerHTML = strategies.map(strategy => `<option value="${esc(strategy.name)}">${esc(strategy.name)}</option>`).join("") + `<option value="custom-roles">custom roles</option>`;
   $("profile").innerHTML = profiles.map(profile => `<div class="profile-block"><div class="kv"><span>profile</span><span>${esc(profile.name)}</span></div><div class="kv"><span>provider</span><span>${esc(profile.provider)}</span></div><div class="kv"><span>protocol</span><span>${esc(profile.apiFormat || "openai")}</span></div><div class="kv"><span>model</span><span class="model-name">${esc(profile.model)}</span></div><div class="kv"><span>endpoint</span><span>${esc(profile.baseUrl)}</span></div><div class="kv"><span>secret</span><span>${esc(profile.apiKeySource)}</span></div></div>`).join("");
   $("settings").innerHTML = `<div class="kv"><span>storage root</span><span>${esc(config.storageRoot)}</span></div><div class="kv"><span>API boundary</span><span>loopback only</span></div><div class="kv"><span>event transport</span><span>SSE · resumable ID</span></div><div class="kv"><span>model profiles</span><span>${profiles.length}</span></div>`;
+  setRestartState(false);
   const tools = config.tools || [];
   const toolRow = tool => `<label class="tool"><input type="checkbox" value="${esc(tool.id)}" data-gated="${Boolean(tool.requires_permission)}"><span class="tool-name">${esc(tool.id)}<small>${esc(tool.source || "default")}</small></span><span class="tier ${tool.requires_permission ? "gated" : ""}">${tool.requires_permission ? "ask" : "auto"} · t${tool.safety_tier}</span></label>`;
   $("toolPicker").innerHTML = tools.map(toolRow).join("") || `<div class="hint">No Rekit tools discovered.</div>`;

@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+import uuid
 
 from rekit_factory.control import InvestigationController, RunRequest
 from rekit_factory.strategies import DEFAULT_STRATEGIES
@@ -68,7 +69,7 @@ class DriveSupervisor:
 class FactoryServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, controller: InvestigationController):
+    def __init__(self, address, controller: InvestigationController, *, allow_restart: bool = False):
         host = address[0]
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Factory API must bind to a loopback address")
@@ -76,6 +77,16 @@ class FactoryServer(ThreadingHTTPServer):
         self.controller = controller
         self.storage_root = controller.storage_root.resolve()
         self.supervisor = DriveSupervisor(controller)
+        self.allow_restart = allow_restart
+        self.instance_id = uuid.uuid4().hex
+        self.restart_requested = threading.Event()
+
+    def request_restart(self) -> None:
+        """Finish the current response, then return control to the CLI for re-exec."""
+        if not self.allow_restart:
+            raise RuntimeError("service restart is unavailable for this server")
+        self.restart_requested.set()
+        threading.Thread(target=self.shutdown, name="factory-restart", daemon=True).start()
 
     def server_close(self) -> None:
         if hasattr(self, "supervisor"):
@@ -107,6 +118,8 @@ class FactoryHandler(BaseHTTPRequestHandler):
                         **tool.__dict__, "requires_permission": tool.requires_permission,
                     } for tool in self.server.controller.rekit.list_tools()]
                 self._json(HTTPStatus.OK, {
+                    "serviceInstance": self.server.instance_id,
+                    "restartAvailable": self.server.allow_restart,
                     "storageRoot": str(self.server.storage_root),
                     "modelProfile": self.server.controller.workers.profile.public_dict(),
                     "modelProfiles": [backend.profile.public_dict()
@@ -144,6 +157,18 @@ class FactoryHandler(BaseHTTPRequestHandler):
         parts = [part for part in parsed.path.split("/") if part]
         try:
             payload = self._body()
+            if parts == ["api", "restart"]:
+                if not self.server.allow_restart:
+                    self._json(HTTPStatus.CONFLICT, {
+                        "error": "service restart is unavailable for this server",
+                    })
+                    return
+                self._json(HTTPStatus.ACCEPTED, {
+                    "restarting": True,
+                    "serviceInstance": self.server.instance_id,
+                })
+                self.server.request_restart()
+                return
             if parts == ["api", "runs"]:
                 request = RunRequest(
                     target=Path(payload["target"]),
@@ -304,11 +329,13 @@ def _fleet(controller: InvestigationController) -> list[dict[str, Any]]:
 
 
 def serve(controller: InvestigationController, *, host: str = "127.0.0.1",
-          port: int = 8768) -> None:
-    server = FactoryServer((host, port), controller)
+          port: int = 8768) -> bool:
+    """Serve until stopped, returning true when the CLI should re-exec itself."""
+    server = FactoryServer((host, port), controller, allow_restart=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+    return server.restart_requested.is_set()

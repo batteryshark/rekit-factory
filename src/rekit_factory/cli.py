@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -131,7 +132,12 @@ def main(argv: list[str] | None = None) -> int:
             from rekit_factory.api import serve
             controller = _controller(args, needs_model=True)
             print(f"Rekit Factory API: http://{args.host}:{args.port}", flush=True)
-            serve(controller, host=args.host, port=args.port)
+            restart = serve(controller, host=args.host, port=args.port)
+            if restart:
+                os.execv(
+                    sys.executable,
+                    [sys.executable, "-m", "rekit_factory", *sys.argv[1:]],
+                )
             return 0
         if args.command == "status":
             result = _controller(args, needs_model=False).snapshot(args.run_dir)

@@ -381,6 +381,29 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertIn(field, script)
         self.assertIn("cannot bypass server-side gates", page)
 
+    def test_loopback_service_restart_is_explicit_and_stops_the_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs",
+                rekit=FakeRekit(),
+                workers=FakeBackend(),
+            )
+            server = FactoryServer(("127.0.0.1", 0), controller, allow_restart=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                config = self._request(base + "/api/config")
+                self.assertTrue(config["restartAvailable"])
+                self.assertEqual(server.instance_id, config["serviceInstance"])
+                result = self._request(base + "/api/restart", {}, expected=202)
+                self.assertTrue(result["restarting"])
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+                self.assertTrue(server.restart_requested.is_set())
+            finally:
+                server.server_close()
+
     def test_loopback_api_launches_exposes_and_answers_a_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = self._fixture(tmp)
@@ -404,6 +427,7 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b'id="strategySelect"', page)
                     self.assertIn(b'id="retriesPerWorker"', page)
                     self.assertIn(b'value="automatic-only"', page)
+                    self.assertIn(b'id="restartService"', page)
                 with urlopen(base + "/ui/mission-control.css", timeout=5) as response:
                     self.assertEqual("text/css; charset=utf-8", response.headers["Content-Type"])
                     self.assertIn(b"prefers-reduced-motion", response.read())
@@ -418,7 +442,9 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b"retriesPerWorker", script)
                     self.assertIn(b"costUnits", script)
                     self.assertIn(b"maxWorkers", script)
+                    self.assertIn(b"restartService", script)
                 config = self._request(base + "/api/config")
+                self.assertFalse(config["restartAvailable"])
                 self.assertEqual("deterministic", config["modelProfile"]["model"])
                 self.assertEqual("prompted", config["modelProfile"]["structuredOutputMode"])
                 self.assertIn("recon-analysis", {item["name"] for item in config["strategies"]})
