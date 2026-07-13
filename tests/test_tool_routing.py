@@ -66,6 +66,7 @@ class FakeTransport:
                 media_type="application/json",
             ),),
             lease_id=request.lease_id,
+            manifest_digest=request.expected_manifest_digest,
         )
 
     def setup_lease(self, request):
@@ -109,9 +110,12 @@ class FakeRekit:
     def list_tools(self):
         return [self.manifest("scan")]
 
-    def run(self, tool_id, target, *, allow_dynamic=False):
+    def run(self, tool_id, target, *, allow_dynamic=False,
+            expected_manifest_digest=None):
         self.calls += 1
-        return ToolResult(0, "local", "", "local scan")
+        return ToolResult(
+            0, "local", "", "local scan", expected_manifest_digest
+        )
 
 
 class FakeBackend:
@@ -274,6 +278,7 @@ class ToolRoutingTests(unittest.TestCase):
                 tool_id="scan", target_sha256=hash_path(target), scope=scope,
                 actions=actions, approval_id="question-allow", endpoint=endpoint,
                 account_ref="account:lab", uses_credentials=True, lease_id="lease-test",
+                expected_manifest_digest="d" * 64,
             )
             self.assertEqual("restricted", request.network_policy)
             self.assertEqual("staged-input-read-only", request.mount_policy)
@@ -282,6 +287,7 @@ class ToolRoutingTests(unittest.TestCase):
             self.assertEqual(tuple(action.value for action in actions), request.requested_actions)
             self.assertEqual("account:lab", request.account_ref)
             self.assertTrue(request.uses_credentials)
+            self.assertEqual("d" * 64, request.expected_manifest_digest)
             self.assertNotIn("api_key", request.to_json().lower())
 
     def test_controller_routes_to_remote_and_preserves_result_provenance(self):

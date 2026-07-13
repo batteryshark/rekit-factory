@@ -110,6 +110,7 @@ class ToolRoute:
         account_ref: str | None,
         uses_credentials: bool,
         lease_id: str,
+        expected_manifest_digest: str,
     ) -> InvocationRequest:
         networked = ActionAuthority.NETWORK_ACCESS in actions
         return InvocationRequest(
@@ -129,6 +130,7 @@ class ToolRoute:
             scope_revision=scope.to_dict(),
             requested_actions=tuple(action.value for action in actions),
             lease_id=lease_id,
+            expected_manifest_digest=expected_manifest_digest,
         )
 
 

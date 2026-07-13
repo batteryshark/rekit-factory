@@ -23,7 +23,7 @@ from rekit_factory.scope import (
 class FakeRekit:
     def __init__(self, *, risky: bool = False):
         self.risky = risky
-        self.calls: list[tuple[str, Path, bool]] = []
+        self.calls: list[tuple[str, Path, bool, str | None]] = []
 
     def manifest(self, tool_id: str) -> ToolManifest:
         return ToolManifest(
@@ -33,14 +33,18 @@ class FakeRekit:
             safety_tier=2 if self.risky else 0,
             executes_input="full" if self.risky else "no",
             network="none",
+            actions=((ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.EXECUTE_UNTRUSTED)
+                     if self.risky else (ActionAuthority.READ_LOCAL_TARGET,)),
         )
 
     def list_tools(self) -> list[ToolManifest]:
         return [self.manifest("fixture-scan")]
 
-    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False) -> ToolResult:
-        self.calls.append((tool_id, target, allow_dynamic))
-        return ToolResult(0, "fixture output", "", f"rekit run {tool_id} <target>")
+    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False,
+            expected_manifest_digest: str | None = None) -> ToolResult:
+        self.calls.append((tool_id, target, allow_dynamic, expected_manifest_digest))
+        return ToolResult(0, "fixture output", "", f"rekit run {tool_id} <target>",
+                          expected_manifest_digest)
 
 
 class RemoteEnvelopeTests(unittest.TestCase):
@@ -91,6 +95,8 @@ class RemoteEnvelopeTests(unittest.TestCase):
             stdout="ok",
             stderr="",
             artifacts=(artifact,),
+            lease_id="lease-1",
+            manifest_digest="c" * 64,
         )
 
         for envelope, envelope_type in (
@@ -126,6 +132,17 @@ class RemoteEnvelopeTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "output root"):
             ArtifactRecord(path="../host.txt", sha256="a" * 64, size=1)
+
+    def test_rejects_internally_inconsistent_result_success_state(self):
+        common = {
+            "invocation_id": "invoke-inconsistent", "run_id": "run-1",
+            "work_item_id": "work-1", "worker_id": "worker-1",
+            "stdout": "", "stderr": "",
+        }
+        for status, exit_code in (("done", 1), ("failed", 0), ("cancelled", 0)):
+            with self.subTest(status=status, exit_code=exit_code), \
+                    self.assertRaisesRegex(ValueError, "inconsistent"):
+                InvocationResult(status=status, exit_code=exit_code, **common)
 
     def test_capabilities_reject_duplicate_tools(self):
         with self.assertRaisesRegex(ValueError, "duplicates"):
@@ -172,7 +189,11 @@ class RemoteEnvelopeTests(unittest.TestCase):
             allowed = InvocationRequest(
                 invocation_id="invoke-1", run_id="run-1", work_item_id="work-1",
                 tool_id="fixture-scan", target_path=str(target), approval_id="approval-1",
-                lease_id="lease-local", **common,
+                lease_id="lease-local",
+                expected_manifest_digest=rekit.manifest(
+                    "fixture-scan"
+                ).effective_manifest_digest,
+                **common,
             )
             worker.setup_lease(WorkerLeaseRequest(
                 lease_id="lease-local", run_id="run-1", work_item_id="work-1",
@@ -184,7 +205,58 @@ class RemoteEnvelopeTests(unittest.TestCase):
             self.assertEqual("run-1", result.run_id)
             self.assertEqual("work-1", result.work_item_id)
             self.assertEqual("worker-local", result.worker_id)
+            self.assertEqual("lease-local", result.lease_id)
             self.assertTrue(rekit.calls[0][2])
+            self.assertEqual(allowed.expected_manifest_digest, rekit.calls[0][3])
+            self.assertEqual(allowed.expected_manifest_digest, result.manifest_digest)
+
+    def test_local_worker_rejects_missing_manifest_attestation(self):
+        class MissingAttestationRekit(FakeRekit):
+            def run(self, tool_id, target, *, allow_dynamic=False,
+                    expected_manifest_digest=None):
+                result = super().run(
+                    tool_id, target, allow_dynamic=allow_dynamic,
+                    expected_manifest_digest=expected_manifest_digest,
+                )
+                return ToolResult(
+                    result.exit_code, result.stdout, result.stderr,
+                    result.command_label, None,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.bin"
+            target.write_bytes(b"fixture")
+            rekit = MissingAttestationRekit()
+            expected = rekit.manifest("fixture-scan").effective_manifest_digest
+            envelope = ScopeEnvelope(
+                scope_id="scope-missing-attestation", revision=1,
+                valid_from="2026-07-01T00:00:00Z", valid_until="2026-08-01T00:00:00Z",
+                targets=(TargetGrant.from_path(target),),
+                actions=(ActionAuthority.READ_LOCAL_TARGET,),
+            )
+            scope = AuthorizedScope(envelope, ScopeApproval(
+                scope_id=envelope.scope_id, revision=1,
+                content_digest=envelope.content_digest, approved_by="test-operator",
+                approved_at="2026-07-01T00:00:00Z",
+                expires_at="2026-08-01T00:00:00Z", rationale="attestation fixture",
+            ))
+            request = InvocationRequest(
+                invocation_id="invoke-missing", run_id="run-1", work_item_id="work-1",
+                tool_id="fixture-scan", target_path=str(target),
+                expected_manifest_digest=expected,
+                target_sha256=TargetGrant.from_path(target).content_sha256,
+                scope_digest=scope.envelope.content_digest,
+                scope_revision=scope.to_dict(),
+                requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+                lease_id="lease-missing",
+            )
+            worker = LocalRekitWorker(rekit)
+            worker.setup_lease(WorkerLeaseRequest(
+                lease_id="lease-missing", run_id="run-1", work_item_id="work-1",
+                worker_id="local", route_sha256="a" * 64,
+            ))
+            with self.assertRaisesRegex(ValueError, "attest"):
+                worker.invoke(request)
 
 
 if __name__ == "__main__":
