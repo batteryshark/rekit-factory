@@ -106,11 +106,15 @@ ordinary lifecycle of the source record, not a new database or second state mach
 `factory-outcome-source-state/v1` JSON boundary: run, sorted workers and work items, complete
 project-memory projection, sorted dossiers and pending decisions, and diagnostic source
 watermarks. It also records the deterministic current revision head for each source stream so
-a restarted accumulator cannot be rewound by a late stale change. `from_source_snapshot()`
-rebuilds the in-memory accumulator and its intrinsic
-entity materialization without calling the full projector. Change receipts are intentionally
-ephemeral in this slice; the source snapshot is sufficient to reproduce public meaning and
-identity, not to claim durable delivery acknowledgement.
+a restarted accumulator cannot be rewound by a late stale change. The snapshot additionally
+persists every accepted strict v1 change envelope as a deterministically sorted receipt. On
+admission, those receipts rebuild both exact-change and stream-revision conflict maps; every
+head must have its exact receipt, receipts cannot exceed a head, present records require heads,
+and each current head must reproduce the materialized value or tombstone. Missing or tampered
+heads, receipts, and source values therefore fail closed instead of weakening retry semantics
+after process recreation. `from_source_snapshot()` rebuilds the in-memory accumulator and its
+intrinsic entity materialization without calling the full projector. These receipts preserve
+in-memory idempotency and conflict detection; they do not claim an external delivery protocol.
 
 The shared public `consistency` object is deliberately derivation-path neutral:
 

@@ -41,7 +41,7 @@ _OPERATIONS = frozenset({"upsert", "remove"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SNAPSHOT_FIELDS = frozenset({
     "schemaVersion", "sourceVersion", "run", "workers", "workItems", "projectMemory",
-    "dossiers", "pendingDecisions", "sourceWatermarks", "sourceHeads",
+    "dossiers", "pendingDecisions", "sourceWatermarks", "sourceHeads", "changeReceipts",
 })
 EntityKey = tuple[str, str]
 StreamKey = tuple[str, str]
@@ -645,6 +645,77 @@ def _heads_from_snapshot(snapshot: Mapping[str, Any]) -> dict[StreamKey, int]:
     return heads
 
 
+def _materialized_stream_value(state: _SourceState, stream: StreamKey) -> dict[str, Any] | None:
+    kind, source_id = stream
+    if kind == "run":
+        return state.run
+    if kind == "project-memory":
+        return state.memory
+    return {
+        "worker": state.workers,
+        "work-item": state.work_items,
+        "dossier": state.dossiers,
+        "pending-decision": state.pending_decisions,
+    }[kind].get(source_id)
+
+
+def _receipts_from_snapshot(
+    snapshot: Mapping[str, Any], state: _SourceState, heads: Mapping[StreamKey, int],
+) -> tuple[dict[str, bytes], dict[tuple[StreamKey, int], bytes]]:
+    values = snapshot["changeReceipts"]
+    if type(values) is not list:
+        raise OutcomeSourceChangeError("changeReceipts must be a JSON array")
+    change_receipts: dict[str, bytes] = {}
+    revision_receipts: dict[tuple[StreamKey, int], bytes] = {}
+    head_changes: dict[StreamKey, OutcomeSourceChangeV1] = {}
+    for item in values:
+        change = OutcomeSourceChangeV1.from_dict(item)
+        payload = change.canonical_bytes
+        if change.change_id in change_receipts:
+            raise OutcomeSourceChangeError("changeReceipts contains duplicate changeId")
+        stream = _stream_key(change)
+        revision_key = (stream, change.source_revision)
+        if revision_key in revision_receipts:
+            raise OutcomeSourceChangeError("changeReceipts contains duplicate source revision")
+        head = heads.get(stream)
+        if head is None:
+            raise OutcomeSourceChangeError("change receipt has no matching source head")
+        if change.source_revision > head:
+            raise OutcomeSourceChangeError("change receipt revision exceeds its source head")
+        change_receipts[change.change_id] = payload
+        revision_receipts[revision_key] = payload
+        if change.source_revision == head:
+            head_changes[stream] = change
+
+    if set(head_changes) != set(heads):
+        raise OutcomeSourceChangeError("every source head requires its exact change receipt")
+
+    present_streams: set[StreamKey] = set()
+    if state.run is not None:
+        present_streams.add(("run", "run"))
+    present_streams.update(("worker", source_id) for source_id in state.workers)
+    present_streams.update(("work-item", source_id) for source_id in state.work_items)
+    present_streams.update(("dossier", source_id) for source_id in state.dossiers)
+    present_streams.update(
+        ("pending-decision", source_id) for source_id in state.pending_decisions
+    )
+    if state.memory:
+        present_streams.add(("project-memory", "project-memory"))
+    if not present_streams <= set(heads):
+        raise OutcomeSourceChangeError("materialized source record has no source head")
+
+    for stream, change in head_changes.items():
+        materialized = _materialized_stream_value(state, stream)
+        expected = change.value if change.operation == "upsert" else (
+            {} if stream == ("project-memory", "project-memory") else None
+        )
+        if materialized != expected:
+            raise OutcomeSourceChangeError(
+                "current source head does not match materialized source state"
+            )
+    return change_receipts, revision_receipts
+
+
 class IncrementalOutcomeFold:
     """Genuine in-memory source accumulator with selective entity refolding."""
 
@@ -662,6 +733,9 @@ class IncrementalOutcomeFold:
         value._state = _state_from_snapshot(snapshot)
         value._entities = _fold_all(value._state)
         value._heads = _heads_from_snapshot(snapshot)
+        value._change_receipts, value._revision_receipts = _receipts_from_snapshot(
+            snapshot, value._state, value._heads,
+        )
         return value
 
     @property
@@ -744,6 +818,10 @@ class IncrementalOutcomeFold:
         )
 
     def source_snapshot(self) -> dict[str, Any]:
+        receipts = [json.loads(payload) for payload in self._change_receipts.values()]
+        receipts.sort(key=lambda item: (
+            item["sourceKind"], item["sourceId"], item["sourceRevision"], item["changeId"],
+        ))
         return _json_snapshot({
             "schemaVersion": SCHEMA_VERSION,
             "sourceVersion": SOURCE_SNAPSHOT_VERSION,
@@ -766,6 +844,7 @@ class IncrementalOutcomeFold:
                 }
                 for stream in sorted(self._heads)
             ],
+            "changeReceipts": receipts,
         })
 
     def _clone(self) -> Self:

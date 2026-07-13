@@ -435,16 +435,75 @@ def test_source_snapshot_restart_is_canonical_byte_identical_and_detached():
     assert restarted.projection()["semanticSha256"] == fold.projection()["semanticSha256"]
     assert_full_parity(restarted)
 
+    exact_retry = randomized_changes()[-1]
+    assert restarted.apply(exact_retry) is False
+    with pytest.raises(OutcomeSourceChangeConflict, match="changeId"):
+        restarted.apply(change(
+            exact_retry.change_id, "pending-decision", 4, {"id": "question-a"},
+        ))
+    with pytest.raises(OutcomeSourceChangeConflict, match="source revision"):
+        restarted.apply(change(
+            "question-revision-conflict", "pending-decision", 3,
+            {"id": "question-a", "prompt": "tampered"},
+        ))
+
     before_stale = restarted.projection()
-    assert restarted.apply(change(
-        "run-stale-after-restart", "run", 1, {"id": "run-a", "status": "queued"},
-    ))
+    assert restarted.apply(randomized_changes()[0]) is False
     assert restarted.last_refolded_entities == ()
     assert restarted.projection() == before_stale
 
     snapshot["projectMemory"].clear()
     snapshot["workers"].clear()
     assert restarted.source_snapshot() == decoded
+
+
+def test_source_snapshot_rejects_missing_or_incoherent_heads_and_receipts():
+    fold = IncrementalOutcomeFold()
+    fold.apply(change("run-1", "run", 1, {"id": "run-a", "status": "running"}))
+    fold.apply(change("worker-1", "worker", 1, {"id": "worker-a", "status": "done"}))
+    fold.apply(remove("worker-2", "worker", "worker-a", 2))
+    snapshot = fold.source_snapshot()
+
+    missing_receipt = deepcopy(snapshot)
+    missing_receipt["changeReceipts"] = [
+        item for item in missing_receipt["changeReceipts"] if item["changeId"] != "run-1"
+    ]
+    with pytest.raises(OutcomeSourceChangeError, match="source head requires"):
+        IncrementalOutcomeFold.from_source_snapshot(missing_receipt)
+
+    missing_head = deepcopy(snapshot)
+    missing_head["sourceHeads"] = [
+        item for item in missing_head["sourceHeads"] if item["sourceKind"] != "run"
+    ]
+    with pytest.raises(OutcomeSourceChangeError, match="no matching source head"):
+        IncrementalOutcomeFold.from_source_snapshot(missing_head)
+
+    head_without_receipt = deepcopy(snapshot)
+    next(item for item in head_without_receipt["sourceHeads"]
+         if item["sourceKind"] == "run")["sourceRevision"] = 2
+    with pytest.raises(OutcomeSourceChangeError, match="source head requires"):
+        IncrementalOutcomeFold.from_source_snapshot(head_without_receipt)
+
+    future_receipt = deepcopy(snapshot)
+    next(item for item in future_receipt["changeReceipts"]
+         if item["changeId"] == "run-1")["sourceRevision"] = 2
+    with pytest.raises(OutcomeSourceChangeError, match="exceeds its source head"):
+        IncrementalOutcomeFold.from_source_snapshot(future_receipt)
+
+    tampered_value = deepcopy(snapshot)
+    tampered_value["run"]["status"] = "failed"
+    with pytest.raises(OutcomeSourceChangeError, match="materialized source state"):
+        IncrementalOutcomeFold.from_source_snapshot(tampered_value)
+
+    broken_tombstone = deepcopy(snapshot)
+    broken_tombstone["workers"] = [{"id": "worker-a", "status": "done"}]
+    with pytest.raises(OutcomeSourceChangeError, match="materialized source state"):
+        IncrementalOutcomeFold.from_source_snapshot(broken_tombstone)
+
+    unheaded_record = deepcopy(snapshot)
+    unheaded_record["workItems"] = [{"id": "work-a", "status": "queued"}]
+    with pytest.raises(OutcomeSourceChangeError, match="no source head"):
+        IncrementalOutcomeFold.from_source_snapshot(unheaded_record)
 
 
 @pytest.mark.parametrize("invalid_parent", [None, ["finding-a"]])
