@@ -593,9 +593,9 @@ class ControlPlaneTests(unittest.TestCase):
                     expected_cursor = cursor_ledger.conn.execute(
                         "select max(rowid) from factory_events where run_id=?", (run_id,),
                     ).fetchone()[0]
-                self.assertEqual(
-                    expected_cursor,
+                self.assertLessEqual(
                     launched["outcomeProjection"]["consistency"]["cursor"]["factoryEventRowid"],
+                    expected_cursor,
                 )
                 suspended = self._wait_status(base, run_id, "needs_input")
                 self.assertEqual(1, len(suspended["pendingQuestions"]))

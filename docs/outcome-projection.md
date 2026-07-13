@@ -21,7 +21,7 @@ Each entity has six orthogonal facets:
 | disposition | What outcome was assigned? | `successful`, `failed`, `blocked`, `cancelled`, `deferred`, `needs-review`, `mixed`, `unknown` |
 | validation | What has proof policy concluded? | `unvalidated`, `pending`, `demonstrated`, `reproduced`, `contradicted`, `invalid`, `inconclusive`, `verified`, `stale`, `unknown` |
 | acceptance | What has an operator decided? | `undecided`, `accepted`, `rejected`, `waived`, `unknown` |
-| publication | What durable publication exists? | `unpublished`, `published`, `verified`, `archived`, `stale`, `unknown` |
+| publication | What durable publication exists? | `unpublished`, `published`, `unknown` |
 
 Every facet preserves `rawState`, supplies a normalized `state`, says whether the raw value is
 `known`, identifies whether the canonical raw state is `terminal`, and names its `owner`.
@@ -37,7 +37,7 @@ history to repair an unknown state.
 | `muster` | Durable work-item execution and completion |
 | `factory-scheduler` | Run and worker execution/completion |
 | `validator-policy` | Hypothesis, finding, and reproduction conclusions |
-| `rekit-tool-result` | Only the execution/completion of its own Rekit tool work item |
+| `rekit-tool-result` | The result-based disposition of a Rekit-backed work item only |
 | `operator` | Answers and explicit acceptance, rejection, or waiver |
 | `factory-dossier-publisher` | Transactional proof-bundle publication presence |
 | `offline-proof-verifier` | Current byte, scope, manifest, and trust-anchor validity |
@@ -45,6 +45,8 @@ history to repair an unknown state.
 Authority is facet-local. In particular:
 
 - a completed worker or work item never makes its run complete or successful;
+- Muster owns every durable work-item execution and completion transition, including
+  Rekit-backed work; the canonical Rekit result may own only that item's disposition;
 - a rendered report never makes a finding demonstrated, reproduced, or accepted;
 - a successful reproduction attempt never directly changes its parent finding facet;
 - a proof-bundle publication changes only publication; it does not imply verification;
@@ -63,12 +65,13 @@ remain ordinary work results in this slice; report rendering does not acquire in
 outcome authority.
 
 The generic/SSE snapshot deliberately uses the cheap `dossier_list` publication projection.
-That establishes that a proof bundle was transactionally published, but it does **not** read
-and re-verify dossier bytes. Such bundles have `validation.state: unknown` and
-`validation.known: false`. The dedicated
-dossier route supplies explicit `verified` or `stale-or-invalid` facts and callers may pass
-those facts through the same pure projector. The high-frequency snapshot never guesses
-validity and never pays the byte-verification cost.
+Every listed dossier therefore has `publication.state: published`, owned by the dossier
+publisher, regardless of its current verification result. Publication never becomes
+`verified` or `stale`. The cheap projection does **not** read and re-verify dossier bytes, so
+its bundles have `validation.state: unknown` and `validation.known: false`. The dedicated
+dossier route supplies explicit `verified` or `stale-or-invalid` facts to the verifier-owned
+validation facet. The high-frequency snapshot never guesses validity and never pays the
+byte-verification cost.
 
 ## Consistency boundary
 

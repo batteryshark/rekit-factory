@@ -19,8 +19,8 @@ FACETS = (
 AUTHORITIES = {
     "muster": "Muster owns durable work-item execution and completion transitions.",
     "factory-scheduler": "The Factory scheduler owns run and worker execution transitions.",
-    "validator-policy": "Validator policy owns proof and validation conclusions.",
-    "rekit-tool-result": "A Rekit tool result owns only its own execution outcome.",
+    "validator-policy": "Validator policy owns hypothesis, finding, and reproduction conclusions.",
+    "rekit-tool-result": "A Rekit result may own only a Rekit-backed work item's disposition.",
     "operator": "The operator owns explicit acceptance, rejection, waiver, and answers.",
     "factory-dossier-publisher": "The Factory dossier publisher owns transactional publication.",
     "offline-proof-verifier": "The offline proof verifier owns current bundle validity.",
@@ -179,7 +179,11 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
     for work in work_items:
         item = _entity("work-item", work.get("id", "missing-work"), parent=run_parent)
         raw = work.get("status")
-        owner = "rekit-tool-result" if work.get("operation") == "rekit-tool" else "muster"
+        # Muster owns the durable work row. Rekit may own only the result-based disposition.
+        owner = "muster"
+        disposition_owner = (
+            "rekit-tool-result" if work.get("operation") == "rekit-tool" else "muster"
+        )
         work_terminal = {"done", "failed", "cancelled", "canceled"}
         _set(item, "execution", raw, _WORK_EXECUTION, terminal_raw=work_terminal,
              owner=owner, diagnostics=diagnostics)
@@ -191,7 +195,8 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
             "queued": "deferred", "running": "deferred", "blocked": "blocked",
             "done": "successful", "failed": "failed", "cancelled": "cancelled",
             "canceled": "cancelled",
-        }, terminal_raw=work_terminal, owner=owner, entity=item, diagnostics=diagnostics)
+        }, terminal_raw=work_terminal, owner=disposition_owner, entity=item,
+                     diagnostics=diagnostics)
         entities.append(item)
 
     hypotheses = memory.get("hypotheses") or {}
@@ -279,12 +284,9 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
             _set(item, "validation", raw, _DOSSIER_VALIDATION,
                  terminal_raw=set(_DOSSIER_VALIDATION), owner="offline-proof-verifier",
                  diagnostics=diagnostics)
-        publication_state = {"published": "published", "verified": "verified",
-                             "stale-or-invalid": "stale"}.get(str(raw), "unknown")
         item["facets"]["publication"] = {
-            "rawState": raw, "state": publication_state,
-            "known": raw in {"published", "verified", "stale-or-invalid"},
-            "terminal": raw in {"published", "verified", "stale-or-invalid"},
+            "rawState": "published", "state": "published",
+            "known": True, "terminal": True,
             "owner": "factory-dossier-publisher",
         }
         entities.append(item)

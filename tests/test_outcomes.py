@@ -110,14 +110,25 @@ def test_publication_and_explicit_verification_remain_orthogonal():
         "id": "dossier-1", "findingId": "finding-1", "verificationStatus": "verified",
         "verified": True,
     }])
+    stale = _project(dossiers=[{
+        "id": "dossier-1", "findingId": "finding-1",
+        "verificationStatus": "stale-or-invalid", "verified": False,
+    }])
 
     published_dossier = _entity(published, "proof-bundle", "dossier-1")
     verified_dossier = _entity(verified, "proof-bundle", "dossier-1")
+    stale_dossier = _entity(stale, "proof-bundle", "dossier-1")
     assert published_dossier["facets"]["publication"]["state"] == "published"
     assert published_dossier["facets"]["validation"]["state"] == "unknown"
     assert published_dossier["facets"]["validation"]["known"] is False
-    assert verified_dossier["facets"]["publication"]["state"] == "verified"
     assert verified_dossier["facets"]["validation"]["state"] == "verified"
+    assert stale_dossier["facets"]["validation"]["state"] == "stale"
+    for dossier in (published_dossier, verified_dossier, stale_dossier):
+        assert dossier["facets"]["publication"] == {
+            "rawState": "published", "state": "published", "known": True,
+            "terminal": True, "owner": "factory-dossier-publisher",
+        }
+        assert dossier["facets"]["validation"]["owner"] == "offline-proof-verifier"
 
 
 def test_authority_is_explicit_for_every_facet():
@@ -134,7 +145,9 @@ def test_authority_is_explicit_for_every_facet():
         assert all(facet["owner"] in projection["authorities"]
                    for facet in entity["facets"].values())
     tool = _entity(projection, "work-item", "tool-work")
-    assert tool["facets"]["completion"]["owner"] == "rekit-tool-result"
+    assert tool["facets"]["execution"]["owner"] == "muster"
+    assert tool["facets"]["completion"]["owner"] == "muster"
+    assert tool["facets"]["disposition"]["owner"] == "rekit-tool-result"
 
 
 def test_dangling_parent_is_diagnostic_and_does_not_create_parent_state():
