@@ -96,6 +96,50 @@ def test_candidate_is_excluded_until_clean_independent_reproduction():
         assert len(state["attempts"]) == 2
 
 
+def test_duplicate_finding_id_is_idempotent_only_for_the_same_proposal():
+    with tempfile.TemporaryDirectory() as tmp:
+        findings = _finding_memory(tmp)
+        proposal = _proposal()
+        assert findings.propose(
+            proposal, origin_worker_id="origin", origin_session_id="session:origin",
+            origin_model_profile="fixture",
+        ) is True
+        assert findings.propose(
+            proposal, origin_worker_id="origin", origin_session_id="session:origin",
+            origin_model_profile="fixture",
+        ) is False
+
+        conflicting = proposal.model_copy(update={"impact_claim": "A different claimed impact"})
+        with pytest.raises(ValueError, match="different proposal"):
+            findings.propose(
+                conflicting, origin_worker_id="origin", origin_session_id="session:origin",
+                origin_model_profile="fixture",
+            )
+
+
+def test_qualifying_count_ignores_unclean_origin_and_duplicate_identity_successes():
+    with tempfile.TemporaryDirectory() as tmp:
+        findings = _finding_memory(tmp)
+        findings.propose(
+            _proposal(finding_type="destructive-impact", consequence="critical"),
+            origin_worker_id="origin", origin_session_id="session:origin",
+            origin_model_profile="fixture",
+        )
+        findings.mark_validation_pending("f-length")
+        findings.record_attempt(_attempt(
+            "origin-success", worker="origin", session="session:origin",
+        ))
+        findings.record_attempt(_attempt("unclean-success", clean=False))
+        findings.record_attempt(_attempt("qualifying-one"))
+        findings.record_attempt(_attempt("same-identity", worker="validator-1",
+                                         session="session:validator-1",
+                                         environment="clean:one"))
+
+        assert findings.qualifying_reproduction_count("f-length") == 1
+        assert findings.log.replay().findings["f-length"]["status"] \
+               == "reproduction-pending"
+
+
 def test_false_positive_records_contradiction_and_never_enters_validated_projection():
     with tempfile.TemporaryDirectory() as tmp:
         findings = _finding_memory(tmp)

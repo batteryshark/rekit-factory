@@ -168,15 +168,22 @@ class FindingMemory:
     def propose(self, proposal: FindingProposal, *, origin_worker_id: str,
                 origin_session_id: str, origin_model_profile: str) -> bool:
         memory = self.log.replay()
-        if proposal.id in memory.findings:
-            return False
         hypothesis = memory.hypotheses.get(proposal.hypothesis_id)
         if hypothesis is None:
             raise ValueError("finding must cite a canonical hypothesis")
         if proposal.scope != hypothesis.get("scope"):
             raise ValueError("finding scope must match its hypothesis scope")
         policy = proof_policy(proposal.finding_type, proposal.consequence)
-        self.log.append(MemoryAction("finding_upserted", {
+        proposal_identity = {
+            "proposal": proposal.model_dump(mode="json"),
+            "originWorkerId": origin_worker_id,
+            "originSessionId": origin_session_id,
+            "originModelProfile": origin_model_profile,
+        }
+        proposal_digest = hashlib.sha256(json.dumps(
+            proposal_identity, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        payload = {
             "id": proposal.id,
             "schemaVersion": proposal.schema_version,
             "hypothesisId": proposal.hypothesis_id,
@@ -195,8 +202,28 @@ class FindingMemory:
             "originWorkerId": origin_worker_id,
             "originSessionId": origin_session_id,
             "originModelProfile": origin_model_profile,
+            "proposalDigest": proposal_digest,
             "references": _refs(proposal.references),
-        }, action_id=f"finding:{proposal.id}:candidate"))
+        }
+        current = memory.findings.get(proposal.id)
+        if current is not None:
+            current_digest = current.get("proposalDigest")
+            if current_digest is not None and current_digest != proposal_digest:
+                raise ValueError("finding id is already bound to a different proposal")
+            if current_digest is None:
+                immutable_keys = {
+                    "hypothesisId", "scope", "observations", "affectedComponent",
+                    "impactClaim", "assumptions", "knownUncertainty", "findingType",
+                    "proofPolicy", "recipe", "originWorkerId", "originSessionId",
+                    "originModelProfile", "references",
+                }
+                if any(current.get(key) != payload[key] for key in immutable_keys):
+                    raise ValueError("finding id is already bound to a different proposal")
+            return False
+        self.log.append(MemoryAction(
+            "finding_upserted", payload,
+            action_id=f"finding:{proposal.id}:candidate",
+        ))
         return True
 
     def transition(self, update: FindingTransition) -> None:
@@ -293,8 +320,18 @@ class FindingMemory:
 
     def _proof_satisfied(self, finding: dict) -> bool:
         policy = ProofPolicy.model_validate(finding["proofPolicy"])
+        return self.qualifying_reproduction_count(finding["id"]) \
+               >= policy.successful_clean_reproductions
+
+    def qualifying_reproduction_count(self, finding_id: str) -> int:
+        """Count distinct successes that satisfy the finding's persisted proof policy."""
+        memory = self.log.replay()
+        finding = memory.findings.get(finding_id)
+        if finding is None:
+            raise KeyError(finding_id)
+        policy = ProofPolicy.model_validate(finding["proofPolicy"])
         attempts = [
-            item for item in self.log.replay().finding_attempts.values()
+            item for item in memory.finding_attempts.values()
             if item["findingId"] == finding["id"] and item["outcome"] == "success"
         ]
         qualifying = []
@@ -313,7 +350,7 @@ class FindingMemory:
             (item["workerId"], item["sessionId"], item["environment"]["id"])
             for item in qualifying
         }
-        return len(identities) >= policy.successful_clean_reproductions
+        return len(identities)
 
     def decide(self, decision: OperatorFindingDecision) -> None:
         current = self.log.replay().findings.get(decision.finding_id)

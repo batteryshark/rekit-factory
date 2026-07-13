@@ -7,10 +7,17 @@ from types import SimpleNamespace
 
 from muster import resolve_run_dir
 
-from rekit_factory.control import InvestigationController, RunRequest, _target_snapshot
+from rekit_factory.control import (
+    InvestigationController,
+    RunRequest,
+    _project_memory_log,
+    _target_snapshot,
+)
 from rekit_factory.findings import (
+    FindingMemory,
     FindingProposal,
     ObservationEvidence,
+    ReproductionAttempt,
     ReproductionRecipe,
     ReproductionResultProposal,
 )
@@ -178,3 +185,47 @@ def test_false_positive_records_contradictory_attempt_and_stays_out_of_validated
     assert result["findingState"]["findings"][0]["status"] == "inconclusive"
     assert result["findingState"]["attempts"][0]["outcome"] == "contradictory"
     assert result["findingState"]["attempts"][0]["environment"]["clean"] is True
+
+
+def test_scheduler_continues_after_a_success_that_fails_independence_policy(tmp_path):
+    target = _target(tmp_path)
+    controller = InvestigationController(
+        storage_root=tmp_path / "runs", rekit=NoopRekit(), workers=FindingBackend(),
+    )
+    run_dir = controller.create(RunRequest(
+        target, "Assess parser", worker_roles=("recon",), concurrency=1,
+    ))
+    paths = resolve_run_dir(run_dir)
+    with FactoryLedger(paths.db_path) as ledger:
+        parent = dict(ledger.lease_next_actionable(paths.run_id))
+        ctx = SimpleNamespace(
+            state=SimpleNamespace(run_id=paths.run_id, iteration=0),
+            deps=SimpleNamespace(
+                ledger=ledger, paths=paths,
+                scratch={"targetSnapshot": _target_snapshot(target)},
+            ),
+        )
+        asyncio.run(controller._worker_handler(ctx, parent))
+        finding = FindingMemory(_project_memory_log(paths))
+        finding.record_attempt(ReproductionAttempt(
+            id="repro-f-length-1", finding_id="f-length",
+            recipe_id="recipe-length-v1", outcome="success",
+            worker_id=json.loads(parent["payload_json"])["workerId"],
+            session_id=f"session:{json.loads(parent['payload_json'])['workerId']}",
+            environment_id="clean:origin", clean_environment=True,
+            model_profile="finding-fixture", observations=["Allocation exceeded limit"],
+            references=[_ref("origin-reproduction")],
+        ))
+
+        controller._schedule_remaining_reproduction(
+            ledger, paths, paths.run_id, parent, "finding-fixture", (), "f-length",
+        )
+        validation_items = ledger.conn.execute(
+            "select payload_json from work_items where category='finding-validation' "
+            "order by id"
+        ).fetchall()
+        attempt_ids = {
+            json.loads(item["payload_json"])["reproductionAttemptId"]
+            for item in validation_items
+        }
+        assert attempt_ids == {"repro-f-length-1", "repro-f-length-2"}

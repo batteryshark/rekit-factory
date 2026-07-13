@@ -1072,14 +1072,15 @@ class InvestigationController:
                                          run_id: str, parent_item: dict[str, Any],
                                          model_profile: str, model_tools: Any,
                                          finding_id: str) -> None:
-        memory = _project_memory_log(paths).replay()
+        findings = FindingMemory(_project_memory_log(paths))
+        memory = findings.log.replay()
         finding = memory.findings.get(finding_id)
         if finding is None or finding["status"] != "reproduction-pending":
             return
         attempts = [item for item in memory.finding_attempts.values()
                     if item["findingId"] == finding_id]
         required = int(finding["proofPolicy"]["successful_clean_reproductions"])
-        if len(attempts) >= required or any(
+        if findings.qualifying_reproduction_count(finding_id) >= required or any(
             item["outcome"] in {"negative", "flaky", "contradictory", "inconclusive"}
             for item in attempts
         ):
