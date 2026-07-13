@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+import subprocess
+import sys
 
-from rekit_factory.outcomes import project_outcomes
+import pytest
+
+from rekit_factory.outcomes import (
+    SEMANTIC_IDENTITY_DOMAIN,
+    canonical_outcome_semantic_bytes,
+    outcome_semantic_sha256,
+    project_outcomes,
+    verify_outcome_semantic_sha256,
+)
 
 
 def _project(*, run_status="queued", workers=(), work=(), memory=None, dossiers=(), questions=(),
@@ -39,6 +50,8 @@ def test_full_fold_is_deterministic_and_input_order_independent():
         "finding_operator_decisions": {
             "decision-z": {"id": "decision-z", "findingId": "finding-z",
                            "decision": "accepted", "_eventSeq": 8},
+            "decision-a": {"id": "decision-a", "findingId": "finding-a",
+                           "decision": "rejected", "_eventSeq": 2},
         },
     }
     first = _project(
@@ -48,8 +61,12 @@ def test_full_fold_is_deterministic_and_input_order_independent():
         work=[{"id": "work-z", "status": "running", "operation": "model-worker"},
               {"id": "work-a", "status": "done", "operation": "rekit-tool"}],
         memory=memory,
-        dossiers=[{"id": "dossier-z", "findingId": "finding-z",
-                   "verificationStatus": "published"}],
+        dossiers=[
+            {"id": "dossier-z", "findingId": "finding-z",
+             "verificationStatus": "published"},
+            {"id": "dossier-a", "findingId": "finding-a",
+             "verificationStatus": "verified"},
+        ],
         questions=[{"id": "question-z"}],
     )
     rebuilt = _project(
@@ -59,12 +76,20 @@ def test_full_fold_is_deterministic_and_input_order_independent():
         work=[{"id": "work-a", "status": "done", "operation": "rekit-tool"},
               {"id": "work-z", "status": "running", "operation": "model-worker"}],
         memory={key: dict(reversed(list(value.items()))) for key, value in memory.items()},
-        dossiers=[{"id": "dossier-z", "findingId": "finding-z",
-                   "verificationStatus": "published"}],
+        dossiers=[
+            {"id": "dossier-a", "findingId": "finding-a",
+             "verificationStatus": "verified"},
+            {"id": "dossier-z", "findingId": "finding-z",
+             "verificationStatus": "published"},
+        ],
         questions=[{"id": "question-z"}],
     )
 
     assert json.dumps(first, sort_keys=True) == json.dumps(rebuilt, sort_keys=True)
+    assert canonical_outcome_semantic_bytes(first) == canonical_outcome_semantic_bytes(rebuilt)
+    assert first["semanticSha256"] == rebuilt["semanticSha256"]
+    assert verify_outcome_semantic_sha256(first)
+    assert verify_outcome_semantic_sha256(rebuilt)
     assert [(item["entityType"], item["entityId"]) for item in first["entities"]] == sorted(
         (item["entityType"], item["entityId"]) for item in first["entities"]
     )
@@ -178,6 +203,163 @@ def test_source_watermarks_are_not_exposed_as_projection_identity():
     assert projection["sourceWatermarks"] == {"factoryEventRowid": 19, "memorySequence": 7}
     assert projection["consistency"]["watermarksAreProjectionIdentity"] is False
     assert "cursor" not in projection["consistency"]
+
+
+def test_semantic_identity_domain_is_public_recomputable_and_restart_stable():
+    projection = _project(
+        run_status="running",
+        workers=[{"id": "worker-1", "status": "running"}],
+        work=[{"id": "work-1", "status": "done"}],
+    )
+    before = deepcopy(projection)
+    claimed = projection["semanticSha256"]
+    without_identity = deepcopy(projection)
+    without_identity.pop("semanticSha256")
+
+    assert outcome_semantic_sha256(projection) == claimed
+    assert outcome_semantic_sha256(without_identity) == claimed
+    assert verify_outcome_semantic_sha256(projection) is True
+    assert verify_outcome_semantic_sha256(without_identity) is False
+    assert projection == before
+
+    reordered_mappings = dict(reversed(list(projection.items())))
+    reordered_mappings["authorities"] = dict(reversed(list(
+        reordered_mappings["authorities"].items()
+    )))
+    assert canonical_outcome_semantic_bytes(reordered_mappings) == \
+        canonical_outcome_semantic_bytes(projection)
+
+    envelope = json.loads(canonical_outcome_semantic_bytes(projection))
+    assert envelope["domain"] == SEMANTIC_IDENTITY_DOMAIN
+    assert set(envelope["projection"]) == set(projection) - {
+        "semanticSha256", "sourceWatermarks",
+    }
+
+    recomputed = subprocess.check_output(
+        [
+            sys.executable, "-c",
+            "import json,sys; from rekit_factory.outcomes import outcome_semantic_sha256; "
+            "print(outcome_semantic_sha256(json.load(sys.stdin)))",
+        ],
+        input=json.dumps(projection), text=True,
+    ).strip()
+    assert recomputed == claimed
+
+
+def test_watermark_movement_is_visible_but_semantically_excluded():
+    first = _project(source_watermarks={"factoryEventRowid": 19, "memorySequence": 7})
+    moved = _project(source_watermarks={"memorySequence": 8, "factoryEventRowid": 23})
+
+    assert first["sourceWatermarks"] != moved["sourceWatermarks"]
+    assert canonical_outcome_semantic_bytes(first) == canonical_outcome_semantic_bytes(moved)
+    assert first["semanticSha256"] == moved["semanticSha256"]
+    assert verify_outcome_semantic_sha256(first)
+    assert verify_outcome_semantic_sha256(moved)
+
+    observed_later = deepcopy(first)
+    observed_later["sourceWatermarks"]["factoryEventRowid"] = 10_000
+    assert verify_outcome_semantic_sha256(observed_later)
+    assert observed_later["consistency"]["watermarksAreProjectionIdentity"] is False
+
+
+def _semantic_fixture():
+    return _project(
+        run_status="future-paused",
+        memory={
+            "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+            "finding_operator_decisions": {
+                "decision-1": {
+                    "id": "decision-1", "findingId": "finding-1",
+                    "decision": "accepted", "_eventSeq": 1,
+                },
+            },
+        },
+        dossiers=[{
+            "id": "dossier-1", "findingId": "finding-1",
+            "verificationStatus": "verified",
+        }],
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate"),
+    [
+        ("schema", lambda value: value.__setitem__("schemaVersion", 2)),
+        ("vocabulary", lambda value: value.__setitem__(
+            "vocabularyVersion", "factory-outcomes/v2",
+        )),
+        ("facet-list", lambda value: value["facets"].__setitem__(0, "phase")),
+        ("authority", lambda value: value["authorities"].__setitem__(
+            "operator", "Different authority meaning.",
+        )),
+        ("entity", lambda value: value["entities"].append({
+            **deepcopy(value["entities"][0]), "entityId": "additional-entity",
+        })),
+        ("raw-state", lambda value: _entity(value, "run", "run-1")["facets"][
+            "execution"
+        ].__setitem__("rawState", "another-raw-state")),
+        ("normalized-state", lambda value: _entity(value, "run", "run-1")["facets"][
+            "execution"
+        ].__setitem__("state", "waiting")),
+        ("parent", lambda value: _entity(value, "finding", "finding-1")[
+            "parent"
+        ].__setitem__("entityId", "run-other")),
+        ("publication", lambda value: _entity(value, "finding", "finding-1")["facets"][
+            "publication"
+        ].__setitem__("state", "unpublished")),
+        ("acceptance", lambda value: _entity(value, "finding", "finding-1")["facets"][
+            "acceptance"
+        ].__setitem__("state", "rejected")),
+        ("diagnostic", lambda value: value["diagnostics"][0].__setitem__(
+            "message", "Different diagnostic meaning.",
+        )),
+        ("degraded", lambda value: value.__setitem__("degraded", False)),
+        ("consistency", lambda value: value["consistency"].__setitem__(
+            "mode", "incremental-fold",
+        )),
+    ],
+)
+def test_every_public_semantic_class_changes_identity(name, mutate):
+    original = _semantic_fixture()
+    changed = deepcopy(original)
+    mutate(changed)
+
+    assert outcome_semantic_sha256(changed) != original["semanticSha256"], name
+    assert verify_outcome_semantic_sha256(changed) is False
+
+
+def test_projection_detaches_mutable_inputs_and_verifier_detects_public_mutation():
+    raw_state = ["future-state"]
+    watermarks = {"factoryEventRowid": 1, "observer": {"sequence": 2}}
+    projection = project_outcomes(
+        run={"id": "run-1", "status": raw_state}, workers=(), work_items=(), memory={},
+        dossiers=(), pending_questions=(), source_watermarks=watermarks,
+    )
+    before = deepcopy(projection)
+
+    raw_state.append("mutated")
+    watermarks["observer"]["sequence"] = 99
+    assert projection == before
+    assert verify_outcome_semantic_sha256(projection)
+
+    _entity(projection, "run", "run-1")["facets"]["execution"]["state"] = "active"
+    assert verify_outcome_semantic_sha256(projection) is False
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "error"),
+    [
+        (("python", "tuple"), TypeError),
+        ({1: "non-string-key"}, TypeError),
+        (float("nan"), ValueError),
+        (float("inf"), ValueError),
+    ],
+)
+def test_canonical_domain_rejects_non_json_and_nonfinite_values(bad_value, error):
+    projection = _project()
+    projection["adversarialField"] = bad_value
+    with pytest.raises(error):
+        canonical_outcome_semantic_bytes(projection)
 
 
 def test_dangling_parent_is_diagnostic_and_does_not_create_parent_state():

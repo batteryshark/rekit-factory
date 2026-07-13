@@ -12,6 +12,43 @@ the meanings below independently. Entities are sorted by `(entityType, entityId)
 diagnostics are sorted by entity, facet, and raw value. Rebuilding from the same canonical
 state therefore produces byte-for-byte equivalent JSON.
 
+### Semantic content identity
+
+Every projection carries `semanticSha256`, a lowercase SHA-256 over the complete public
+semantic projection. It is an outcome-projection content identity, not a source revision.
+Consumers can recompute it with the pure public helpers
+`canonical_outcome_semantic_bytes`, `outcome_semantic_sha256`, and
+`verify_outcome_semantic_sha256` in `rekit_factory.outcomes`; no ledger, memory, dossier, or
+process-private state is required.
+
+The canonical byte domain is `factory-outcomes/semantic-sha256/v1`. Its UTF-8 JSON envelope is:
+
+```json
+{"domain":"factory-outcomes/semantic-sha256/v1","projection":{}}
+```
+
+The `projection` member contains every present top-level public field except exactly
+`semanticSha256` itself and `sourceWatermarks`. Objects are recursively copied and serialized
+with keys sorted, no insignificant whitespace, UTF-8 characters unescaped, and only exact JSON
+objects, arrays, strings, booleans, nulls, and finite numbers accepted. Python-only containers,
+non-string object keys, and non-finite numbers fail closed. Arrays retain their order; the
+projector canonicalizes every set-like entity and diagnostic collection before hashing.
+
+This include-by-default rule binds `schemaVersion`, `vocabularyVersion`, facet and authority
+definitions, every entity field and parent, every raw and normalized facet value, every
+diagnostic, `degraded`, and the consistency contract. Vocabulary meaning changes therefore
+require a `vocabularyVersion` change. Future public semantic fields automatically join the
+domain unless a later identity-domain version explicitly classifies observation metadata as
+non-semantic.
+
+`sourceWatermarks` remains visible as observation diagnostics but is deliberately excluded.
+Moving only `factoryEventRowid`, `memorySequence`, or another source observation does not alter
+the semantic bytes or digest. Conversely, watermark equality says nothing about semantic
+equality; clients compare `semanticSha256` only when they want this exact projection meaning.
+The helper never removes fields from its caller, and the projector snapshots JSON values before
+attaching the identity so later mutation of input containers cannot invalidate the returned
+projection. Mutating a returned semantic field is detectable because the verifier then fails.
+
 Each entity has six orthogonal facets:
 
 | Facet | Question answered | Representative normalized states |
@@ -89,9 +126,15 @@ transaction, and v1 does not claim an atomic revision across those two stores. T
 `sourceWatermarks` object reports the independently observed run-scoped maximum Factory event
 rowid and project-memory sequence. They are diagnostic source positions only: other ledger
 tables can change without either value changing, so watermark equality **must not** be used as
-full projection identity, an ETag, or a change-detection cursor. A complete ledger revision or
-content identity and incremental fold remain deferred. Clients obtain current state by
-fetching and replacing the complete versioned projection.
+full projection identity, an ETag, or a change-detection cursor.
+
+`semanticSha256` identifies only the outcome meaning present in one completed full-fold response.
+It does **not** claim an atomic revision across SQLite and project memory, identify every ledger
+table or run-snapshot field, bind unprojected proof bytes, replace artifact digests, or certify
+that two observations read the sources at the same instant. Because it excludes observation
+metadata and carries no HTTP cache semantics, it is not advertised as an ETag or incremental
+cursor. A cross-store revision and incremental fold remain deferred. Clients obtain current
+state by fetching and replacing the complete versioned projection.
 
 This first slice does not migrate Mission Control, exports, notifications, or reports. Those
 consumers continue using their backward-compatible fields while parity is established.

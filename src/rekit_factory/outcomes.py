@@ -7,11 +7,22 @@ ledger rows, replayed project memory, and dossier publication facts.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
+import math
+import re
 from typing import Any, Iterable, Mapping
 
 
 SCHEMA_VERSION = 1
 VOCABULARY_VERSION = "factory-outcomes/v1"
+SEMANTIC_IDENTITY_DOMAIN = "factory-outcomes/semantic-sha256/v1"
+SEMANTIC_IDENTITY_FIELD = "semanticSha256"
+_NONSEMANTIC_TOP_LEVEL_FIELDS = frozenset({
+    SEMANTIC_IDENTITY_FIELD, "sourceWatermarks",
+})
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 FACETS = (
     "execution", "completion", "disposition", "validation", "acceptance", "publication",
 )
@@ -56,6 +67,71 @@ _ACCEPTANCE = {"accepted": "accepted", "rejected": "rejected", "waived": "waived
 _DOSSIER_VALIDATION = {
     "verified": "verified", "stale-or-invalid": "stale",
 }
+
+
+def _json_snapshot(value: Any, *, path: str = "$") -> Any:
+    """Copy an exact JSON value while rejecting Python-only or non-finite values."""
+    if value is None or type(value) in {bool, str, int}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} contains a non-finite JSON number")
+        return value
+    if type(value) is list:
+        return [
+            _json_snapshot(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise TypeError(f"{path} contains a non-string JSON object key")
+        return {
+            key: _json_snapshot(value[key], path=f"{path}.{key}")
+            for key in sorted(value)
+        }
+    raise TypeError(f"{path} contains non-JSON value {type(value).__name__}")
+
+
+def canonical_outcome_semantic_bytes(projection: Mapping[str, Any]) -> bytes:
+    """Return the v1 canonical semantic byte domain for a public outcome projection.
+
+    The identity field and independently observed source watermarks are non-semantic and
+    excluded. Every other present top-level field is included by default so future public
+    semantic additions cannot accidentally escape the digest.
+    """
+    if type(projection) is not dict:
+        raise TypeError("outcome projection must be a JSON object")
+    if any(type(key) is not str for key in projection):
+        raise TypeError("outcome projection contains a non-string JSON object key")
+    semantic_projection = {
+        key: _json_snapshot(projection[key], path=f"$.{key}")
+        for key in sorted(projection)
+        if key not in _NONSEMANTIC_TOP_LEVEL_FIELDS
+    }
+    envelope = {
+        "domain": SEMANTIC_IDENTITY_DOMAIN,
+        "projection": semantic_projection,
+    }
+    return json.dumps(
+        envelope, allow_nan=False, ensure_ascii=False, separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def outcome_semantic_sha256(projection: Mapping[str, Any]) -> str:
+    """Recompute the lowercase semantic SHA-256 from a public projection."""
+    return hashlib.sha256(canonical_outcome_semantic_bytes(projection)).hexdigest()
+
+
+def verify_outcome_semantic_sha256(projection: Mapping[str, Any]) -> bool:
+    """Fail closed unless the public projection carries its recomputed semantic identity."""
+    if type(projection) is not dict:
+        raise TypeError("outcome projection must be a JSON object")
+    claimed = projection.get(SEMANTIC_IDENTITY_FIELD)
+    if not isinstance(claimed, str) or _SHA256.fullmatch(claimed) is None:
+        return False
+    return hmac.compare_digest(claimed, outcome_semantic_sha256(projection))
+
 
 def _na(owner: str) -> dict[str, Any]:
     return {**_NA, "owner": owner}
@@ -352,7 +428,7 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
         value.get("entityType", ""), value.get("entityId", ""), value.get("facet", ""),
         value.get("code", ""), str(value.get("raw", "")),
     ))
-    return {
+    projection = {
         "schemaVersion": SCHEMA_VERSION,
         "vocabularyVersion": VOCABULARY_VERSION,
         "facets": list(FACETS),
@@ -368,3 +444,9 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
             "incrementalProjection": "deferred",
         },
     }
+    # Snapshot first so mutable canonical inputs cannot change the returned meaning after
+    # the identity is computed. The returned object remains ordinary public JSON; a caller
+    # mutation is intentionally detectable by the standalone verifier.
+    detached = _json_snapshot(projection)
+    detached[SEMANTIC_IDENTITY_FIELD] = outcome_semantic_sha256(detached)
+    return detached
