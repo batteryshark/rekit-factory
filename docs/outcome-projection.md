@@ -37,7 +37,7 @@ history to repair an unknown state.
 | `muster` | Durable work-item execution and completion |
 | `factory-scheduler` | Run and worker execution/completion |
 | `validator-policy` | Hypothesis, finding, and reproduction conclusions |
-| `rekit-tool-result` | The result-based disposition of a Rekit-backed work item only |
+| `rekit-tool-result` | Reserved for a future distinct, authoritative Rekit result entity |
 | `operator` | Answers and explicit acceptance, rejection, or waiver |
 | `factory-dossier-publisher` | Transactional proof-bundle publication presence |
 | `offline-proof-verifier` | Current byte, scope, manifest, and trust-anchor validity |
@@ -45,8 +45,8 @@ history to repair an unknown state.
 Authority is facet-local. In particular:
 
 - a completed worker or work item never makes its run complete or successful;
-- Muster owns every durable work-item execution and completion transition, including
-  Rekit-backed work; the canonical Rekit result may own only that item's disposition;
+- Muster owns every execution, completion, and disposition facet derived from a durable
+  work-item status, including Rekit-backed work. Operation names do not prove result authority;
 - a rendered report never makes a finding demonstrated, reproduced, or accepted;
 - a successful reproduction attempt never directly changes its parent finding facet;
 - a proof-bundle publication changes only publication; it does not imply verification;
@@ -68,23 +68,30 @@ The generic/SSE snapshot deliberately uses the cheap `dossier_list` publication 
 Every listed dossier therefore has `publication.state: published`, owned by the dossier
 publisher, regardless of its current verification result. Publication never becomes
 `verified` or `stale`. The cheap projection does **not** read and re-verify dossier bytes, so
-its bundles have `validation.state: unknown` and `validation.known: false`. The dedicated
-dossier route supplies explicit `verified` or `stale-or-invalid` facts to the verifier-owned
-validation facet. The high-frequency snapshot never guesses validity and never pays the
-byte-verification cost.
+its bundles have `validation.state: unknown` and `validation.known: false`. The pure projector
+can accept explicit `verified` or `stale-or-invalid` facts and place them only in the
+verifier-owned validation facet. No production `outcomeProjection` route supplies those facts
+in this slice: the dedicated dossier route verifies bundles but does not invoke the outcome
+projector. Wiring that route into a verified outcome projection is deferred. The
+high-frequency snapshot never guesses validity and never pays the byte-verification cost.
 
 ## Consistency boundary
 
-The projector observes only data that is already visible in the canonical stores. Its
-`consistency.cursor` combines the run-scoped maximum SQLite event `rowid` with the replayed
-project-memory sequence. The row ID is monotonic and remains unambiguous when event timestamps
-tie; opaque event UUIDs are identities, not cursors. `mode: full-fold` and
-`replaceOnReconnect: true` make the v1 convergence contract explicit; an incremental
-projector is deferred until it can prove parity with this fold. Dossier artifacts and their
-`dossier.published` event are committed in one SQLite transaction, so a
-published outcome cannot precede its artifact references. Project-memory replay supplies the
-full fold; there is no incremental derived cache. Polling clients and SSE reconnects converge
-by fetching the canonical snapshot and replacing the versioned projection for that run.
+Every SQLite-backed field in a run snapshot is read under one explicit SQLite read
+transaction. That includes the run, work, workers, questions, model/tool/session rows,
+artifacts, dossier publication rows, knowledge references, coverage, events, and the event
+rowid watermark. Dossier artifacts and their `dossier.published` event are themselves written
+in one transaction, so a response cannot expose the dossier publication without the
+same-response artifact rows (or vice versa).
+
+Project memory is a separately fsynced JSONL source. It is replayed outside the SQLite read
+transaction, and v1 does not claim an atomic revision across those two stores. The
+`sourceWatermarks` object reports the independently observed run-scoped maximum Factory event
+rowid and project-memory sequence. They are diagnostic source positions only: other ledger
+tables can change without either value changing, so watermark equality **must not** be used as
+full projection identity, an ETag, or a change-detection cursor. A complete ledger revision or
+content identity and incremental fold remain deferred. Clients obtain current state by
+fetching and replacing the complete versioned projection.
 
 This first slice does not migrate Mission Control, exports, notifications, or reports. Those
 consumers continue using their backward-compatible fields while parity is established.

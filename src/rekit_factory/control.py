@@ -426,55 +426,71 @@ class InvestigationController:
             return self._snapshot_open(ledger, paths)
 
     def _snapshot_open(self, ledger: FactoryLedger, paths: RunPaths) -> dict[str, Any]:
-        run = ledger.get_run(paths.run_id)
-        work_rows = ledger.conn.execute(
-            "select * from work_items where run_id=? order by priority desc, created_at",
-            (paths.run_id,),
-        ).fetchall()
-        work = []
-        for row in work_rows:
-            item = dict(row)
-            for source, target in (
-                ("payload_json", "payload"),
-                ("depends_on_json", "dependsOn"),
-                ("result_json", "result"),
-            ):
-                raw = item.pop(source)
-                item[target] = json.loads(raw) if raw else None
-            if item["payload"]:
-                item["payload"] = _redact_intent(item["payload"])
-            work.append(item)
-        artifacts = [dict(row) for row in ledger.conn.execute(
-            "select * from artifacts where run_id=? order by created_at", (paths.run_id,)
-        ).fetchall()]
+        # Project memory is a separately fsynced JSONL source. Replay it before opening the
+        # SQLite read transaction and expose both source watermarks without claiming they form
+        # one atomic cross-source revision.
         project_memory = _project_memory_log(paths).replay()
         memory_projection = project_memory.deterministic_dict()
-        # Publication presence is cheap canonical state.  Byte-level dossier verification is
-        # intentionally reserved for the dedicated dossier route and is never inferred here.
-        dossiers = dossier_list(ledger, paths.run_id)
-        pending_questions = ledger.pending_questions(paths.run_id)
-        workers = ledger.workers(paths.run_id)
-        events = ledger.events(paths.run_id)
-        event_cursor_row = ledger.conn.execute(
-            "select coalesce(max(rowid), 0) as cursor from factory_events where run_id=?",
-            (paths.run_id,),
-        ).fetchone()
+        meta = _read_meta(paths)
+        if ledger.conn.in_transaction:
+            raise RuntimeError("snapshot requires a clean ledger connection")
+        ledger.conn.execute("begin")
+        try:
+            run = ledger.get_run(paths.run_id)
+            work_rows = ledger.conn.execute(
+                "select * from work_items where run_id=? order by priority desc, created_at",
+                (paths.run_id,),
+            ).fetchall()
+            work = []
+            for row in work_rows:
+                item = dict(row)
+                for source, target in (
+                    ("payload_json", "payload"),
+                    ("depends_on_json", "dependsOn"),
+                    ("result_json", "result"),
+                ):
+                    raw = item.pop(source)
+                    item[target] = json.loads(raw) if raw else None
+                if item["payload"]:
+                    item["payload"] = _redact_intent(item["payload"])
+                work.append(item)
+            artifacts = [dict(row) for row in ledger.conn.execute(
+                "select * from artifacts where run_id=? order by created_at", (paths.run_id,)
+            ).fetchall()]
+            # Publication presence is cheap canonical state. Byte-level verification is not
+            # performed or inferred by the high-frequency snapshot.
+            dossiers = dossier_list(ledger, paths.run_id)
+            pending_questions = ledger.pending_questions(paths.run_id)
+            workers = ledger.workers(paths.run_id)
+            events = ledger.events(paths.run_id)
+            event_watermark_row = ledger.conn.execute(
+                "select coalesce(max(rowid), 0) as watermark "
+                "from factory_events where run_id=?", (paths.run_id,),
+            ).fetchone()
+            coverage = ledger.coverage(paths.run_id)
+            model_calls = ledger.model_calls(paths.run_id)
+            worker_sessions = ledger.worker_sessions(paths.run_id)
+            tool_calls = ledger.tool_calls(paths.run_id)
+            knowledge_references = ledger.knowledge_references(paths.run_id)
+        finally:
+            # End the read snapshot without implying a write commit.
+            ledger.conn.rollback()
         return {
             "run": dict(run) if run is not None else None,
-            "meta": _read_meta(paths),
-            "coverage": ledger.coverage(paths.run_id),
+            "meta": meta,
+            "coverage": coverage,
             "workers": workers,
             "workItems": work,
             "events": events,
             "pendingQuestions": pending_questions,
-            "modelCalls": ledger.model_calls(paths.run_id),
+            "modelCalls": model_calls,
             "workerSessions": [
                 {**session,
                  "pendingCalls": [_redact_intent(call)
                                   for call in session.get("pendingCalls", [])]}
-                for session in ledger.worker_sessions(paths.run_id)
+                for session in worker_sessions
             ],
-            "toolCalls": ledger.tool_calls(paths.run_id),
+            "toolCalls": tool_calls,
             "artifacts": artifacts,
             "memory": memory_projection,
             "memoryContext": memory_context(project_memory),
@@ -490,12 +506,12 @@ class InvestigationController:
                 memory=memory_projection,
                 dossiers=dossiers,
                 pending_questions=pending_questions,
-                cursor={
-                    "factoryEventRowid": int(event_cursor_row["cursor"]),
+                source_watermarks={
+                    "factoryEventRowid": int(event_watermark_row["watermark"]),
                     "memorySequence": project_memory.last_seq,
                 },
             ),
-            "knowledgeReferences": ledger.knowledge_references(paths.run_id),
+            "knowledgeReferences": knowledge_references,
         }
 
     async def _tool_handler(self, ctx, item: dict[str, Any]) -> None:

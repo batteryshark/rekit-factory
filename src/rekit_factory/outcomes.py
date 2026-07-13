@@ -20,7 +20,7 @@ AUTHORITIES = {
     "muster": "Muster owns durable work-item execution and completion transitions.",
     "factory-scheduler": "The Factory scheduler owns run and worker execution transitions.",
     "validator-policy": "Validator policy owns hypothesis, finding, and reproduction conclusions.",
-    "rekit-tool-result": "A Rekit result may own only a Rekit-backed work item's disposition.",
+    "rekit-tool-result": "Reserved for a future authoritative Rekit result entity.",
     "operator": "The operator owns explicit acceptance, rejection, waiver, and answers.",
     "factory-dossier-publisher": "The Factory dossier publisher owns transactional publication.",
     "offline-proof-verifier": "The offline proof verifier owns current bundle validity.",
@@ -128,12 +128,22 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
                      memory: Mapping[str, Any],
                      dossiers: Iterable[Mapping[str, Any]],
                      pending_questions: Iterable[Mapping[str, Any]],
-                     cursor: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                     source_watermarks: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return the complete v1 projection from canonical, already-redacted inputs."""
     entities: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     run_id = str((run or {}).get("id", "missing-run"))
     run_parent = {"entityType": "run", "entityId": run_id}
+    memory_diagnostics = sorted({str(value) for value in memory.get("diagnostics") or []})
+    if memory.get("degraded") and not memory_diagnostics:
+        memory_diagnostics = ["Project-memory replay reported degraded state without detail."]
+    diagnostics.extend({
+        "code": "project-memory-source-degraded",
+        "entityType": "project-memory",
+        "entityId": run_id,
+        "source": "project-memory",
+        "message": message,
+    } for message in memory_diagnostics)
 
     if run is None:
         diagnostics.append({
@@ -179,11 +189,9 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
     for work in work_items:
         item = _entity("work-item", work.get("id", "missing-work"), parent=run_parent)
         raw = work.get("status")
-        # Muster owns the durable work row. Rekit may own only the result-based disposition.
+        # All three facets are derived from Muster's durable status. A future separate result
+        # entity may assign narrower authority to an explicitly attested Rekit result.
         owner = "muster"
-        disposition_owner = (
-            "rekit-tool-result" if work.get("operation") == "rekit-tool" else "muster"
-        )
         work_terminal = {"done", "failed", "cancelled", "canceled"}
         _set(item, "execution", raw, _WORK_EXECUTION, terminal_raw=work_terminal,
              owner=owner, diagnostics=diagnostics)
@@ -195,7 +203,7 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
             "queued": "deferred", "running": "deferred", "blocked": "blocked",
             "done": "successful", "failed": "failed", "cancelled": "cancelled",
             "canceled": "cancelled",
-        }, terminal_raw=work_terminal, owner=disposition_owner, entity=item,
+        }, terminal_raw=work_terminal, owner=owner, entity=item,
                      diagnostics=diagnostics)
         entities.append(item)
 
@@ -352,9 +360,11 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
         "entities": entities,
         "diagnostics": diagnostics,
         "degraded": bool(diagnostics),
+        "sourceWatermarks": dict(source_watermarks or {}),
         "consistency": {
-            "mode": "full-fold", "cursor": dict(cursor or {}),
-            "source": "committed-canonical-state", "replaceOnReconnect": True,
+            "mode": "full-fold", "ledgerRead": "single-read-transaction",
+            "projectMemoryRead": "external-replay",
+            "watermarksAreProjectionIdentity": False,
             "incrementalProjection": "deferred",
         },
     }

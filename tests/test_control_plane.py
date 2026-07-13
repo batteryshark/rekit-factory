@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -13,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from rekit_factory.api import FactoryServer, _after
 from rekit_factory.control import InvestigationController, RunRequest
+from rekit_factory.dossiers import dossier_list as canonical_dossier_list
 from rekit_factory.evidence import EvidenceStore, Provenance, hash_target
 from rekit_factory.models import (
     DeferredModelToolCall,
@@ -586,16 +588,19 @@ class ControlPlaneTests(unittest.TestCase):
                     "factory-outcomes/v1", launched["outcomeProjection"]["vocabularyVersion"]
                 )
                 self.assertIsInstance(
-                    launched["outcomeProjection"]["consistency"]["cursor"]["factoryEventRowid"],
-                    int,
+                    launched["outcomeProjection"]["sourceWatermarks"]["factoryEventRowid"], int,
                 )
-                with FactoryLedger(Path(launched["runDir"]) / "run.db") as cursor_ledger:
-                    expected_cursor = cursor_ledger.conn.execute(
+                self.assertFalse(
+                    launched["outcomeProjection"]["consistency"]
+                    ["watermarksAreProjectionIdentity"]
+                )
+                with FactoryLedger(Path(launched["runDir"]) / "run.db") as watermark_ledger:
+                    current_watermark = watermark_ledger.conn.execute(
                         "select max(rowid) from factory_events where run_id=?", (run_id,),
                     ).fetchone()[0]
                 self.assertLessEqual(
-                    launched["outcomeProjection"]["consistency"]["cursor"]["factoryEventRowid"],
-                    expected_cursor,
+                    launched["outcomeProjection"]["sourceWatermarks"]["factoryEventRowid"],
+                    current_watermark,
                 )
                 suspended = self._wait_status(base, run_id, "needs_input")
                 self.assertEqual(1, len(suspended["pendingQuestions"]))
@@ -663,6 +668,79 @@ class ControlPlaneTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+    def test_snapshot_uses_one_ledger_read_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend()
+            )
+            run_dir = controller.create(RunRequest(
+                target=target, goal="Capture one untorn ledger snapshot", worker_roles=("analyst",)
+            ))
+            run_id = resolve_run_dir(run_dir).run_id
+            inserted = threading.Event()
+            committed = threading.Event()
+            writer_errors = []
+
+            def publish_concurrently():
+                try:
+                    connection = sqlite3.connect(run_dir / "run.db", timeout=5)
+                    connection.execute("begin immediate")
+                    metadata = json.dumps({
+                        "dossierId": "dossier-concurrent", "findingId": "finding-concurrent",
+                        "manifestSha256": "a" * 64, "findingStateSha256": "b" * 64,
+                        "verdict": "SUPPORTED", "findingStatus": "reproduced",
+                        "artifactIds": {"proof-bundle": "artifact-concurrent"},
+                    }, sort_keys=True)
+                    connection.execute(
+                        "insert into artifacts "
+                        "(id,run_id,kind,path,logical_path,sha256,size_bytes,media_type,"
+                        "language,origin,metadata_json,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("artifact-concurrent", run_id, "proof-bundle", str(target),
+                         "dossier/proof.json", "c" * 64, 1, "application/json", None,
+                         "proof-dossier", metadata, "2026-07-13T08:40:00Z"),
+                    )
+                    connection.execute(
+                        "insert into factory_events "
+                        "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                        "values (?,?,?,?,?,?,?)",
+                        ("event-concurrent", run_id, None, "dossier.published",
+                         "Concurrent dossier published", "{}", "2026-07-13T08:40:00Z"),
+                    )
+                    inserted.set()
+                    connection.commit()
+                    committed.set()
+                    connection.close()
+                except Exception as exc:  # pragma: no cover - asserted below
+                    writer_errors.append(exc)
+                    inserted.set()
+
+            writer = None
+
+            def dossier_read(read_ledger, selected_run_id, **kwargs):
+                nonlocal writer
+                self.assertTrue(read_ledger.conn.in_transaction)
+                writer = threading.Thread(target=publish_concurrently, daemon=True)
+                writer.start()
+                self.assertTrue(inserted.wait(timeout=2))
+                self.assertFalse(committed.is_set())
+                return canonical_dossier_list(read_ledger, selected_run_id, **kwargs)
+
+            with patch("rekit_factory.control.dossier_list", side_effect=dossier_read):
+                before = controller.snapshot(run_dir)
+            self.assertIsNotNone(writer)
+            writer.join(timeout=5)
+            self.assertFalse(writer.is_alive())
+            self.assertEqual([], writer_errors)
+            self.assertNotIn("artifact-concurrent", {item["id"] for item in before["artifacts"]})
+            self.assertEqual([], before["dossiers"])
+
+            after = controller.snapshot(run_dir)
+            self.assertIn("artifact-concurrent", {item["id"] for item in after["artifacts"]})
+            self.assertEqual("dossier-concurrent", after["dossiers"][0]["id"])
+            self.assertEqual("single-read-transaction",
+                             after["outcomeProjection"]["consistency"]["ledgerRead"])
 
     def test_general_direction_answer_is_bounded_and_durable(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,7 +5,8 @@ import json
 from rekit_factory.outcomes import project_outcomes
 
 
-def _project(*, run_status="queued", workers=(), work=(), memory=None, dossiers=(), questions=()):
+def _project(*, run_status="queued", workers=(), work=(), memory=None, dossiers=(), questions=(),
+             source_watermarks=None):
     return project_outcomes(
         run={"id": "run-1", "status": run_status},
         workers=workers,
@@ -13,6 +14,7 @@ def _project(*, run_status="queued", workers=(), work=(), memory=None, dossiers=
         memory=memory or {},
         dossiers=dossiers,
         pending_questions=questions,
+        source_watermarks=source_watermarks,
     )
 
 
@@ -133,7 +135,11 @@ def test_publication_and_explicit_verification_remain_orthogonal():
 
 def test_authority_is_explicit_for_every_facet():
     projection = _project(
-        work=[{"id": "tool-work", "status": "done", "operation": "rekit-tool"}],
+        work=[
+            {"id": "tool-queued", "status": "queued", "operation": "rekit-tool"},
+            {"id": "tool-blocked", "status": "blocked", "operation": "rekit-tool"},
+            {"id": "tool-failed", "status": "failed", "operation": "rekit-tool"},
+        ],
         questions=[{"id": "question-1"}],
     )
     assert set(projection["authorities"]) == {
@@ -144,10 +150,34 @@ def test_authority_is_explicit_for_every_facet():
         assert set(entity["facets"]) == set(projection["facets"])
         assert all(facet["owner"] in projection["authorities"]
                    for facet in entity["facets"].values())
-    tool = _entity(projection, "work-item", "tool-work")
-    assert tool["facets"]["execution"]["owner"] == "muster"
-    assert tool["facets"]["completion"]["owner"] == "muster"
-    assert tool["facets"]["disposition"]["owner"] == "rekit-tool-result"
+    for work_id in ("tool-queued", "tool-blocked", "tool-failed"):
+        tool = _entity(projection, "work-item", work_id)
+        assert tool["facets"]["execution"]["owner"] == "muster"
+        assert tool["facets"]["completion"]["owner"] == "muster"
+        assert tool["facets"]["disposition"]["owner"] == "muster"
+
+
+def test_degraded_project_memory_diagnostics_are_propagated_deterministically():
+    projection = _project(memory={
+        "degraded": True,
+        "diagnostics": ["sequence discontinuity: expected 2, found 4", "bad record", "bad record"],
+    })
+
+    source = [item for item in projection["diagnostics"]
+              if item["code"] == "project-memory-source-degraded"]
+    assert projection["degraded"] is True
+    assert [item["message"] for item in source] == [
+        "bad record", "sequence discontinuity: expected 2, found 4",
+    ]
+    assert all(item["source"] == "project-memory" for item in source)
+
+
+def test_source_watermarks_are_not_exposed_as_projection_identity():
+    projection = _project(source_watermarks={"factoryEventRowid": 19, "memorySequence": 7})
+
+    assert projection["sourceWatermarks"] == {"factoryEventRowid": 19, "memorySequence": 7}
+    assert projection["consistency"]["watermarksAreProjectionIdentity"] is False
+    assert "cursor" not in projection["consistency"]
 
 
 def test_dangling_parent_is_diagnostic_and_does_not_create_parent_state():
