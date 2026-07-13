@@ -138,7 +138,7 @@ def test_invalid_or_unsupported_projection_is_rejected_before_policy_evaluation(
     tampered = deepcopy(good)
     tampered["entities"][0]["entityId"] = "run-tampered"
     unsupported = deepcopy(good)
-    unsupported["vocabularyVersion"] = "factory-outcomes/v2"
+    unsupported["vocabularyVersion"] = "factory-outcomes/v3"
 
     with pytest.raises(InvalidOutcomeProjection, match="identity"):
         notification_candidates(good, tampered)

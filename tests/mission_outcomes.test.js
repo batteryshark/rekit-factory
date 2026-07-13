@@ -10,8 +10,8 @@ const {
 
 const empty = {
   schemaVersion: 1,
-  vocabularyVersion: "factory-outcomes/v1",
-  facets: [],
+  vocabularyVersion: "factory-outcomes/v2",
+  facets: ["execution", "completion", "disposition", "validation", "acceptance", "publication", "coverage", "archival"],
   authorities: {},
   entities: [],
   diagnostics: [],
@@ -19,13 +19,13 @@ const empty = {
   sourceWatermarks: {factoryEventRowid: 9},
   consistency: {mode: "full-fold"},
 };
-const expectedText = "{\"domain\":\"factory-outcomes/semantic-sha256/v1\",\"projection\":{\"authorities\":{},\"consistency\":{\"mode\":\"full-fold\"},\"degraded\":false,\"diagnostics\":[],\"entities\":[],\"facets\":[],\"schemaVersion\":1,\"vocabularyVersion\":\"factory-outcomes/v1\"}}";
-const expectedDigest = "c422738c6fc7f207cb5ea7f296181c6a777c06c286eb0c13d93fc98b7af4f444";
-const expectedBase64 = "eyJkb21haW4iOiJmYWN0b3J5LW91dGNvbWVzL3NlbWFudGljLXNoYTI1Ni92MSIsInByb2plY3Rpb24iOnsiYXV0aG9yaXRpZXMiOnt9LCJjb25zaXN0ZW5jeSI6eyJtb2RlIjoiZnVsbC1mb2xkIn0sImRlZ3JhZGVkIjpmYWxzZSwiZGlhZ25vc3RpY3MiOltdLCJlbnRpdGllcyI6W10sImZhY2V0cyI6W10sInNjaGVtYVZlcnNpb24iOjEsInZvY2FidWxhcnlWZXJzaW9uIjoiZmFjdG9yeS1vdXRjb21lcy92MSJ9fQ==";
+const expectedText = "{\"domain\":\"factory-outcomes/semantic-sha256/v1\",\"projection\":{\"authorities\":{},\"consistency\":{\"mode\":\"full-fold\"},\"degraded\":false,\"diagnostics\":[],\"entities\":[],\"facets\":[\"execution\",\"completion\",\"disposition\",\"validation\",\"acceptance\",\"publication\",\"coverage\",\"archival\"],\"schemaVersion\":1,\"vocabularyVersion\":\"factory-outcomes/v2\"}}";
+const expectedDigest = "fa9c207e4467b35c2cf5971cfe8544218e625992b5e9846ba8f193ac624f2d7a";
+const expectedBase64 = "eyJkb21haW4iOiJmYWN0b3J5LW91dGNvbWVzL3NlbWFudGljLXNoYTI1Ni92MSIsInByb2plY3Rpb24iOnsiYXV0aG9yaXRpZXMiOnt9LCJjb25zaXN0ZW5jeSI6eyJtb2RlIjoiZnVsbC1mb2xkIn0sImRlZ3JhZGVkIjpmYWxzZSwiZGlhZ25vc3RpY3MiOltdLCJlbnRpdGllcyI6W10sImZhY2V0cyI6WyJleGVjdXRpb24iLCJjb21wbGV0aW9uIiwiZGlzcG9zaXRpb24iLCJ2YWxpZGF0aW9uIiwiYWNjZXB0YW5jZSIsInB1YmxpY2F0aW9uIiwiY292ZXJhZ2UiLCJhcmNoaXZhbCJdLCJzY2hlbWFWZXJzaW9uIjoxLCJ2b2NhYnVsYXJ5VmVyc2lvbiI6ImZhY3Rvcnktb3V0Y29tZXMvdjIifX0=";
 // Generated once from Python's exact ensure_ascii=False, sort_keys=True canonical bytes.
 // It intentionally contains 2.0, 1e-07, integer-like keys, BMP, and astral Unicode keys.
-const vectorBase64 = "eyJkb21haW4iOiJmYWN0b3J5LW91dGNvbWVzL3NlbWFudGljLXNoYTI1Ni92MSIsInByb2plY3Rpb24iOnsiYXV0aG9yaXRpZXMiOnt9LCJjb25zaXN0ZW5jeSI6eyJtb2RlIjoiZnVsbC1mb2xkIn0sImRlZ3JhZGVkIjp0cnVlLCJkaWFnbm9zdGljcyI6W3siY29kZSI6InZlY3RvciIsInJhdyI6eyIxMCI6MSwiMiI6Mi4wLCJmbG9hdCI6MWUtMDcsInVuaWNvZGUiOnsi7oCAIjoiYm1wIiwi8JCAgCI6ImFzdHJhbCJ9fX1dLCJlbnRpdGllcyI6W10sImZhY2V0cyI6W10sInNjaGVtYVZlcnNpb24iOjEsInZvY2FidWxhcnlWZXJzaW9uIjoiZmFjdG9yeS1vdXRjb21lcy92MSJ9fQ==";
-const vectorDigest = "eb163ebba1e9e2a538309156be1c2d8099c0f5f0c120b0d0b179587b09d8e970";
+const vectorBase64 = "eyJkb21haW4iOiJmYWN0b3J5LW91dGNvbWVzL3NlbWFudGljLXNoYTI1Ni92MSIsInByb2plY3Rpb24iOnsiYXV0aG9yaXRpZXMiOnt9LCJjb25zaXN0ZW5jeSI6eyJtb2RlIjoiZnVsbC1mb2xkIn0sImRlZ3JhZGVkIjp0cnVlLCJkaWFnbm9zdGljcyI6W3siY29kZSI6InZlY3RvciIsInJhdyI6eyIxMCI6MSwiMiI6Mi4wLCJmbG9hdCI6MWUtMDcsInVuaWNvZGUiOnsi7oCAIjoiYm1wIiwi8JCAgCI6ImFzdHJhbCJ9fX1dLCJlbnRpdGllcyI6W10sImZhY2V0cyI6WyJleGVjdXRpb24iLCJjb21wbGV0aW9uIiwiZGlzcG9zaXRpb24iLCJ2YWxpZGF0aW9uIiwiYWNjZXB0YW5jZSIsInB1YmxpY2F0aW9uIiwiY292ZXJhZ2UiLCJhcmNoaXZhbCJdLCJzY2hlbWFWZXJzaW9uIjoxLCJ2b2NhYnVsYXJ5VmVyc2lvbiI6ImZhY3Rvcnktb3V0Y29tZXMvdjIifX0=";
+const vectorDigest = "c729a9967a4f6a06cf1ec2ce1ed357d8e017f485a422d61a61b5011d5ba0ecbc";
 
 const facet = (state, owner, {known = true, terminal = false, rawState = state} = {}) => ({
   rawState, state, known, terminal, owner,
@@ -40,6 +40,8 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
     validation: values.validation || na("validator-policy"),
     acceptance: values.acceptance || na("operator"),
     publication: values.publication || na("factory-dossier-publisher"),
+    coverage: values.coverage || na("muster"),
+    archival: values.archival || na("operator"),
   },
   diagnostics,
 });
@@ -75,6 +77,13 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
       acceptance: facet("accepted", "operator", {terminal: true}),
       publication: facet("published", "factory-dossier-publisher", {terminal: true}),
     }, {entityType: "run", entityId: "missing-run"}, [{code: "dangling-parent"}]),
+    entity("campaign", "campaign-1", {
+      execution: facet("active", "factory-scheduler", {rawState: "active"}),
+      coverage: facet("covered", "muster", {terminal: true, rawState: "covered"}),
+    }),
+    entity("archive", "archive-1", {
+      archival: facet("archived", "operator", {terminal: true, rawState: "archived"}),
+    }, {entityType: "campaign", entityId: "campaign-1"}),
     entity("proof-bundle", "proof-1", {
       validation: facet("verified", "offline-proof-verifier", {terminal: true}),
       publication: facet("published", "factory-dossier-publisher", {terminal: true}),
@@ -86,13 +95,18 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
   const projected = {...empty, entities, degraded: true, diagnostics: [{code: "dangling-parent"}]};
   const all = projectionView(projected);
   assert.deepEqual(all.counts, {
-    total: 5, shown: 5, terminal: 3, unknown: 1, degraded: 1,
-    types: {run: 1, worker: 1, finding: 1, "proof-bundle": 1, "operator-decision": 1},
+    total: 7, shown: 7, terminal: 5, unknown: 1, degraded: 1,
+    types: {run: 1, worker: 1, finding: 1, campaign: 1, archive: 1, "proof-bundle": 1, "operator-decision": 1},
   });
   assert.deepEqual(projectionView(projected, {type: "finding"}).entities.map(item => item.entityId), ["finding-unknown"]);
   assert.deepEqual(projectionView(projected, {state: "accepted"}).entities.map(item => item.entityId), ["finding-unknown"]);
   assert.deepEqual(projectionView(projected, {owner: "offline-proof-verifier"}).entities.map(item => item.entityId), ["proof-1"]);
   assert.deepEqual(projectionView(projected, {terminal: "nonterminal"}).entities.map(item => item.entityId), ["run-1", "decision-1"], "not-applicable terminal facets do not promote an entity");
+  assert.deepEqual(projectionView(projected, {state: "covered"}).entities.map(item => item.entityId), ["campaign-1"]);
+  assert.deepEqual(projectionView(projected, {state: "archived"}).entities.map(item => item.entityId), ["archive-1"]);
+  assert.equal(entities[3].facets.completion.state, "not-applicable", "coverage never derives campaign completion");
+  assert.equal(entities[3].facets.disposition.state, "not-applicable", "coverage never derives campaign success");
+  assert.equal(entities[4].facets.publication.state, "not-applicable", "archival is not report publication");
   assert.deepEqual(projectionView(projected, {query: "missing-run"}).entities.map(item => item.entityId), ["finding-unknown"]);
   assert.deepEqual(projectionView(projected, {query: "future-state"}).entities.map(item => item.entityId), ["finding-unknown"]);
 
@@ -101,8 +115,10 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
   assert.equal(projectionView(large, {query: "work-249"}).counts.shown, 1);
 
   assert.deepEqual(canonicalLink(entities[0]), {tab: "activity", label: "Open activity"});
-  assert.deepEqual(canonicalLink(entities[3]), {tab: "dossiers", label: "Open dossiers"});
-  assert.deepEqual(canonicalLink(entities[4]), {tab: "decisions", label: "Open decisions"});
+  assert.deepEqual(canonicalLink(entities[3]), {tab: "activity", label: "Open campaign activity"});
+  assert.deepEqual(canonicalLink(entities[4]), {tab: "activity", label: "Open archive activity"});
+  assert.deepEqual(canonicalLink(entities[5]), {tab: "dossiers", label: "Open dossiers"});
+  assert.deepEqual(canonicalLink(entities[6]), {tab: "decisions", label: "Open decisions"});
   assert.equal(canonicalLink(entity("hypothesis", "hypothesis-1")), null, "no report/evidence link is invented");
 
   const tracker = createSemanticTracker();
@@ -154,6 +170,7 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
     ["execution", "not-applicable"], ["completion", "not-applicable"],
     ["disposition", "not-applicable"], ["validation", "not-applicable"],
     ["acceptance", "not-applicable"], ["publication", "rendered"],
+    ["coverage", "not-applicable"], ["archival", "not-applicable"],
   ]);
 
   console.log("mission outcomes behavior: ok");

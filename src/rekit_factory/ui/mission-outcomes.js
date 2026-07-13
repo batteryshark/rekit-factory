@@ -6,7 +6,10 @@
   else root.MissionOutcomes = api;
 })(typeof globalThis === "object" ? globalThis : this, function () {
   const DOMAIN = "factory-outcomes/semantic-sha256/v1";
-  const FACETS = ["execution", "completion", "disposition", "validation", "acceptance", "publication"];
+  const FACETS = [
+    "execution", "completion", "disposition", "validation", "acceptance", "publication",
+    "coverage", "archival",
+  ];
   const SHA256 = /^[0-9a-f]{64}$/;
 
   function canonicalValue(value, path = "$") {
@@ -222,6 +225,8 @@
   function canonicalLink(entity) {
     if (entity.entityType === "proof-bundle") return {tab: "dossiers", label: "Open dossiers"};
     if (entity.entityType === "operator-decision") return {tab: "decisions", label: "Open decisions"};
+    if (entity.entityType === "campaign") return {tab: "activity", label: "Open campaign activity"};
+    if (entity.entityType === "archive") return {tab: "activity", label: "Open archive activity"};
     if (["run", "worker", "work-item"].includes(entity.entityType)) return {tab: "activity", label: "Open activity"};
     if (entity.entityType === "finding" && entity.facets?.publication?.state === "published") {
       return {tab: "dossiers", label: "Open dossiers"};

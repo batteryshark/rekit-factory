@@ -1,7 +1,8 @@
 # Campaign coverage and archive lifecycle source contract
 
 `factory-campaign-lifecycle/v1` is the minimal durable source contract for the campaign and
-archive entities deferred by `factory-outcomes/v1`. It is not itself an outcome projection.
+archive entities deferred by `factory-outcomes/v1` and projected by `factory-outcomes/v2`. It is
+not itself an outcome projection.
 The document contains sorted campaign and archive records, exact schema/source versions, stable
 identities, positive revisions, and no timestamps or model-authored prose.
 
@@ -38,6 +39,12 @@ wrong authorities, oversized state, non-regular state files, symlinked roots/sta
 archive records whose campaign parent is absent. Serialization sorts records and object keys and
 contains no process-, locale-, time-, or insertion-order-dependent data.
 
-The store does not yet feed `project_outcomes`, the incremental outcome source envelope, the run
-API, or Mission Control. It also makes no every-boundary crash, cross-store atomicity, derived
-cache recovery, or snapshot/dossier rebuild claim; those remain separate W-0026 integration work.
+The shared full and incremental folds consume these exact records. Run snapshots and terminal
+exports observe the project lifecycle document independently of run SQLite and project-memory
+JSONL, publish its content digest as a diagnostic source watermark, and explicitly claim no
+cross-store revision. Mission Control renders only the signed canonical v2 projection; it does
+not infer coverage or archival state from run, report, finding, or dossier fields.
+
+There is not yet a public mutation endpoint or operator control for lifecycle transitions. The
+store also makes no every-boundary crash, cross-store atomicity, derived-cache recovery, or
+snapshot/dossier rebuild claim; those remain bounded W-0026 child tasks.

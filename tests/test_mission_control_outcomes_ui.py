@@ -26,11 +26,12 @@ def test_outcomes_surface_is_packaged_first_class_and_projection_only():
         assert marker in page
     for facet in (
         "execution", "completion", "disposition", "validation", "acceptance", "publication",
+        "coverage", "archival",
     ):
         assert facet in helper
     for entity_type in (
         "run", "worker", "work-item", "finding", "validation", "proof-bundle",
-        "operator-decision",
+        "operator-decision", "campaign", "archive",
     ):
         assert entity_type in script + helper
     assert "snapshot?.outcomeProjection" in script
@@ -42,6 +43,8 @@ def test_outcomes_surface_is_packaged_first_class_and_projection_only():
         assert forbidden not in outcome_slice
     assert "sourceWatermarks" not in outcome_slice
     assert "MissionOutcomes.canonicalLink(entity)" in outcome_slice
+    assert 'campaign: ["CAMPAIGN", "◎"]' in outcome_slice
+    assert 'archive: ["ARCHIVE", "▣"]' in outcome_slice
     assert "renderOutcomeProjection" in script
     assert "state.outcomes.tracker.accept" in script
     assert "semanticCanonicalBase64" in helper

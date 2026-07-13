@@ -24,6 +24,8 @@ from rekit_factory.outcomes import (
     _completion,
     _disposition,
     _entity,
+    _fold_archive,
+    _fold_campaign,
     _fold_report,
     _finalize_outcome_projection,
     _json_snapshot,
@@ -33,16 +35,18 @@ from rekit_factory.outcomes import (
 )
 
 
-SOURCE_CHANGE_VERSION = "factory-outcome-source-change/v1"
-SOURCE_SNAPSHOT_VERSION = "factory-outcome-source-state/v1"
+SOURCE_CHANGE_VERSION = "factory-outcome-source-change/v2"
+SOURCE_SNAPSHOT_VERSION = "factory-outcome-source-state/v2"
 _SOURCE_KINDS = frozenset({
     "run", "worker", "work-item", "project-memory", "dossier", "pending-decision",
+    "campaign", "archive",
 })
 _OPERATIONS = frozenset({"upsert", "remove"})
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SNAPSHOT_FIELDS = frozenset({
     "schemaVersion", "sourceVersion", "run", "workers", "workItems", "projectMemory",
-    "dossiers", "pendingDecisions", "sourceWatermarks", "sourceHeads", "changeReceipts",
+    "dossiers", "pendingDecisions", "campaigns", "archives", "sourceWatermarks",
+    "sourceHeads", "changeReceipts",
 })
 EntityKey = tuple[str, str]
 StreamKey = tuple[str, str]
@@ -73,6 +77,11 @@ def _record(value: Any, name: str) -> dict[str, Any]:
 
 def _record_id(value: Mapping[str, Any], name: str) -> str:
     return _identifier(value.get("id"), f"{name}.id")
+
+
+def _source_record_id(value: Mapping[str, Any], kind: str, name: str) -> str:
+    field = {"campaign": "campaignId", "archive": "archiveId"}.get(kind, "id")
+    return _identifier(value.get(field), f"{name}.{field}")
 
 
 def _validate_memory(value: dict[str, Any]) -> dict[str, Any]:
@@ -107,13 +116,14 @@ def _validate_memory(value: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class OutcomeSourceChangeV1:
-    """Strict, revisioned upsert/removal of one canonical outcome source."""
+    """Strict v2 revisioned source change (legacy class name retained for import stability)."""
 
     schema_version: int
     source_version: str
     change_id: str
     source_kind: Literal[
-        "run", "worker", "work-item", "project-memory", "dossier", "pending-decision"
+        "run", "worker", "work-item", "project-memory", "dossier", "pending-decision",
+        "campaign", "archive",
     ]
     source_id: str
     source_revision: int
@@ -147,11 +157,13 @@ class OutcomeSourceChangeV1:
         if self.source_kind == "project-memory":
             record = _validate_memory(record)
         else:
-            identifier = _record_id(record, "value")
+            identifier = _source_record_id(record, self.source_kind, "value")
             if self.source_kind != "run" and identifier != self.source_id:
-                raise OutcomeSourceChangeError("sourceId must match value.id")
+                raise OutcomeSourceChangeError("sourceId must match the canonical value identity")
             if self.source_kind == "dossier":
                 _identifier(record.get("findingId"), "value.findingId")
+            if self.source_kind == "archive":
+                _identifier(record.get("campaignId"), "value.campaignId")
         object.__setattr__(self, "value", record)
 
     def to_dict(self) -> dict[str, Any]:
@@ -175,7 +187,7 @@ class OutcomeSourceChangeV1:
             "sourceRevision", "operation", "value",
         }
         if set(value) != fields:
-            raise OutcomeSourceChangeError("source change fields must match the v1 envelope")
+            raise OutcomeSourceChangeError("source change fields must match the v2 envelope")
         return cls(
             schema_version=value["schemaVersion"], source_version=value["sourceVersion"],
             change_id=value["changeId"], source_kind=value["sourceKind"],
@@ -199,16 +211,22 @@ class _SourceState:
     memory: dict[str, Any]
     dossiers: dict[str, dict[str, Any]]
     pending_decisions: dict[str, dict[str, Any]]
+    campaigns: dict[str, dict[str, Any]]
+    archives: dict[str, dict[str, Any]]
     source_watermarks: dict[str, Any]
 
     @classmethod
     def empty(cls, source_watermarks: Mapping[str, Any] | None = None) -> Self:
-        return cls(None, {}, {}, {}, {}, {}, _record(dict(source_watermarks or {}), "watermarks"))
+        return cls(
+            None, {}, {}, {}, {}, {}, {}, {},
+            _record(dict(source_watermarks or {}), "watermarks"),
+        )
 
     def copy(self) -> Self:
         return type(self)(
             self.run, dict(self.workers), dict(self.work_items), self.memory,
-            dict(self.dossiers), dict(self.pending_decisions), self.source_watermarks,
+            dict(self.dossiers), dict(self.pending_decisions), dict(self.campaigns),
+            dict(self.archives), self.source_watermarks,
         )
 
 
@@ -417,6 +435,8 @@ def _dossiers_for(state: _SourceState, finding_id: str) -> list[Mapping[str, Any
 
 def _all_entity_keys(state: _SourceState) -> set[EntityKey]:
     keys: set[EntityKey] = set()
+    keys.update(("campaign", value) for value in state.campaigns)
+    keys.update(("archive", value) for value in state.archives)
     if state.run is not None:
         keys.add(("run", str(state.run["id"])))
     keys.update(("worker", value) for value in state.workers)
@@ -449,6 +469,12 @@ def _validate_cross_source_identities(state: _SourceState) -> None:
 def _refold_key(state: _SourceState, key: EntityKey) -> dict[str, Any] | None:
     kind, identifier = key
     run_id = _run_id(state)
+    if kind == "campaign":
+        record = state.campaigns.get(identifier)
+        return _fold_campaign(record) if record else None
+    if kind == "archive":
+        record = state.archives.get(identifier)
+        return _fold_archive(record) if record else None
     if kind == "run":
         if state.run is None or str(state.run["id"]) != identifier:
             return None
@@ -504,6 +530,10 @@ def _changed_map_keys(old: Mapping[str, Any], new: Mapping[str, Any]) -> set[str
 
 def _affected_keys(old: _SourceState, new: _SourceState,
                    change: OutcomeSourceChangeV1) -> set[EntityKey]:
+    if change.source_kind == "campaign":
+        return {("campaign", change.source_id)} if old.campaigns != new.campaigns else set()
+    if change.source_kind == "archive":
+        return {("archive", change.source_id)} if old.archives != new.archives else set()
     if old.run != new.run:
         if _run_id(old) != _run_id(new):
             return _all_entity_keys(old) | _all_entity_keys(new)
@@ -574,6 +604,8 @@ def _apply_to_source(state: _SourceState, change: OutcomeSourceChangeV1) -> _Sou
             "work-item": candidate.work_items,
             "dossier": candidate.dossiers,
             "pending-decision": candidate.pending_decisions,
+            "campaign": candidate.campaigns,
+            "archive": candidate.archives,
         }[change.source_kind]
         if value is None:
             collection.pop(change.source_id, None)
@@ -583,13 +615,14 @@ def _apply_to_source(state: _SourceState, change: OutcomeSourceChangeV1) -> _Sou
     return candidate
 
 
-def _list_to_map(value: Any, name: str) -> dict[str, dict[str, Any]]:
+def _list_to_map(value: Any, name: str, *, source_kind: str | None = None
+                 ) -> dict[str, dict[str, Any]]:
     if type(value) is not list:
         raise OutcomeSourceChangeError(f"{name} must be a JSON array")
     result: dict[str, dict[str, Any]] = {}
     for item in value:
         record = _record(item, name)
-        identifier = _record_id(record, name)
+        identifier = _source_record_id(record, source_kind or "record", name)
         if identifier in result:
             raise OutcomeSourceChangeError(f"{name} contains duplicate id {identifier!r}")
         result[identifier] = record
@@ -598,7 +631,7 @@ def _list_to_map(value: Any, name: str) -> dict[str, dict[str, Any]]:
 
 def _state_from_snapshot(snapshot: Mapping[str, Any]) -> _SourceState:
     if type(snapshot) is not dict or set(snapshot) != _SNAPSHOT_FIELDS:
-        raise OutcomeSourceChangeError("source snapshot fields must match the v1 envelope")
+        raise OutcomeSourceChangeError("source snapshot fields must match the v2 envelope")
     if type(snapshot["schemaVersion"]) is not int or snapshot["schemaVersion"] != SCHEMA_VERSION:
         raise OutcomeSourceChangeError("source snapshot schemaVersion must be 1")
     if snapshot["sourceVersion"] != SOURCE_SNAPSHOT_VERSION:
@@ -616,10 +649,14 @@ def _state_from_snapshot(snapshot: Mapping[str, Any]) -> _SourceState:
         memory=_validate_memory(_record(snapshot["projectMemory"], "projectMemory")),
         dossiers=_list_to_map(snapshot["dossiers"], "dossiers"),
         pending_decisions=_list_to_map(snapshot["pendingDecisions"], "pendingDecisions"),
+        campaigns=_list_to_map(snapshot["campaigns"], "campaigns", source_kind="campaign"),
+        archives=_list_to_map(snapshot["archives"], "archives", source_kind="archive"),
         source_watermarks=_record(snapshot["sourceWatermarks"], "sourceWatermarks"),
     )
     for record in state.dossiers.values():
         _identifier(record.get("findingId"), "dossier.findingId")
+    for record in state.archives.values():
+        _identifier(record.get("campaignId"), "archive.campaignId")
     _validate_cross_source_identities(state)
     return state
 
@@ -633,7 +670,7 @@ def _heads_from_snapshot(snapshot: Mapping[str, Any]) -> dict[StreamKey, int]:
         if type(value) is not dict or set(value) != {
             "sourceKind", "sourceId", "sourceRevision",
         }:
-            raise OutcomeSourceChangeError("source head fields must match the v1 envelope")
+            raise OutcomeSourceChangeError("source head fields must match the v2 envelope")
         kind = value["sourceKind"]
         source_id = value["sourceId"]
         revision = value["sourceRevision"]
@@ -666,6 +703,8 @@ def _materialized_stream_value(state: _SourceState, stream: StreamKey) -> dict[s
         "work-item": state.work_items,
         "dossier": state.dossiers,
         "pending-decision": state.pending_decisions,
+        "campaign": state.campaigns,
+        "archive": state.archives,
     }[kind].get(source_id)
 
 
@@ -706,6 +745,8 @@ def _receipts_from_snapshot(
     present_streams.update(("worker", source_id) for source_id in state.workers)
     present_streams.update(("work-item", source_id) for source_id in state.work_items)
     present_streams.update(("dossier", source_id) for source_id in state.dossiers)
+    present_streams.update(("campaign", source_id) for source_id in state.campaigns)
+    present_streams.update(("archive", source_id) for source_id in state.archives)
     present_streams.update(
         ("pending-decision", source_id) for source_id in state.pending_decisions
     )
@@ -810,7 +851,7 @@ class IncrementalOutcomeFold:
             for change in changes
         ]
         if any(type(change) is not OutcomeSourceChangeV1 for change in parsed):
-            raise OutcomeSourceChangeError("batch changes must be exact v1 envelopes")
+            raise OutcomeSourceChangeError("batch changes must be exact v2 envelopes")
         clone = self._clone()
         accepted = 0
         for change in sorted(parsed, key=lambda item: (
@@ -845,6 +886,12 @@ class IncrementalOutcomeFold:
             "pendingDecisions": [
                 self._state.pending_decisions[key]
                 for key in sorted(self._state.pending_decisions)
+            ],
+            "campaigns": [
+                self._state.campaigns[key] for key in sorted(self._state.campaigns)
+            ],
+            "archives": [
+                self._state.archives[key] for key in sorted(self._state.archives)
             ],
             "sourceWatermarks": self._state.source_watermarks,
             "sourceHeads": [

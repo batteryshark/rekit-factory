@@ -57,13 +57,21 @@ from rekit_factory.findings import (
     finding_snapshot,
 )
 from rekit_factory.dossiers import DossierPublisher, dossier_list
+from rekit_factory.campaign_lifecycle import (
+    CAMPAIGN_AUTHORITY,
+    CampaignLifecycleStore,
+)
 from rekit_factory.outcomes import project_outcomes
 from rekit_factory.policy_runtime import (
     SafetyPolicyCatalog,
     builtin_policy_catalog,
     policy_from_meta,
     policy_record,
+    strategy_from_record,
+    strategy_metadata_catalog,
+    strategy_record,
     validate_policy_authority,
+    validate_strategy_authority,
 )
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.remote import LocalRekitWorker
@@ -129,12 +137,12 @@ class RunRequest:
     tools: tuple[str, ...] = ()
     model_tools: tuple[str, ...] = ()
     worker_roles: tuple[str, ...] = ("recon", "analyst")
-    concurrency: int = 4
+    concurrency: int | None = None
     model_profile: str | None = None
     strategy: str | None = None
-    retries_per_worker: int = 1
-    cost_units: int = 100
-    max_workers: int = 8
+    retries_per_worker: int | None = None
+    cost_units: int | None = None
+    max_workers: int | None = None
     scope: AuthorizedScope | None = None
     safety_policy_id: str | None = None
 
@@ -146,21 +154,26 @@ class RunRequest:
             raise ValueError("goal must not be empty")
         if not self.worker_roles:
             raise ValueError("at least one worker role is required")
-        ceilings = RunCeilings(
-            concurrency=self.concurrency,
-            retries_per_worker=self.retries_per_worker,
-            cost_units=self.cost_units,
-            max_workers=self.max_workers,
-        )
         if self.strategy is not None and self.strategy not in DEFAULT_STRATEGIES:
             raise ValueError(f"unknown worker strategy {self.strategy!r}")
+        defaults = (
+            DEFAULT_STRATEGIES[self.strategy].ceilings if self.strategy is not None
+            else RunCeilings(concurrency=4, retries_per_worker=1, cost_units=100, max_workers=8)
+        )
+        ceilings = RunCeilings(
+            concurrency=(defaults.concurrency if self.concurrency is None else self.concurrency),
+            retries_per_worker=(defaults.retries_per_worker
+                                if self.retries_per_worker is None else self.retries_per_worker),
+            cost_units=(defaults.cost_units if self.cost_units is None else self.cost_units),
+            max_workers=(defaults.max_workers if self.max_workers is None else self.max_workers),
+        )
         return RunRequest(
             target=target,
             goal=self.goal.strip(),
             tools=tuple(dict.fromkeys(self.tools)),
             model_tools=tuple(dict.fromkeys(self.model_tools)),
             worker_roles=tuple(dict.fromkeys(self.worker_roles)),
-            concurrency=self.concurrency,
+            concurrency=ceilings.concurrency,
             model_profile=self.model_profile,
             strategy=self.strategy,
             retries_per_worker=ceilings.retries_per_worker,
@@ -190,6 +203,14 @@ class InvestigationController:
         self.default_profile = next(iter(self.worker_backends))
         configured_manifests = rekit.list_tools() if hasattr(rekit, "list_tools") else ()
         self.safety_policies = safety_policies or builtin_policy_catalog(configured_manifests)
+        self.strategy_metadata = strategy_metadata_catalog(
+            DEFAULT_STRATEGIES.values(),
+            profile_names=self.worker_backends,
+            policy_ids=(policy.policy_id for policy in self.safety_policies.policies),
+        )
+        self._strategy_metadata_by_name = {
+            metadata.name: metadata for metadata in self.strategy_metadata
+        }
         self.tool_router = ToolWorkerRouter(
             LocalRekitWorker(rekit), remote_tool_workers,
         )
@@ -225,6 +246,12 @@ class InvestigationController:
     def public_safety_policies(self) -> list[dict[str, object]]:
         return self.safety_policies.public_dicts()
 
+    def public_strategy_metadata(self) -> list[dict[str, object]]:
+        return [
+            {"strategyId": metadata.strategy_id, **metadata.to_dict()}
+            for metadata in self.strategy_metadata
+        ]
+
     def _validate_persisted_policy(
         self, paths: RunPaths, meta: dict[str, Any], plan: InvestigationPlan,
     ) -> None:
@@ -239,6 +266,15 @@ class InvestigationController:
             policy, requested_tool_ids=tool_ids, manifests=manifests,
             ceilings=plan.ceilings, scope=scope,
         )
+        strategy_value = meta.get("strategyMetadata")
+        if strategy_value is not None:
+            metadata = strategy_from_record(strategy_value)
+            if metadata.name != plan.strategy:
+                raise ValueError("persisted strategy metadata does not match the run plan")
+            validate_strategy_authority(
+                metadata, profile_name=_model_profile_name(meta) or self.default_profile,
+                policy=policy, scope=scope,
+            )
 
     def create(self, request: RunRequest) -> Path:
         request = request.validate()
@@ -271,6 +307,25 @@ class InvestigationController:
             ceilings=plan.ceilings,
             scope=scope,
         )
+        if request.strategy is not None:
+            strategy_metadata = self._strategy_metadata_by_name[request.strategy]
+        else:
+            custom_strategy = Strategy(
+                name="custom-roles",
+                description="Explicit worker roles supplied by the operator.",
+                workers=tuple(WorkerSeed(
+                    role, f"Investigate as the {role} specialist."
+                ) for role in request.worker_roles),
+                ceilings=plan.ceilings,
+            )
+            strategy_metadata = strategy_metadata_catalog(
+                (custom_strategy,), profile_names=self.worker_backends,
+                policy_ids=(item.policy_id for item in self.safety_policies.policies),
+            )[0]
+        validate_strategy_authority(
+            strategy_metadata, profile_name=worker_backend.profile.name,
+            policy=policy, scope=scope,
+        )
         tool_routes = {
             tool_id: self._route_payload(tool_id, request.target)
             for tool_id in dict.fromkeys((*request.tools, *request.model_tools))
@@ -278,6 +333,7 @@ class InvestigationController:
         self.storage_root.mkdir(parents=True, exist_ok=True)
         plan_payload = _plan_payload(plan)
         safety_policy = policy_record(policy)
+        strategy_metadata_record = strategy_record(strategy_metadata)
         public_config = {
             "goal": request.goal,
             "tools": list(request.tools),
@@ -292,12 +348,14 @@ class InvestigationController:
             if self.knowledge else [],
             "toolAuthorities": manifest_contracts,
             "safetyPolicy": safety_policy,
+            "strategyMetadata": strategy_metadata_record,
         }
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
         project_id, project_meta = compute_project_id(request.target)
         run_id, run_hash = compute_run_id(project_id, request.target, config_hash)
         paths = new_run_paths(self.storage_root, project_id, run_id, run_hash)
+        _ensure_project_campaign(paths, project_id)
 
         meta = {
             "version": 1,
@@ -317,6 +375,7 @@ class InvestigationController:
             if self.knowledge else [],
             "toolAuthorities": manifest_contracts,
             "safetyPolicy": safety_policy,
+            "strategyMetadata": strategy_metadata_record,
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
@@ -512,11 +571,14 @@ class InvestigationController:
             return self._snapshot_open(ledger, paths)
 
     def _snapshot_open(self, ledger: FactoryLedger, paths: RunPaths) -> dict[str, Any]:
-        # Project memory is a separately fsynced JSONL source. Replay it before opening the
-        # SQLite read transaction and expose both source watermarks without claiming they form
-        # one atomic cross-source revision.
+        # Project memory and campaign lifecycle are separately fsynced sources. Observe both
+        # before opening the SQLite read transaction; the resulting watermarks are independent
+        # diagnostics and explicitly do not form one atomic cross-source revision.
         project_memory = _project_memory_log(paths).replay()
         memory_projection = project_memory.deterministic_dict()
+        lifecycle = _campaign_lifecycle_store(paths).load()
+        lifecycle_source = lifecycle.to_dict()
+        lifecycle_sha256 = hashlib.sha256(lifecycle.canonical_bytes()).hexdigest()
         meta = _read_meta(paths)
         if "safetyPolicy" not in meta:
             meta = dict(meta)
@@ -590,6 +652,7 @@ class InvestigationController:
             # Cheap publication projection only. Anchored byte verification belongs to the
             # dedicated dossier route, not the high-frequency generic/SSE snapshot path.
             "dossiers": dossiers,
+            "campaignLifecycle": lifecycle_source,
             "outcomeProjection": project_outcomes(
                 run=dict(run) if run is not None else None,
                 workers=workers,
@@ -597,9 +660,12 @@ class InvestigationController:
                 memory=memory_projection,
                 dossiers=dossiers,
                 pending_questions=pending_questions,
+                campaigns=lifecycle_source["campaigns"],
+                archives=lifecycle_source["archives"],
                 source_watermarks={
                     "factoryEventRowid": int(event_watermark_row["watermark"]),
                     "memorySequence": project_memory.last_seq,
+                    "campaignLifecycleSha256": lifecycle_sha256,
                 },
             ),
             "knowledgeReferences": knowledge_references,
@@ -1947,6 +2013,20 @@ def _project_memory_log(paths: RunPaths) -> ProjectMemoryLog:
     return ProjectMemoryLog(project_dir)
 
 
+def _campaign_lifecycle_store(paths: RunPaths) -> CampaignLifecycleStore:
+    """Canonical project-level campaign/archive source, independent of run SQLite."""
+    return CampaignLifecycleStore(paths.run_dir.parents[1] / "campaign-lifecycle")
+
+
+def _ensure_project_campaign(paths: RunPaths, project_id: str) -> None:
+    """Create the scheduler-owned project campaign without deriving later lifecycle state."""
+    store = _campaign_lifecycle_store(paths)
+    state = store.load()
+    if any(item.campaign_id == project_id for item in state.campaigns):
+        return
+    store.save(state.create_campaign(project_id, authority=CAMPAIGN_AUTHORITY))
+
+
 def _manifest_actions(manifest: Any) -> tuple[ActionAuthority, ...]:
     actions = tuple(manifest.actions)
     if not actions or any(not isinstance(action, ActionAuthority) for action in actions):
@@ -2366,10 +2446,14 @@ def _tool_context(ledger: FactoryLedger, run_id: str, max_chars: int = 30_000,
 
 def _render_report(ledger: FactoryLedger, paths: RunPaths,
                    meta: dict[str, Any]) -> Path:
-    # Project memory is an independently fsynced source, just as it is for the canonical
-    # snapshot. SQLite-backed inputs are then captured under one read transaction.
+    # Project memory and campaign lifecycle are independently fsynced sources, just as they are
+    # for the canonical snapshot. SQLite-backed inputs are then captured under one transaction;
+    # no cross-store atomic revision is claimed.
     project_memory = _project_memory_log(paths).replay()
     memory_projection = project_memory.deterministic_dict()
+    lifecycle = _campaign_lifecycle_store(paths).load()
+    lifecycle_source = lifecycle.to_dict()
+    lifecycle_sha256 = hashlib.sha256(lifecycle.canonical_bytes()).hexdigest()
     if ledger.conn.in_transaction:
         raise RuntimeError("investigation export requires a clean ledger connection")
     ledger.conn.execute("begin")
@@ -2408,9 +2492,12 @@ def _render_report(ledger: FactoryLedger, paths: RunPaths,
         memory=memory_projection,
         dossiers=dossiers,
         pending_questions=pending_questions,
+        campaigns=lifecycle_source["campaigns"],
+        archives=lifecycle_source["archives"],
         source_watermarks={
             "factoryEventRowid": int(event_watermark_row["watermark"]),
             "memorySequence": project_memory.last_seq,
+            "campaignLifecycleSha256": lifecycle_sha256,
         },
     )
     outcome_entities = {
@@ -2448,6 +2535,7 @@ def _render_report(ledger: FactoryLedger, paths: RunPaths,
         "goal": meta["goal"],
         "workers": reports,
         "coverage": coverage,
+        "campaignLifecycle": lifecycle_source,
         "outcomeProjection": projection,
         "generatedAt": utcnow(),
     }

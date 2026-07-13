@@ -6,8 +6,14 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .policy_contracts import NamedSafetyPolicy, ScopePolicyBinding
-from .strategies import RunCeilings
+from .policy_contracts import (
+    NamedSafetyPolicy,
+    ScopePolicyBinding,
+    StrategyMetadata,
+    StrategyPolicyConstraints,
+    StrategyRoleMetadata,
+)
+from .strategies import RunCeilings, Strategy
 
 
 DEFAULT_POLICY_CEILINGS = RunCeilings(
@@ -99,6 +105,72 @@ def policy_from_meta(meta: Mapping[str, Any], ceilings: RunCeilings) -> NamedSaf
     if value is None:
         return NamedSafetyPolicy.legacy_compatibility(ceilings=ceilings)
     return policy_from_record(value)
+
+
+def strategy_metadata_catalog(
+    strategies: Iterable[Strategy], *, profile_names: Iterable[str], policy_ids: Iterable[str],
+) -> tuple[StrategyMetadata, ...]:
+    """Resolve configured strategies against exact profiles and policy identities."""
+
+    profiles = tuple(sorted(set(profile_names)))
+    policies = tuple(sorted(set(policy_ids)))
+    if not profiles:
+        raise ValueError("strategy metadata requires at least one configured profile")
+    if not policies:
+        raise ValueError("strategy metadata requires at least one safety policy")
+    result = []
+    for strategy in strategies:
+        result.append(StrategyMetadata(
+            name=strategy.name,
+            description=strategy.description,
+            roles=tuple(StrategyRoleMetadata(
+                worker.role, worker.objective, tuple(sorted(worker.depends_on_roles)),
+            ) for worker in strategy.workers),
+            default_ceilings=strategy.ceilings,
+            compatible_profile_names=profiles,
+            policy_constraints=StrategyPolicyConstraints(
+                compatible_policy_ids=policies,
+                required_tool_ids=(),
+                requires_scope_binding=False,
+            ),
+        ))
+    return tuple(result)
+
+
+def strategy_record(metadata: StrategyMetadata) -> dict[str, object]:
+    return {"strategyId": metadata.strategy_id, "document": metadata.to_dict()}
+
+
+def strategy_from_record(value: object) -> StrategyMetadata:
+    if not isinstance(value, Mapping) or set(value) != {"strategyId", "document"}:
+        raise ValueError("persisted strategy metadata record is malformed")
+    strategy_id = value["strategyId"]
+    if not isinstance(strategy_id, str):
+        raise ValueError("persisted strategy metadata identity is malformed")
+    metadata = StrategyMetadata.from_dict(value["document"])
+    if metadata.strategy_id != strategy_id:
+        raise ValueError("persisted strategy metadata identity does not match its document")
+    return metadata
+
+
+def validate_strategy_authority(
+    metadata: StrategyMetadata,
+    *, profile_name: str, policy: NamedSafetyPolicy, scope: Any | None,
+) -> None:
+    if profile_name not in metadata.compatible_profile_names:
+        raise PermissionError("selected model profile is incompatible with worker strategy")
+    constraints = metadata.policy_constraints
+    if policy.policy_id not in constraints.compatible_policy_ids:
+        raise PermissionError("selected safety policy is incompatible with worker strategy")
+    missing = sorted(set(constraints.required_tool_ids) - set(policy.allowed_tool_ids))
+    if missing:
+        raise PermissionError(
+            "selected safety policy lacks strategy-required tools: " + ", ".join(missing)
+        )
+    if constraints.requires_scope_binding and policy.scope_binding.mode != "authorized-scope":
+        raise PermissionError("selected worker strategy requires a scope-bound safety policy")
+    if constraints.requires_scope_binding and scope is None:
+        raise PermissionError("selected worker strategy requires an engagement scope")
 
 
 def validate_policy_authority(

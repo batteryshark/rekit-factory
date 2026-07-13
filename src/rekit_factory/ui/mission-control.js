@@ -656,6 +656,7 @@ function renderDossiers(snapshot) {
 
 const OUTCOME_TYPES = {
   run: ["RUN", "◆"], worker: ["WORKER", "◉"], "work-item": ["WORK", "▤"],
+  campaign: ["CAMPAIGN", "◎"], archive: ["ARCHIVE", "▣"],
   hypothesis: ["HYPOTHESIS", "◇"], finding: ["FINDING", "◈"],
   validation: ["VALIDATION", "✓"], "proof-bundle": ["PROOF", "⬡"],
   "operator-decision": ["DECISION", "!"],
@@ -740,7 +741,10 @@ function renderDetail() {
   $("detailTitle").textContent = meta.target.split("/").pop(); $("detailGoal").textContent = meta.goal;
   const boundPolicy = meta.safetyPolicy, boundPolicyDocument = boundPolicy?.document;
   const boundPolicyLabel = boundPolicyDocument ? `${boundPolicyDocument.name} r${boundPolicyDocument.revision} · ${String(boundPolicy.policyId).slice(-10)}` : "legacy deny-all";
-  $("runMeta").innerHTML = [["status", run.status], ["run", run.id], ["model", meta.modelProfile.model], ["safety", boundPolicyLabel], ["coverage", `${snapshot.coverage.terminal}/${snapshot.coverage.workItemsTotal}`], ["target", meta.target]].map(([name, value]) => `<div class="kv"><span>${esc(name)}</span><span>${esc(value)}</span></div>`).join("");
+  const boundStrategy = meta.strategyMetadata, boundStrategyDocument = boundStrategy?.document;
+  const boundStrategyLabel = boundStrategyDocument ? `${boundStrategyDocument.name} · ${String(boundStrategy.strategyId).slice(-10)}` : (meta.strategy || "legacy/custom");
+  const boundStrategyRoles = boundStrategyDocument?.roles?.map(role => role.depends_on_roles?.length ? `${role.depends_on_roles.join("+")}→${role.role}` : role.role).join(" · ") || "not recorded";
+  $("runMeta").innerHTML = [["status", run.status], ["run", run.id], ["model", meta.modelProfile.model], ["strategy", boundStrategyLabel], ["role graph", boundStrategyRoles], ["safety", boundPolicyLabel], ["coverage", `${snapshot.coverage.terminal}/${snapshot.coverage.workItemsTotal}`], ["target", meta.target]].map(([name, value]) => `<div class="kv"><span>${esc(name)}</span><span>${esc(value)}</span></div>`).join("");
   renderScope(meta);
   $("workers").innerHTML = snapshot.workers.map(worker => `<div class="worker"><div class="worker-top"><span class="worker-role">${esc(worker.role)}</span><span class="worker-status">${esc(worker.status)}</span></div><div class="worker-step">${esc(worker.current_step || "queued")}</div>${worker.error ? `<div class="worker-error">${esc(worker.error)}</div>` : ""}</div>`).join("");
   $("activitySummary").innerHTML = MissionObservability.activitySummary(events);
@@ -822,6 +826,23 @@ function selectedSafetyPolicy() {
   return safetyPolicyByName(name);
 }
 
+function selectedStrategyMetadata() {
+  const name = $("strategySelect").value;
+  return (state.config?.strategies || []).find(strategy => strategy.name === name);
+}
+
+function applyStrategyDefaults() {
+  const ceilings = selectedStrategyMetadata()?.default_ceilings;
+  if (!ceilings) return;
+  const fields = {
+    concurrency: "concurrency", retries_per_worker: "retriesPerWorker",
+    max_workers: "maxWorkers", cost_units: "costUnits",
+  };
+  Object.entries(fields).forEach(([key, id]) => {
+    if (Number.isInteger(ceilings[key])) $(id).value = ceilings[key];
+  });
+}
+
 function positiveInteger(id, label, {allowZero = false} = {}) {
   const input = $(id), value = Number(input.value), minimum = allowZero ? 0 : 1;
   input.setCustomValidity(Number.isInteger(value) && value >= minimum ? "" : `${label} must be a whole number of at least ${minimum}.`);
@@ -833,8 +854,15 @@ function renderComposerState() {
   const custom = strategy === "custom-roles";
   $("customRolesField").hidden = !custom;
   $("roles").disabled = !custom;
-  const selected = (state.config.strategies || []).find(item => item.name === strategy);
+  const selected = selectedStrategyMetadata();
   $("strategyHint").textContent = selected?.description || "Define a comma-separated set of independent worker roles.";
+  if (selected) {
+    const roles = selected.roles || [], profileNames = selected.compatible_profile_names || [];
+    const compatiblePolicies = selected.policy_constraints?.compatible_policy_ids || [];
+    const roleGraph = roles.map(role => role.depends_on_roles?.length
+      ? `${role.depends_on_roles.join(" + ")} → ${role.role}` : role.role).join(" · ");
+    $("strategyPreview").innerHTML = `<div><span>durable identity</span><b>${esc(selected.strategyId?.slice(-14) || "unavailable")}</b><small>content-bound strategy</small></div><div><span>worker graph</span><b>${esc(roleGraph)}</b><small>${roles.length} seeded role${roles.length === 1 ? "" : "s"}</small></div><div><span>compatible profiles</span><b>${esc(profileNames.join(" · ") || "none")}</b><small>server enforced</small></div><div><span>compatible policies</span><b>${esc(compatiblePolicies.length)} exact identit${compatiblePolicies.length === 1 ? "y" : "ies"}</b><small>server enforced</small></div>`;
+  } else $("strategyPreview").innerHTML = "";
   if (profile) {
     $("effectivePolicy").innerHTML = `<div class="policy-item"><span>structured output</span><b>${esc(profile.structuredOutputMode || "prompted")}</b></div><div class="policy-item"><span>provider concurrency</span><b>${esc(profile.concurrencyLimit ?? "not declared")}</b></div><div class="policy-item"><span>provider retries</span><b>${esc(profile.retryLimit ?? "not declared")}</b></div>`;
     $("modelStack").textContent = profile.model;
@@ -879,10 +907,11 @@ function renderConfig() {
   $("toolPicker").innerHTML = tools.map(toolRow).join("") || `<div class="hint">No Rekit tools discovered.</div>`;
   $("toolCatalog").innerHTML = tools.map(tool => `<div class="tool"><span class="tool-name">${esc(tool.id)}<small>${esc(tool.source || "default")}</small></span><span class="tier ${tool.requires_permission ? "gated" : ""}">${tool.requires_permission ? "permission" : "automatic"} · tier ${tool.safety_tier}</span></div>`).join("");
   $("profileSelect").addEventListener("change", renderComposerState);
-  $("strategySelect").addEventListener("change", renderComposerState);
+  $("strategySelect").addEventListener("change", () => { applyStrategyDefaults(); renderComposerState(); });
   document.querySelectorAll('input[name="safetyPolicy"]').forEach(input => input.addEventListener("change", renderComposerState));
   ["concurrency", "retriesPerWorker", "maxWorkers", "costUnits", "roles"].forEach(id => $(id).addEventListener("input", renderComposerState));
   $("toolPicker").addEventListener("change", renderComposerState);
+  applyStrategyDefaults();
   renderComposerState();
 }
 

@@ -21,7 +21,7 @@ from rekit_factory.outcomes import (
 
 
 def _project(*, run_status="queued", workers=(), work=(), memory=None, dossiers=(), questions=(),
-             source_watermarks=None):
+             campaigns=(), archives=(), source_watermarks=None):
     return project_outcomes(
         run={"id": "run-1", "status": run_status},
         workers=workers,
@@ -29,6 +29,8 @@ def _project(*, run_status="queued", workers=(), work=(), memory=None, dossiers=
         memory=memory or {},
         dossiers=dossiers,
         pending_questions=questions,
+        campaigns=campaigns,
+        archives=archives,
         source_watermarks=source_watermarks,
     )
 
@@ -117,6 +119,53 @@ def test_children_never_promote_parent_outcomes():
     assert finding["facets"]["validation"]["state"] == "unvalidated"
     assert finding["facets"]["acceptance"]["state"] == "undecided"
     assert finding["facets"]["publication"]["state"] == "published"
+
+
+def test_campaign_coverage_completion_and_archival_are_orthogonal():
+    projection = _project(
+        campaigns=[{
+            "campaignId": "campaign-1", "state": "active",
+            "coverage": {"state": "covered"},
+        }],
+        archives=[{
+            "archiveId": "archive-1", "campaignId": "campaign-1",
+            "state": "unarchived",
+        }],
+    )
+    campaign = _entity(projection, "campaign", "campaign-1")
+    archive = _entity(projection, "archive", "archive-1")
+    assert projection["vocabularyVersion"] == "factory-outcomes/v2"
+    assert projection["facets"][-2:] == ["coverage", "archival"]
+    assert campaign["facets"]["execution"]["state"] == "active"
+    assert campaign["facets"]["completion"]["state"] == "incomplete"
+    assert campaign["facets"]["disposition"]["state"] == "not-applicable"
+    assert campaign["facets"]["coverage"]["state"] == "covered"
+    assert campaign["facets"]["archival"]["state"] == "not-applicable"
+    assert archive["parent"] == {"entityType": "campaign", "entityId": "campaign-1"}
+    assert archive["facets"]["archival"]["state"] == "unarchived"
+    assert archive["facets"]["coverage"]["state"] == "not-applicable"
+
+
+def test_unknown_campaign_archive_states_and_missing_parent_degrade_without_inference():
+    projection = _project(
+        campaigns=[{
+            "campaignId": "campaign-1", "state": "future-paused",
+            "coverage": {"state": "future-scoped"},
+        }],
+        archives=[{
+            "archiveId": "archive-orphan", "campaignId": "missing-campaign",
+            "state": "future-cold",
+        }],
+    )
+    campaign = _entity(projection, "campaign", "campaign-1")
+    archive = _entity(projection, "archive", "archive-orphan")
+    assert projection["degraded"] is True
+    assert campaign["facets"]["execution"]["rawState"] == "future-paused"
+    assert campaign["facets"]["coverage"]["rawState"] == "future-scoped"
+    assert archive["facets"]["archival"]["rawState"] == "future-cold"
+    assert {item["code"] for item in archive["diagnostics"]} == {
+        "dangling-parent", "unknown-state",
+    }
 
 
 def test_worker_report_is_rendered_child_without_model_authored_outcome_inference():
@@ -316,7 +365,7 @@ def _semantic_fixture():
     [
         ("schema", lambda value: value.__setitem__("schemaVersion", 2)),
         ("vocabulary", lambda value: value.__setitem__(
-            "vocabularyVersion", "factory-outcomes/v2",
+            "vocabularyVersion", "factory-outcomes/v3",
         )),
         ("facet-list", lambda value: value["facets"].__setitem__(0, "phase")),
         ("authority", lambda value: value["authorities"].__setitem__(

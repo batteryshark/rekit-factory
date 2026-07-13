@@ -2,7 +2,7 @@
 
 This module deliberately does not persist, deliver, retry, acknowledge, or batch anything.
 Those are durable outbox concerns owned by W-0030.  It only turns a verified old/new
-``factory-outcomes/v1`` pair into deterministic, redacted candidate records.
+current supported ``factory-outcomes`` pair into deterministic, redacted candidate records.
 """
 
 from __future__ import annotations

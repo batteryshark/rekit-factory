@@ -22,7 +22,9 @@ def change(change_id, kind, revision, value=None, *, operation="upsert", source_
         if kind in {"run", "project-memory"}:
             source_id = kind
         elif value is not None:
-            source_id = value["id"]
+            source_id = value.get({"campaign": "campaignId", "archive": "archiveId"}.get(
+                kind, "id"
+            ))
         else:
             raise AssertionError("removals require source_id")
     return OutcomeSourceChangeV1(
@@ -50,6 +52,8 @@ def full_projection(fold):
         memory=source["projectMemory"],
         dossiers=source["dossiers"],
         pending_questions=source["pendingDecisions"],
+        campaigns=source["campaigns"],
+        archives=source["archives"],
         source_watermarks=source["sourceWatermarks"],
     )
 
@@ -413,6 +417,50 @@ def test_report_entity_has_exact_full_incremental_parity_across_render_and_remov
     assert fold.apply(remove("work-3", "work-item", "work-a", 3))
     assert_full_parity(fold)
     assert not any(item["entityId"] == "work-a" for item in fold.projection()["entities"])
+
+
+def test_campaign_archive_full_incremental_parity_removal_readd_unknown_and_dangling():
+    fold = IncrementalOutcomeFold()
+    assert fold.apply(change("campaign-1", "campaign", 1, {
+        "campaignId": "campaign-a", "state": "active",
+        "coverage": {"state": "covered"},
+    }))
+    assert fold.apply(change("archive-1", "archive", 1, {
+        "archiveId": "archive-a", "campaignId": "campaign-a", "state": "unarchived",
+    }))
+    projection = assert_full_parity(fold)
+    campaign = entity(projection, "campaign", "campaign-a")
+    archive = entity(projection, "archive", "archive-a")
+    assert campaign["facets"]["coverage"]["state"] == "covered"
+    assert campaign["facets"]["completion"]["state"] == "incomplete"
+    assert archive["facets"]["archival"]["state"] == "unarchived"
+
+    assert fold.apply(remove("campaign-2", "campaign", "campaign-a", 2))
+    projection = assert_full_parity(fold)
+    assert entity(projection, "archive", "archive-a")["diagnostics"][0]["code"] \
+        == "dangling-parent"
+
+    assert fold.apply(change("campaign-3", "campaign", 3, {
+        "campaignId": "campaign-a", "state": "future-paused",
+        "coverage": {"state": "future-scoped"},
+    }))
+    projection = assert_full_parity(fold)
+    assert not entity(projection, "archive", "archive-a")["diagnostics"]
+    assert entity(projection, "campaign", "campaign-a")["facets"]["coverage"][
+        "state"
+    ] == "unknown"
+
+    assert fold.apply(change("archive-2", "archive", 2, {
+        "archiveId": "archive-a", "campaignId": "campaign-a", "state": "archived",
+    }))
+    projection = assert_full_parity(fold)
+    assert entity(projection, "archive", "archive-a")["facets"]["archival"][
+        "state"
+    ] == "archived"
+    assert fold.last_refolded_entities == (("archive", "archive-a"),)
+
+    restarted = IncrementalOutcomeFold.from_source_snapshot(fold.source_snapshot())
+    assert restarted.projection() == projection
 
 
 def test_randomized_differential_parity_after_every_arrival_and_batch_order():

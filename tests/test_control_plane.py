@@ -13,6 +13,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from rekit_factory.api import FactoryServer, _event_batch
+from rekit_factory.campaign_lifecycle import ARCHIVE_AUTHORITY, CampaignLifecycleStore
 from rekit_factory.control import InvestigationController, RunRequest
 from rekit_factory.dossiers import dossier_list as canonical_dossier_list
 from rekit_factory.evidence import EvidenceStore, Provenance, hash_target
@@ -241,9 +242,21 @@ class ControlPlaneTests(unittest.TestCase):
             )
             projection = exported["outcomeProjection"]
             self.assertEqual(1, projection["schemaVersion"])
-            self.assertEqual("factory-outcomes/v1", projection["vocabularyVersion"])
+            self.assertEqual("factory-outcomes/v2", projection["vocabularyVersion"])
             self.assertRegex(projection["semanticSha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(completed["outcomeProjection"], projection)
+            self.assertEqual(completed["campaignLifecycle"], exported["campaignLifecycle"])
+            campaign = next(
+                entity for entity in projection["entities"]
+                if entity["entityType"] == "campaign"
+            )
+            self.assertEqual("planned", campaign["facets"]["execution"]["rawState"])
+            self.assertEqual("uncovered", campaign["facets"]["coverage"]["state"])
+            self.assertEqual(
+                completed["outcomeProjection"]["sourceWatermarks"]
+                ["campaignLifecycleSha256"],
+                projection["sourceWatermarks"]["campaignLifecycleSha256"],
+            )
 
             run_outcome = next(
                 entity for entity in projection["entities"]
@@ -266,6 +279,47 @@ class ControlPlaneTests(unittest.TestCase):
             )
             self.assertNotIn("status_update", report["report"])
             self.assertNotIn("statusUpdate", report["report"])
+
+    def test_snapshot_reads_archive_only_from_atomic_project_lifecycle_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend()
+            )
+            run_dir = controller.create(RunRequest(
+                target=target, goal="Project lifecycle authority", worker_roles=("analyst",)
+            ))
+            paths = resolve_run_dir(run_dir)
+            store = CampaignLifecycleStore(paths.run_dir.parents[1] / "campaign-lifecycle")
+            state = store.load()
+            campaign_id = state.campaigns[0].campaign_id
+            state = state.create_archive(
+                "archive-a", campaign_id, authority=ARCHIVE_AUTHORITY,
+            ).transition_archive(
+                "archive-a", "archived", expected_revision=1,
+                authority=ARCHIVE_AUTHORITY,
+            )
+            store.save(state)
+
+            snapshot = controller.snapshot(run_dir)
+            self.assertEqual(state.to_dict(), snapshot["campaignLifecycle"])
+            archive = next(
+                item for item in snapshot["outcomeProjection"]["entities"]
+                if item["entityType"] == "archive"
+            )
+            self.assertEqual("archived", archive["facets"]["archival"]["state"])
+            self.assertEqual(
+                {"entityType": "campaign", "entityId": campaign_id}, archive["parent"],
+            )
+            self.assertEqual(
+                "not-claimed",
+                snapshot["outcomeProjection"]["consistency"]["crossStoreRevision"],
+            )
+            self.assertRegex(
+                snapshot["outcomeProjection"]["sourceWatermarks"]
+                ["campaignLifecycleSha256"],
+                r"^[0-9a-f]{64}$",
+            )
 
     def test_tool_evidence_projects_redacted_output_and_never_captures_cli_screenshots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -516,6 +570,7 @@ class ControlPlaneTests(unittest.TestCase):
         script = (ui / "mission-control.js").read_text(encoding="utf-8")
 
         self.assertIn('id="strategySelect"', page)
+        self.assertIn('id="strategyPreview"', page)
         self.assertIn('id="retriesPerWorker"', page)
         self.assertIn('value="automatic-only"', page)
         self.assertIn('data-policy-name="supervised"', page)
@@ -524,6 +579,10 @@ class ControlPlaneTests(unittest.TestCase):
         for field in ("strategy", "concurrency", "retriesPerWorker", "costUnits", "maxWorkers", "safetyPolicyId"):
             self.assertIn(field, script)
         self.assertIn("boundPolicyLabel", script)
+        self.assertIn("boundStrategyLabel", script)
+        self.assertIn("applyStrategyDefaults", script)
+        self.assertIn("compatible_profile_names", script)
+        self.assertIn("policy_constraints", script)
         self.assertIn("cannot bypass server-side gates", page)
         self.assertIn("updateEvidence", script)
         self.assertNotIn("rawPath", script)
@@ -653,8 +712,23 @@ class ControlPlaneTests(unittest.TestCase):
                 run_id = launched["run"]["id"]
                 self.assertEqual(1, launched["outcomeProjection"]["schemaVersion"])
                 self.assertEqual(
-                    "factory-outcomes/v1", launched["outcomeProjection"]["vocabularyVersion"]
+                    "factory-outcomes/v2", launched["outcomeProjection"]["vocabularyVersion"]
                 )
+                self.assertEqual(
+                    "not-claimed",
+                    launched["outcomeProjection"]["consistency"]["crossStoreRevision"],
+                )
+                self.assertRegex(
+                    launched["outcomeProjection"]["sourceWatermarks"]
+                    ["campaignLifecycleSha256"],
+                    r"^[0-9a-f]{64}$",
+                )
+                campaign = next(
+                    item for item in launched["outcomeProjection"]["entities"]
+                    if item["entityType"] == "campaign"
+                )
+                self.assertEqual(launched["run"]["project_id"], campaign["entityId"])
+                self.assertEqual("uncovered", campaign["facets"]["coverage"]["state"])
                 self.assertIsInstance(
                     launched["outcomeProjection"]["sourceWatermarks"]["factoryEventRowid"], int,
                 )
@@ -698,7 +772,7 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertEqual("none", completed["meta"]["scope"]["networkMode"])
                 reports = self._request(base + f"/api/runs/{run_id}/reports")
                 self.assertEqual(1, reports["schemaVersion"])
-                self.assertEqual("factory-outcomes/v1", reports["vocabularyVersion"])
+                self.assertEqual("factory-outcomes/v2", reports["vocabularyVersion"])
                 self.assertEqual(
                     completed["outcomeProjection"]["semanticSha256"],
                     reports["semanticSha256"],

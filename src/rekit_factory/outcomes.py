@@ -18,7 +18,7 @@ from typing import Any, Iterable, Mapping
 
 
 SCHEMA_VERSION = 1
-VOCABULARY_VERSION = "factory-outcomes/v1"
+VOCABULARY_VERSION = "factory-outcomes/v2"
 SEMANTIC_IDENTITY_DOMAIN = "factory-outcomes/semantic-sha256/v1"
 SEMANTIC_IDENTITY_FIELD = "semanticSha256"
 SEMANTIC_CANONICAL_BASE64_FIELD = "semanticCanonicalBase64"
@@ -28,6 +28,7 @@ _NONSEMANTIC_TOP_LEVEL_FIELDS = frozenset({
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 FACETS = (
     "execution", "completion", "disposition", "validation", "acceptance", "publication",
+    "coverage", "archival",
 )
 
 AUTHORITIES = {
@@ -71,6 +72,12 @@ _ACCEPTANCE = {"accepted": "accepted", "rejected": "rejected", "waived": "waived
 _DOSSIER_VALIDATION = {
     "verified": "verified", "stale-or-invalid": "stale",
 }
+_CAMPAIGN_EXECUTION = {
+    "planned": "queued", "active": "active", "completed": "terminal",
+    "cancelled": "terminal",
+}
+_COVERAGE = {"uncovered": "uncovered", "partial": "partial", "covered": "covered"}
+_ARCHIVAL = {"unarchived": "unarchived", "archived": "archived"}
 
 
 def _json_snapshot(value: Any, *, path: str = "$") -> Any:
@@ -193,6 +200,7 @@ def _entity(entity_type: str, entity_id: Any, *, parent: dict[str, str] | None =
         "execution": "factory-scheduler", "completion": "factory-scheduler",
         "disposition": "factory-scheduler", "validation": "validator-policy",
         "acceptance": "operator", "publication": "factory-dossier-publisher",
+        "coverage": "muster", "archival": "operator",
     }
     return {
         "entityType": entity_type, "entityId": str(entity_id), "parent": parent,
@@ -220,6 +228,37 @@ def _fold_report(work: Mapping[str, Any]) -> dict[str, Any] | None:
         "rawState": "rendered", "state": "rendered", "known": True,
         "terminal": True, "owner": "factory-report-renderer",
     }
+    return item
+
+
+def _fold_campaign(campaign: Mapping[str, Any]) -> dict[str, Any]:
+    campaign_id = str(campaign.get("campaignId", campaign.get("id", "missing-campaign")))
+    item = _entity("campaign", campaign_id)
+    diagnostics: list[dict[str, Any]] = []
+    raw = campaign.get("state")
+    terminal = {"completed", "cancelled"}
+    _set(item, "execution", raw, _CAMPAIGN_EXECUTION, terminal_raw=terminal,
+         owner="factory-scheduler", diagnostics=diagnostics)
+    _completion(raw, active={"planned", "active"}, complete=terminal,
+                terminal_raw=terminal, owner="factory-scheduler", entity=item,
+                diagnostics=diagnostics)
+    coverage = campaign.get("coverage")
+    coverage_raw = coverage.get("state") if isinstance(coverage, Mapping) else None
+    _set(item, "coverage", coverage_raw, _COVERAGE, terminal_raw={"covered"},
+         owner="muster", diagnostics=diagnostics)
+    return item
+
+
+def _fold_archive(archive: Mapping[str, Any]) -> dict[str, Any]:
+    archive_id = str(archive.get("archiveId", archive.get("id", "missing-archive")))
+    campaign_id = str(archive.get("campaignId", "missing-campaign"))
+    item = _entity(
+        "archive", archive_id,
+        parent={"entityType": "campaign", "entityId": campaign_id},
+    )
+    diagnostics: list[dict[str, Any]] = []
+    _set(item, "archival", archive.get("state"), _ARCHIVAL,
+         terminal_raw={"archived"}, owner="operator", diagnostics=diagnostics)
     return item
 
 
@@ -353,14 +392,23 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
                      memory: Mapping[str, Any],
                      dossiers: Iterable[Mapping[str, Any]],
                      pending_questions: Iterable[Mapping[str, Any]],
+                     campaigns: Iterable[Mapping[str, Any]] = (),
+                     archives: Iterable[Mapping[str, Any]] = (),
                      source_watermarks: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Return the complete v1 projection from canonical, already-redacted inputs."""
+    """Return the complete v2 projection from canonical, already-redacted inputs."""
     entities: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     pending_question_values = list(pending_questions)
     _validate_operator_decision_identity_uniqueness(memory, pending_question_values)
     run_id = str((run or {}).get("id", "missing-run"))
     run_parent = {"entityType": "run", "entityId": run_id}
+    campaign_values = list(campaigns)
+    archive_values = list(archives)
+    for campaign in campaign_values:
+        entities.append(_fold_campaign(campaign))
+
+    for archive in archive_values:
+        entities.append(_fold_archive(archive))
     if run is not None:
         item = _entity("run", run_id)
         raw = run.get("status")

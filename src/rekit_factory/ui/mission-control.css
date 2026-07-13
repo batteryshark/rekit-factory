@@ -106,3 +106,5 @@ button:focus-visible,[tabindex]:focus-visible,input:focus-visible,textarea:focus
 [data-theme="light"] .operator-attention{background:radial-gradient(circle at 8% 0,rgba(168,100,5,.10),transparent 38%),linear-gradient(150deg,var(--panel),var(--bg-2))}
 [data-theme="light"] .outcome-card{background:linear-gradient(150deg,var(--panel),var(--bg))}
 [data-theme="light"] .outcome-facet,[data-theme="light"] .outcome-diagnostics article{background:var(--bg-2)}
+.strategy-preview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}.strategy-preview:empty{display:none}.strategy-preview>div{border:1px solid var(--line);border-radius:6px;background:var(--bg);padding:8px}.strategy-preview span{display:block;color:var(--ink-3);font:7px var(--mono);text-transform:uppercase;letter-spacing:.08em}.strategy-preview b,.strategy-preview small{display:block;margin-top:4px;color:var(--ink-2);font:9px var(--mono);font-weight:500;line-height:1.45}.strategy-preview small{color:var(--teal)}
+@media(max-width:560px){.strategy-preview{grid-template-columns:1fr}}

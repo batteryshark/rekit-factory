@@ -1,4 +1,4 @@
-# Outcome projection v1
+# Outcome projection v2
 
 Factory exposes `outcomeProjection` in every canonical run snapshot. The block is a
 versioned, deterministic read model over already committed ledger rows, replayed project
@@ -7,7 +7,7 @@ machine, lifecycle table, index, or cache.
 
 ## Contract
 
-`schemaVersion: 1` and `vocabularyVersion: factory-outcomes/v1` version the public shape and
+`schemaVersion: 1` and `vocabularyVersion: factory-outcomes/v2` version the public shape and
 the meanings below independently. Entities are sorted by `(entityType, entityId)` and
 diagnostics are sorted by entity, facet, and raw value. Rebuilding from the same canonical
 state therefore produces byte-for-byte equivalent JSON.
@@ -72,12 +72,12 @@ dangling-parent diagnostics, degradation, consistency semantics, `semanticCanoni
 `semanticSha256` are then materialized by the shared finalizer. The incremental path never calls
 `project_outcomes`.
 
-The strict change domain is `factory-outcome-source-change/v1`:
+The strict change domain is `factory-outcome-source-change/v2`:
 
 ```json
 {
   "schemaVersion": 1,
-  "sourceVersion": "factory-outcome-source-change/v1",
+  "sourceVersion": "factory-outcome-source-change/v2",
   "changeId": "worker-a-r2",
   "sourceKind": "worker",
   "sourceId": "worker-a",
@@ -87,10 +87,12 @@ The strict change domain is `factory-outcome-source-change/v1`:
 }
 ```
 
-`sourceKind` is exactly one of `run`, `worker`, `work-item`, `project-memory`, `dossier`, or
-`pending-decision`; `operation` is `upsert` or `remove`, and removals carry a null `value`.
+`sourceKind` is exactly one of `run`, `worker`, `work-item`, `project-memory`, `dossier`,
+`pending-decision`, `campaign`, or `archive`; `operation` is `upsert` or `remove`, and removals
+carry a null `value`.
 Run and project-memory are singleton streams with source IDs `run` and `project-memory`.
-Every other source ID must exactly match `value.id`. Finding-scoped attempts, decisions, and
+Every other source ID must exactly match `value.id`, except campaign and archive streams use
+their canonical `campaignId` and `archiveId` fields. Finding-scoped attempts, decisions, and
 dossiers carry a valid `findingId`; a missing parent remains valid and becomes a public
 `dangling-parent` diagnostic rather than being invented or discarded.
 
@@ -103,11 +105,12 @@ cannot change the converged source state. Removal followed by a higher-revision 
 ordinary lifecycle of the source record, not a new database or second state machine.
 
 `IncrementalOutcomeFold.source_snapshot()` emits the complete canonical
-`factory-outcome-source-state/v1` JSON boundary: run, sorted workers and work items, complete
-project-memory projection, sorted dossiers and pending decisions, and diagnostic source
-watermarks. It also records the deterministic current revision head for each source stream so
+`factory-outcome-source-state/v2` JSON boundary: run, sorted workers and work items, complete
+project-memory projection, sorted dossiers, pending decisions, campaigns, and archives, and
+diagnostic source watermarks. It also records the deterministic current revision head for each
+source stream so
 a restarted accumulator cannot be rewound by a late stale change. The snapshot additionally
-persists every accepted strict v1 change envelope as a deterministically sorted receipt. On
+persists every accepted strict v2 change envelope as a deterministically sorted receipt. On
 admission, those receipts rebuild both exact-change and stream-revision conflict maps; every
 head must have its exact receipt, receipts cannot exceed a head, present records require heads,
 and each current head must reproduce the materialized value or tombstone. Missing or tampered
@@ -133,7 +136,8 @@ performed a full fold, SQLite transaction, or project-memory replay. The control
 obtains its SQLite inputs under its explicit read transaction, as described below; that is a
 producer boundary outside the pure outcome projection.
 
-Each entity has six orthogonal facets:
+Each entity has eight orthogonal facets. Coverage and archival changed public meaning, so the
+vocabulary advanced to v2 instead of silently extending v1:
 
 | Facet | Question answered | Representative normalized states |
 | --- | --- | --- |
@@ -143,6 +147,8 @@ Each entity has six orthogonal facets:
 | validation | What has proof policy concluded? | `unvalidated`, `pending`, `demonstrated`, `reproduced`, `contradicted`, `invalid`, `inconclusive`, `verified`, `stale`, `unknown` |
 | acceptance | What has an operator decided? | `undecided`, `accepted`, `rejected`, `waived`, `unknown` |
 | publication | What durable publication exists? | `unpublished`, `published`, `unknown` |
+| coverage | How much canonical campaign scope is covered? | `uncovered`, `partial`, `covered`, `unknown` |
+| archival | What durable archive transition exists? | `unarchived`, `archived`, `unknown` |
 
 Every facet preserves `rawState`, supplies a normalized `state`, says whether the raw value is
 `known`, identifies whether the canonical raw state is `terminal`, and names its `owner`.
@@ -179,9 +185,14 @@ the finding's completion, disposition, validation, or acceptance facets.
 
 ## Current projection coverage
 
-The initial projection covers runs, workers, work items, hypotheses, findings, reproduction
-validations, proof bundles, and pending or finding-scoped operator decisions. Campaign and
-archive entities will join this vocabulary when their canonical event sources land.
+The projection covers campaigns, archives, runs, workers, work items, hypotheses, findings,
+reproduction validations, proof bundles, reports, and pending or finding-scoped operator
+decisions. Campaign execution/completion is scheduler-owned, coverage is Muster-owned, and
+archive state is operator-owned. Campaign `completed` does not set disposition to `successful`;
+`covered` does not imply completion; and an archive is a distinct campaign child whose
+`archived` facet cannot promote any campaign facet. Unknown lifecycle states remain raw and
+degraded. A retained archive whose campaign is removed remains visible with a dangling-parent
+diagnostic, which disappears when the campaign source is re-added.
 
 ## Canonical worker reports
 
@@ -242,16 +253,17 @@ publication events visible. The already sealed content-addressed directory remai
 an exact retry reuses it, preserves every byte, and publishes five bound artifacts plus one event
 exactly once. This proof adds no production fault-injection control.
 
-Project memory is a separately fsynced JSONL source. It is replayed outside the SQLite read
-transaction, and v1 does not claim an atomic revision across those two stores. The
-`sourceWatermarks` object reports the independently observed run-scoped maximum Factory event
-rowid and project-memory sequence. They are diagnostic source positions only: other ledger
-tables can change without either value changing, so watermark equality **must not** be used as
+Project memory is a separately fsynced JSONL source, and campaign/archive lifecycle is a
+separately fsynced canonical JSON source. Both are read outside the SQLite transaction, and v2
+does not claim an atomic revision across the three stores. The `sourceWatermarks` object reports
+the independently observed run-scoped maximum Factory event rowid, project-memory sequence, and
+campaign-lifecycle content digest. They are diagnostic source observations only: other ledger
+tables can change without any of them changing, so watermark equality **must not** be used as
 full projection identity, an ETag, or a change-detection cursor.
 
 `semanticSha256` identifies only the outcome meaning present in one completed canonical-source
 projection.
-It does **not** claim an atomic revision across SQLite and project memory, identify every ledger
+It does **not** claim an atomic revision across SQLite, project memory, and campaign lifecycle, identify every ledger
 table or run-snapshot field, bind unprojected proof bytes, replace artifact digests, or certify
 that two observations read the sources at the same instant. Because it excludes observation
 metadata and carries no HTTP cache semantics, it is not advertised as an ETag or incremental
@@ -270,8 +282,9 @@ guards remain authoritative when delayed responses race a replacement stream.
 
 ## Canonical notification candidate policy
 
-`rekit_factory.notification_policy.notification_candidates` is a pure old-to-new projection
-policy. Both observations must be intact `factory-outcomes/v1` projections: the policy checks
+`rekit_factory.notification_policy.notification_candidates` remains a v1 pure old-to-new
+transition policy over the current `factory-outcomes/v2` projection. Its admission contract
+imports the canonical vocabulary version, verifies the complete semantic bytes, and then checks
 the schema and vocabulary, recomputes `semanticSha256`, and verifies the exact
 `semanticCanonicalBase64` carrier before inspecting canonical facets. Initial hydration,
 semantic equality, and watermark-only movement emit no candidates.

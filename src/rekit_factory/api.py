@@ -21,7 +21,6 @@ from rekit_factory.dossiers import DossierNotReady, dossier_list, verify_publish
 from rekit_factory.outcomes import is_worker_report_result
 from rekit_factory.scope import AuthorizedScope
 from rekit_factory.store import FactoryLedger
-from rekit_factory.strategies import DEFAULT_STRATEGIES
 
 
 MAX_BODY = 1_000_000
@@ -139,10 +138,7 @@ class FactoryHandler(BaseHTTPRequestHandler):
                         self.server.controller.safety_policies.default_policy_id
                     ),
                     "safetyPolicies": self.server.controller.public_safety_policies(),
-                    "strategies": [
-                        {"name": item.name, "description": item.description}
-                        for item in DEFAULT_STRATEGIES.values()
-                    ],
+                    "strategies": self.server.controller.public_strategy_metadata(),
                     "knowledgeRoots": [
                         {"name": root.name}
                         for root in (self.server.controller.knowledge.roots
@@ -266,12 +262,16 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     tools=tuple(payload.get("tools", [])),
                     model_tools=tuple(payload.get("modelTools", [])),
                     worker_roles=tuple(payload.get("workerRoles") or ("recon", "analyst")),
-                    concurrency=int(payload.get("concurrency", 4)),
+                    concurrency=(int(payload["concurrency"])
+                                 if payload.get("concurrency") is not None else None),
                     model_profile=payload.get("modelProfile"),
                     strategy=payload.get("strategy"),
-                    retries_per_worker=int(payload.get("retriesPerWorker", 1)),
-                    cost_units=int(payload.get("costUnits", 100)),
-                    max_workers=int(payload.get("maxWorkers", 8)),
+                    retries_per_worker=(int(payload["retriesPerWorker"])
+                                        if payload.get("retriesPerWorker") is not None else None),
+                    cost_units=(int(payload["costUnits"])
+                                if payload.get("costUnits") is not None else None),
+                    max_workers=(int(payload["maxWorkers"])
+                                 if payload.get("maxWorkers") is not None else None),
                     scope=(AuthorizedScope.from_dict(payload["scope"])
                            if payload.get("scope") is not None else None),
                     safety_policy_id=payload.get("safetyPolicyId"),
