@@ -23,10 +23,25 @@
     return tracker.claim(runId, questionIds) ? questionIds.length : 0;
   }
 
-  function restoreFocus(element) {
+  function focusTarget(element, documentObject) {
     if (!element?.isConnected || typeof element.focus !== "function") return false;
-    element.focus({preventScroll: true});
-    return true;
+    if (element.hidden || element.getAttribute?.("aria-hidden") === "true") return false;
+    if (element.closest?.("[hidden], [aria-hidden='true']")) return false;
+    const style = documentObject?.defaultView?.getComputedStyle?.(element);
+    if (style?.display === "none" || style?.visibility === "hidden") return false;
+    try {
+      element.focus({preventScroll: true});
+    } catch (_error) {
+      return false;
+    }
+    return !documentObject || documentObject.activeElement === element;
+  }
+
+  function restoreFocus(element, documentObject, fallbacks = []) {
+    for (const candidate of [element, ...fallbacks]) {
+      if (focusTarget(candidate, documentObject)) return candidate;
+    }
+    return null;
   }
 
   function focusInbox(container, heading) {
@@ -35,6 +50,12 @@
     if (typeof target?.focus !== "function") return null;
     target.focus({preventScroll: true});
     return target;
+  }
+
+  function shouldFocusInbox(expectedGeneration, currentGeneration, inboxView) {
+    return expectedGeneration === currentGeneration && Boolean(
+      inboxView?.classList?.contains("active")
+    );
   }
 
   function createTracker({seenLimit = 512} = {}) {
@@ -73,5 +94,7 @@
     return {claim, rearm, transitions};
   }
 
-  return {claimQuestionState, createTracker, focusInbox, messageFor, restoreFocus};
+  return {
+    claimQuestionState, createTracker, focusInbox, messageFor, restoreFocus, shouldFocusInbox,
+  };
 });

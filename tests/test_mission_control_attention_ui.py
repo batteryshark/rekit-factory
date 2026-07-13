@@ -26,7 +26,8 @@ class MissionControlAttentionTests(unittest.TestCase):
         for behavior in (
             "state.attention.transitions(runs)", "MissionAttention.messageFor(runCount, questionCount)",
             "MissionAttention.claimQuestionState", "openAttentionInbox", "focusInbox",
-            "MissionAttention.restoreFocus(previous)", "dismissAttention", "cancelAnimationFrame",
+            "MissionAttention.restoreFocus(", "MissionAttention.shouldFocusInbox(",
+            "state.viewGeneration", "dismissAttention", "cancelAnimationFrame",
         ):
             self.assertIn(behavior, script)
         announce = script[script.index("async function announceAttention"):script.index("const delay")]
