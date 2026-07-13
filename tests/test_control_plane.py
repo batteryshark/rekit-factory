@@ -444,6 +444,23 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn("updateEvidence", script)
         self.assertNotIn("rawPath", script)
 
+    def test_mission_control_renders_canonical_memory_and_scope_projections(self):
+        ui = Path(__file__).parents[1] / "src" / "rekit_factory" / "ui"
+        page = (ui / "index.html").read_text(encoding="utf-8")
+        script = (ui / "mission-control.js").read_text(encoding="utf-8")
+        style = (ui / "mission-control.css").read_text(encoding="utf-8")
+
+        for marker in ('data-tab="memory"', 'id="memoryRibbon"', 'id="memoryGroups"',
+                       'id="memoryContext"', 'id="scopeSummary"'):
+            self.assertIn(marker, page)
+        for field in ("snapshot.memory", "snapshot.memoryContext", "meta.scope",
+                      "workstreams", "attempts", "decisions", "theories",
+                      "questions", "next_actions", "missing_references"):
+            self.assertIn(field, script)
+        self.assertIn("prefers-reduced-motion", style)
+        self.assertIn("memory-scan", style)
+        self.assertNotIn("state.memory", script)
+
     def test_loopback_service_restart_is_explicit_and_stops_the_server(self):
         with tempfile.TemporaryDirectory() as tmp:
             controller = InvestigationController(
@@ -491,6 +508,8 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b'id="retriesPerWorker"', page)
                     self.assertIn(b'value="automatic-only"', page)
                     self.assertIn(b'id="restartService"', page)
+                    self.assertIn(b'data-tab="memory"', page)
+                    self.assertIn(b'id="scopeSummary"', page)
                 with urlopen(base + "/ui/mission-control.css", timeout=5) as response:
                     self.assertEqual("text/css; charset=utf-8", response.headers["Content-Type"])
                     self.assertIn(b"prefers-reduced-motion", response.read())
@@ -534,6 +553,9 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertTrue(answered["started"])
                 completed = self._wait_status(base, run_id, "completed")
                 self.assertEqual(0, completed["coverage"]["pending"])
+                self.assertEqual("Exercise the API permission path", completed["memory"]["goals"][-1]["text"])
+                self.assertIn("GOAL: Exercise the API permission path", completed["memoryContext"])
+                self.assertEqual("none", completed["meta"]["scope"]["networkMode"])
                 reports = self._request(base + f"/api/runs/{run_id}/reports")
                 self.assertEqual(1, len(reports["reports"]))
                 self.assertEqual("analyst", reports["reports"][0]["role"])

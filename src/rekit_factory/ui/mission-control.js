@@ -138,6 +138,15 @@ function activate(element) {
   if (restart) { restartService(); return true; }
   const view = element.closest("[data-view]");
   if (view) { show(view.dataset.view); return true; }
+  const memoryToggle = element.closest("[data-memory-toggle]");
+  if (memoryToggle) {
+    const body = document.getElementById(memoryToggle.getAttribute("aria-controls"));
+    const expanded = memoryToggle.getAttribute("aria-expanded") !== "false";
+    memoryToggle.setAttribute("aria-expanded", String(!expanded));
+    if (body) body.hidden = expanded;
+    return true;
+  }
+  if (element.closest("#copyMemoryContext")) { copyMemoryContext(); return true; }
   const evidenceAction = element.closest("[data-evidence-action]");
   if (evidenceAction) { updateEvidence(evidenceAction.dataset.evidenceId, evidenceAction.dataset.evidenceAction); return true; }
   const card = element.closest("[data-run]");
@@ -267,17 +276,102 @@ function renderEvidence() {
   }).join("") : `<div class="empty compact"><b>No retained evidence</b>Proof-required captures and their lifecycle state will appear here.</div>`;
 }
 
+const memoryValues = value => Array.isArray(value) ? value : value && typeof value === "object" ? Object.values(value) : [];
+const memoryStatus = item => String(item.status || "recorded").replaceAll("_", " ");
+const memoryTone = status => ({active: "live", running: "live", supported: "good", completed: "good", answered: "good", failed: "bad", blocked: "bad", disproven: "bad", rejected: "bad", inconclusive: "warn", paused: "warn", testing: "testing", open: "testing", pending: "testing"})[status] || "neutral";
+const memoryRefs = item => (item.references || []).map(reference => `${reference.kind}:${reference.id}`);
+
+function memoryCard(item, group, index) {
+  const fields = {
+    workstreams: [item.title, item.goal, item.nextAction && `Next: ${item.nextAction}`, item.stopCondition && `Stop when: ${item.stopCondition}`],
+    attempts: [item.method, item.intent, item.result, item.followUp && `Follow-up: ${item.followUp}`],
+    decisions: [item.choice, item.rationale, item.alternatives?.length && `Alternatives: ${item.alternatives.join(" · ")}`],
+    questions: [item.question],
+    theories: [item.claim, item.confidence !== undefined && `Confidence: ${typeof item.confidence === "number" ? Math.round(item.confidence * 100) + "%" : item.confidence}`],
+    next_actions: [item.text, item.blockers?.length && `Blocked by: ${item.blockers.join(", ")}`],
+  }[group] || [item.text || item.title || item.id];
+  const values = fields.filter(Boolean), title = values.shift() || item.id || "Memory record";
+  const refs = memoryRefs(item), status = String(item.status || "recorded");
+  return `<article class="memory-card ${memoryTone(status)}" style="--memory-order:${index}"><header><span>${esc(group.replaceAll("_", " "))}</span><b>${esc(memoryStatus(item))}</b></header><h4>${esc(title)}</h4>${values.map(value => `<p>${esc(value)}</p>`).join("")}${refs.length ? `<footer>${refs.map(reference => `<code>${esc(reference)}</code>`).join("")}</footer>` : ""}<i class="memory-seq">#${esc(item._eventSeq ?? "—")}</i></article>`;
+}
+
+function renderMemoryGroup(key, label, items, startIndex) {
+  if (!items.length) return "";
+  const id = `memory-group-${key}`;
+  return `<section class="memory-group"><button class="memory-group-toggle" type="button" data-memory-toggle aria-expanded="true" aria-controls="${id}"><span>${esc(label)}</span><b>${items.length}</b><i aria-hidden="true">⌄</i></button><div class="memory-card-grid" id="${id}">${items.map((item, index) => memoryCard(item, key, startIndex + index)).join("")}</div></section>`;
+}
+
+function renderScope(meta) {
+  const scope = meta.scope;
+  if (!scope) {
+    $("scopeSummary").innerHTML = `<div class="scope-empty">No canonical scope projection</div>`;
+    return;
+  }
+  const actions = scope.actions || [], until = scope.validUntil ? new Date(scope.validUntil) : null;
+  $("scopeSummary").innerHTML = `<div class="scope-state"><i></i><div><b>${esc(scope.scopeId)}</b><span>revision ${esc(scope.revision)} · ${esc(scope.digest?.slice(0, 12) || "no digest")}</span></div></div><div class="scope-facts"><span><b>network</b>${esc(scope.networkMode)}</span><span><b>data</b>${esc(scope.dataHandling)}</span><span><b>credentials</b>${scope.credentialUse ? "allowed" : "withheld"}</span><span><b>valid until</b>${esc(until && !Number.isNaN(until.valueOf()) ? until.toLocaleString() : "not declared")}</span></div><div class="scope-actions">${actions.map(action => `<span>${esc(action.replaceAll("_", " "))}</span>`).join("") || "<span>no actions</span>"}</div><div class="scope-foot">${(scope.targetRefs || []).length} exact target · ${(scope.endpointRefs || []).length} endpoint grants</div>`;
+}
+
+function renderMemory(snapshot) {
+  const memory = snapshot.memory || {}, goals = memoryValues(memory.goals);
+  const groups = [
+    ["workstreams", "Workstreams"], ["attempts", "Attempts & negative results"],
+    ["decisions", "Decisions"], ["theories", "Theories"],
+    ["questions", "Open questions"], ["next_actions", "Next actions"],
+  ];
+  const collections = groups.map(([key, label]) => {
+    const items = memoryValues(memory[key]);
+    return [key, label, key === "questions" ? items.filter(item => item.status === "open") : items];
+  });
+  const entityCount = collections.reduce((total, [, , items]) => total + items.length, 0);
+  const openCount = memoryValues(memory.questions).filter(item => item.status === "open").length;
+  const negativeCount = memoryValues(memory.attempts).filter(item => ["failed", "blocked", "inconclusive"].includes(item.status)).length;
+  const currentGoal = goals.at(-1)?.text || snapshot.meta.goal || "No durable project goal recorded";
+  $("memoryGoal").textContent = currentGoal;
+  $("memorySummary").innerHTML = `<span><b>${entityCount}</b> records</span><span><b>${negativeCount}</b> negatives</span><span><b>${openCount}</b> open</span><span class="${memory.degraded ? "degraded" : "healthy"}"><b>${memory.degraded ? "!" : "✓"}</b>${memory.degraded ? "degraded" : "verified fold"}</span>`;
+  $("memoryRibbon").classList.toggle("degraded", Boolean(memory.degraded));
+  $("memoryCount").textContent = entityCount;
+  $("memoryContext").textContent = snapshot.memoryContext || "No bounded resume context has been projected yet.";
+  const diagnostics = memoryValues(memory.diagnostics), missing = memoryValues(memory.missing_references);
+  const unknowns = memoryValues(memory.compaction?.unknowns);
+  const degraded = memory.degraded ? `<div class="memory-alert"><b>Memory projection is degraded</b><span>${diagnostics.map(esc).join(" · ") || "Canonical replay reported a degraded state."}</span>${missing.length ? `<small>${missing.length} optional references are unavailable.</small>` : ""}</div>` : "";
+  const unresolved = unknowns.length ? `<div class="memory-unresolved"><b>Unresolved at last compaction</b><span>${unknowns.map(esc).join(" · ")}</span></div>` : "";
+  $("memoryDegraded").innerHTML = degraded + unresolved;
+  let index = 0;
+  const rendered = collections.map(([key, label, items]) => {
+    const result = renderMemoryGroup(key, label, items, index);
+    index += items.length;
+    return result;
+  }).join("");
+  $("memoryGroups").innerHTML = rendered || `<div class="empty compact"><b>No reasoning records yet</b>Durable workstreams, attempts, decisions, theories, questions, and next actions will appear here.</div>`;
+}
+
+async function copyMemoryContext() {
+  const value = state.snapshot?.memoryContext || "";
+  if (!value) { toast("No resume context is available yet.", true); return; }
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+    else {
+      const field = document.createElement("textarea"); field.value = value;
+      field.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+      document.body.appendChild(field); field.select(); document.execCommand("copy"); field.remove();
+    }
+    toast("Bounded resume context copied.");
+  } catch (_error) { toast("The browser did not allow clipboard access.", true); }
+}
+
 function renderDetail() {
   const snapshot = state.snapshot, run = snapshot.run, meta = snapshot.meta;
   const events = snapshot.events || [], artifacts = snapshot.artifacts || [], questions = snapshot.pendingQuestions || [];
   $("detailTitle").textContent = meta.target.split("/").pop(); $("detailGoal").textContent = meta.goal;
   $("runMeta").innerHTML = [["status", run.status], ["run", run.id], ["model", meta.modelProfile.model], ["coverage", `${snapshot.coverage.terminal}/${snapshot.coverage.workItemsTotal}`], ["target", meta.target]].map(([name, value]) => `<div class="kv"><span>${esc(name)}</span><span>${esc(value)}</span></div>`).join("");
+  renderScope(meta);
   $("workers").innerHTML = snapshot.workers.map(worker => `<div class="worker"><div class="worker-top"><span class="worker-role">${esc(worker.role)}</span><span class="worker-status">${esc(worker.status)}</span></div><div class="worker-step">${esc(worker.current_step || "queued")}</div>${worker.error ? `<div class="worker-error">${esc(worker.error)}</div>` : ""}</div>`).join("");
   $("activitySummary").innerHTML = MissionObservability.activitySummary(events);
   $("events").innerHTML = events.map(MissionObservability.renderEvent).join("") || `<div class="empty compact"><b>No activity yet</b>Semantic model and worker events will stream here.</div>`;
   $("events").scrollTop = $("events").scrollHeight;
   $("reports").innerHTML = MissionObservability.renderReports(snapshot);
   $("usage").innerHTML = MissionObservability.renderUsage(snapshot);
+  renderMemory(snapshot);
   $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
   renderEvidence();
   $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;

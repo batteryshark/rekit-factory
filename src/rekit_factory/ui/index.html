@@ -53,16 +53,19 @@
       <section class="view" id="view-detail">
         <div class="view-head"><div><div class="eyebrow">INVESTIGATION</div><h1 id="detailTitle">Investigation</h1><div class="sub" id="detailGoal"></div></div><div class="grow"></div><button class="btn" disabled title="Pause is not implemented yet">Pause</button><button class="btn red" disabled title="Stop is not implemented yet">Stop</button></div>
         <div class="detail-grid">
-          <aside class="panel"><h3>Run</h3><div class="side-kv" id="runMeta"></div><h3 class="section-title">Workers</h3><div class="workers" id="workers"></div></aside>
+          <aside class="panel"><h3>Run</h3><div class="side-kv" id="runMeta"></div><h3 class="section-title">Authorization</h3><div class="scope-summary" id="scopeSummary"></div><h3 class="section-title">Workers</h3><div class="workers" id="workers"></div></aside>
           <div class="detail-main">
+            <section class="mission-ribbon" id="memoryRibbon" aria-label="Durable project memory"><div class="mission-signal" aria-hidden="true"><i></i><span>◆</span></div><div class="mission-copy"><span>Current durable goal</span><b id="memoryGoal">No project goal recorded</b></div><div class="mission-metrics" id="memorySummary"></div></section>
             <div class="tabs" role="tablist" aria-label="Investigation detail">
               <button class="tab active" role="tab" aria-selected="true" data-tab="activity">Activity <span class="tab-count" id="activityCount">0</span></button>
+              <button class="tab" role="tab" aria-selected="false" data-tab="memory">Memory <span class="tab-count" id="memoryCount">0</span></button>
               <button class="tab" role="tab" aria-selected="false" data-tab="reports">Reports <span class="tab-count" id="reportCount">0</span></button>
               <button class="tab" role="tab" aria-selected="false" data-tab="usage">Usage <span class="tab-count" id="usageCount">0</span></button>
               <button class="tab" role="tab" aria-selected="false" data-tab="artifacts">Artifacts <span class="tab-count" id="artifactCount">0</span></button>
               <button class="tab" role="tab" aria-selected="false" data-tab="decisions">Decisions <span class="tab-count" id="decisionCount">0</span></button>
             </div>
             <div class="tabpane active" role="tabpanel" id="tab-activity"><div class="activity-summary" id="activitySummary"></div><div class="events" id="events" aria-live="polite"></div></div>
+            <div class="tabpane" role="tabpanel" id="tab-memory"><div class="memory-board"><div class="memory-primary"><div class="memory-board-head"><div><span class="eyebrow">DURABLE REASONING</span><h2>Project memory</h2></div><button class="btn" id="copyMemoryContext" type="button">Copy resume context</button></div><div id="memoryDegraded"></div><div class="memory-groups" id="memoryGroups"></div></div><aside class="memory-context-panel"><div><span class="eyebrow">BOUNDED PROJECTION</span><b>Worker resume context</b></div><pre id="memoryContext"></pre></aside></div></div>
             <div class="tabpane" role="tabpanel" id="tab-reports"><div class="report-grid" id="reports"></div></div>
             <div class="tabpane" role="tabpanel" id="tab-usage"><div id="usage"></div></div>
             <div class="tabpane" role="tabpanel" id="tab-artifacts"><div class="panel"><h3>Run outputs</h3><div class="artifacts" id="artifacts"></div><h3 class="section-title">Evidence retention</h3><div class="evidence-lifecycle" id="evidenceLifecycle"></div></div></div>
