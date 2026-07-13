@@ -24,6 +24,8 @@ KNOWN_TYPES = frozenset({
     "research_question_upserted", "theory_upserted", "next_action_upserted",
     "session_compacted",
     "hypothesis_upserted", "hypothesis_test_upserted", "hypothesis_observation_recorded",
+    "finding_upserted", "finding_attempt_recorded", "finding_transition_recorded",
+    "finding_operator_decision_recorded",
 })
 ENTITY_TYPES = KNOWN_TYPES - {"session_compacted"}
 REFERENCE_KINDS = frozenset({
@@ -47,6 +49,8 @@ class MemoryAction:
         "session_compacted",
         "hypothesis_upserted", "hypothesis_test_upserted",
         "hypothesis_observation_recorded",
+        "finding_upserted", "finding_attempt_recorded", "finding_transition_recorded",
+        "finding_operator_decision_recorded",
     ]
     payload: dict[str, Any]
     action_id: str | None = None
@@ -77,6 +81,10 @@ class ProjectMemory:
     hypotheses: dict[str, dict[str, Any]] = field(default_factory=dict)
     hypothesis_tests: dict[str, dict[str, Any]] = field(default_factory=dict)
     hypothesis_observations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    findings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    finding_attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    finding_transitions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    finding_operator_decisions: dict[str, dict[str, Any]] = field(default_factory=dict)
     compaction: dict[str, Any] | None = None
     degraded: bool = False
     diagnostics: list[str] = field(default_factory=list)
@@ -86,7 +94,8 @@ class ProjectMemory:
         value = asdict(self)
         for name in ("workstreams", "attempts", "decisions", "questions",
                      "theories", "next_actions", "hypotheses", "hypothesis_tests",
-                     "hypothesis_observations"):
+                     "hypothesis_observations", "findings", "finding_attempts",
+                     "finding_transitions", "finding_operator_decisions"):
             value[name] = {key: value[name][key] for key in sorted(value[name])}
         value["missing_references"] = sorted(
             value["missing_references"], key=lambda item: (item["kind"], item["id"])
@@ -183,6 +192,10 @@ def fold_memory(events: list[MemoryEvent], *, diagnostics: list[str] | None = No
                 "hypothesis_upserted": memory.hypotheses,
                 "hypothesis_test_upserted": memory.hypothesis_tests,
                 "hypothesis_observation_recorded": memory.hypothesis_observations,
+                "finding_upserted": memory.findings,
+                "finding_attempt_recorded": memory.finding_attempts,
+                "finding_transition_recorded": memory.finding_transitions,
+                "finding_operator_decision_recorded": memory.finding_operator_decisions,
             }[event.type]
             collection[item["id"]] = item
         if reference_exists:
@@ -240,6 +253,16 @@ def memory_context(memory: ProjectMemory, *, max_chars: int = 8_000) -> str:
             f"{'; '.join(item.get('observations', []))}"
         )
         sections.append((860, _line("HYPOTHESIS EVIDENCE", text, item)))
+    for item in memory.findings.values():
+        status = item.get("status")
+        text = f"{item.get('affectedComponent')}: {item.get('impactClaim')} | status={status}"
+        label = "VALIDATED FINDING" if status == "reproduced" else "FINDING CANDIDATE"
+        sections.append((880 if status == "reproduced" else 820, _line(label, text, item)))
+    for item in memory.finding_attempts.values():
+        if item.get("outcome") in {"negative", "flaky", "contradictory"}:
+            text = f"{item.get('findingId')} outcome={item.get('outcome')}: " \
+                   f"{'; '.join(item.get('observations', []))}"
+            sections.append((890, _line("REPRODUCTION NEGATIVE", text, item)))
     for item in memory.next_actions.values():
         if item.get("status") == "pending" and not item.get("blockers"):
             sections.append((700 + int(item.get("priority", 0)),
@@ -277,6 +300,10 @@ def render_markdown(memory: ProjectMemory) -> str:
         ("Hypotheses", memory.hypotheses.values(), "claim"),
         ("Hypothesis tests", memory.hypothesis_tests.values(), "objective"),
         ("Hypothesis observations", memory.hypothesis_observations.values(), "reason"),
+        ("Findings", memory.findings.values(), "impactClaim"),
+        ("Finding reproduction attempts", memory.finding_attempts.values(), "outcome"),
+        ("Finding transitions", memory.finding_transitions.values(), "reason"),
+        ("Finding operator decisions", memory.finding_operator_decisions.values(), "rationale"),
     )
     for title, values, label in groups:
         lines += [f"## {title}", ""]
@@ -342,15 +369,32 @@ def _validate_action(action: MemoryAction) -> dict[str, Any]:
         "hypothesis_observation_recorded": (
             "id", "hypothesisId", "testId", "outcome", "observations", "reason", "references",
         ),
+        "finding_upserted": (
+            "id", "hypothesisId", "scope", "observations", "affectedComponent",
+            "impactClaim", "assumptions", "knownUncertainty", "findingType",
+            "consequence", "proofPolicy", "recipe", "status", "originWorkerId",
+            "originSessionId", "references",
+        ),
+        "finding_attempt_recorded": (
+            "id", "findingId", "recipeId", "outcome", "workerId", "sessionId",
+            "environment", "observations", "environmentalDifferences", "references",
+        ),
+        "finding_transition_recorded": (
+            "id", "findingId", "fromStatus", "toStatus", "reason", "references",
+        ),
+        "finding_operator_decision_recorded": (
+            "id", "findingId", "decision", "rationale", "unmetCriteria", "references",
+        ),
     }[action.type]
     missing = [name for name in required if name not in payload]
     if missing:
         raise ValueError(f"{action.type} missing fields: {', '.join(missing)}")
     for name in required:
-        if name in {"alternatives", "unknowns", "references", "observations"}:
+        if name in {"alternatives", "unknowns", "references", "observations",
+                    "assumptions", "environmentalDifferences", "unmetCriteria"}:
             if not isinstance(payload[name], list):
                 raise ValueError(f"{action.type}.{name} must be a list")
-        elif name == "stopCondition":
+        elif name in {"stopCondition", "proofPolicy", "recipe", "environment"}:
             if not isinstance(payload[name], dict):
                 raise ValueError("hypothesis stopCondition must be an object")
         elif name == "priority":
@@ -373,6 +417,10 @@ def _validate_action(action: MemoryAction) -> dict[str, Any]:
             "reproduced", "retired", "blocked",
         },
         "hypothesis_test_upserted": {"proposed", "queued", "leased", "completed", "blocked"},
+        "finding_upserted": {
+            "lead", "candidate", "demonstrated", "reproduction-pending", "reproduced",
+            "rejected", "withdrawn", "inconclusive",
+        },
     }
     if action.type in statuses and payload["status"] not in statuses[action.type]:
         raise ValueError(f"invalid {action.type} status {payload['status']!r}")

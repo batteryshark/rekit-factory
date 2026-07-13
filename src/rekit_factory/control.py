@@ -41,12 +41,18 @@ from rekit_factory.evidence import (
     hash_target,
     render_tool_output,
 )
-from rekit_factory.memory import MemoryAction, ProjectMemoryLog, memory_context
+from rekit_factory.memory import EvidenceRef, MemoryAction, ProjectMemoryLog, memory_context
 from rekit_factory.hypotheses import (
     HypothesisMemory,
     HypothesisUpdate,
     hypothesis_snapshot,
     test_priority,
+)
+from rekit_factory.findings import (
+    FindingMemory,
+    FindingTransition,
+    ReproductionAttempt,
+    finding_snapshot,
 )
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.scope import (
@@ -421,6 +427,7 @@ class InvestigationController:
             "memory": project_memory.deterministic_dict(),
             "memoryContext": memory_context(project_memory),
             "hypothesisState": hypothesis_snapshot(project_memory),
+            "findingState": finding_snapshot(project_memory),
         }
 
     async def _tool_handler(self, ctx, item: dict[str, Any]) -> None:
@@ -663,8 +670,14 @@ class InvestigationController:
                 )
 
             project_memory = _project_memory_log(ctx.deps.paths).replay()
-            resume_context = memory_context(project_memory)
-            tool_context = _tool_context(ledger, ctx.state.run_id)
+            resume_context = (
+                "[originating reasoning withheld for independent reproduction]"
+                if payload.get("findingId") else memory_context(project_memory)
+            )
+            tool_context = _tool_context(
+                ledger, ctx.state.run_id,
+                evidence_ids=(payload.get("evidenceIds") if payload.get("findingId") else None),
+            )
             bounded_context = (
                 f"Project memory (bounded, cited):\n{resume_context}\n\n"
                 f"Rekit tool evidence:\n{tool_context or '[no tool results]'}"
@@ -758,11 +771,39 @@ class InvestigationController:
                 expected_hypothesis_id=hypothesis_id,
                 expected_test_id=hypothesis_test_id,
             )
+            reproduction_results = self._apply_reproduction_results(
+                ctx.deps.paths, payload, worker_backend.profile.name,
+                getattr(report, "reproduction_results", ()),
+            )
+            if payload.get("findingId") and reproduction_results == 0:
+                event_id = ledger.event_log(
+                    ctx.state.run_id, "finding.validation_inconclusive",
+                    "Validator completed without a matching structured reproduction result",
+                    worker_id=worker_id,
+                    payload={"findingId": payload["findingId"],
+                             "attemptId": payload.get("reproductionAttemptId")},
+                )
+                self._record_inconclusive_reproduction(
+                    ctx.deps.paths, payload, worker_backend.profile.name,
+                    "No matching structured reproduction result was returned",
+                    EvidenceRef("run-event", event_id),
+                )
             hypotheses_scheduled, hypotheses_rejected = self._schedule_hypotheses(
                 ledger, ctx.deps.paths, ctx.state.run_id, item,
                 worker_backend.profile.name, payload.get("availableTools", ()),
                 getattr(report, "proposed_hypotheses", ()),
             )
+            findings_scheduled, findings_rejected = self._schedule_findings(
+                ledger, ctx.deps.paths, ctx.state.run_id, item,
+                worker_backend.profile.name, payload.get("availableTools", ()),
+                getattr(report, "proposed_findings", ()),
+            )
+            if payload.get("findingId") and reproduction_results:
+                self._schedule_remaining_reproduction(
+                    ledger, ctx.deps.paths, ctx.state.run_id, item,
+                    worker_backend.profile.name, payload.get("availableTools", ()),
+                    payload["findingId"],
+                )
             if hypothesis_id and hypothesis_test_id and hypothesis_updates == 0:
                 current = HypothesisMemory(_project_memory_log(ctx.deps.paths)).log.replay().hypotheses[
                     hypothesis_id
@@ -800,6 +841,14 @@ class InvestigationController:
                              "rejected": hypotheses_rejected,
                              "updates": hypothesis_updates},
                 )
+            if findings_scheduled or findings_rejected or reproduction_results:
+                ledger.event_log(
+                    ctx.state.run_id, "finding.activity",
+                    "Processed structured proof-gated finding actions", worker_id=worker_id,
+                    payload={"scheduled": findings_scheduled,
+                             "rejected": findings_rejected,
+                             "reproductionResults": reproduction_results},
+                )
             self._enqueue_follow_ups(
                 ledger, ctx.state.run_id, item, payload, report.next_actions,
                 ctx.deps.paths, worker_backend.profile.name,
@@ -825,10 +874,17 @@ class InvestigationController:
                 worker_id, status="failed", current_step="model call failed",
                 error=f"{type(exc).__name__}: {exc}",
             )
-            ledger.event_log(
+            failure_event_id = ledger.event_log(
                 ctx.state.run_id, "worker.failed", f"{type(exc).__name__}: {exc}",
                 worker_id=worker_id,
             )
+            if payload.get("findingId"):
+                self._record_inconclusive_reproduction(
+                    ctx.deps.paths, payload,
+                    self.worker_backend(payload.get("modelProfile")).profile.name,
+                    f"Validator execution failed: {type(exc).__name__}: {exc}",
+                    EvidenceRef("run-event", failure_event_id),
+                )
             if hypothesis_id and hypothesis_test_id:
                 hypothesis_memory = HypothesisMemory(_project_memory_log(ctx.deps.paths))
                 current = hypothesis_memory.log.replay().hypotheses.get(hypothesis_id)
@@ -953,6 +1009,150 @@ class InvestigationController:
                 rejected += 1
         return scheduled, rejected
 
+    def _apply_reproduction_results(self, paths: RunPaths, payload: dict[str, Any],
+                                    model_profile: str, results: Any) -> int:
+        """Apply only explicit validator results and bind them to controller-owned identity."""
+        finding_id = payload.get("findingId")
+        attempt_id = payload.get("reproductionAttemptId")
+        if not finding_id or not attempt_id:
+            return 0
+        findings = FindingMemory(_project_memory_log(paths))
+        accepted = 0
+        for result in results or ():
+            try:
+                if result.finding_id != finding_id or result.attempt_id != attempt_id:
+                    raise ValueError("reproduction result does not match assigned validation")
+                findings.record_attempt(ReproductionAttempt(
+                    id=attempt_id,
+                    finding_id=finding_id,
+                    recipe_id=payload["recipeId"],
+                    outcome=result.outcome,
+                    worker_id=payload["workerId"],
+                    session_id=payload["validatorSessionId"],
+                    environment_id=payload["validatorEnvironmentId"],
+                    clean_environment=payload["cleanEnvironment"],
+                    model_profile=model_profile,
+                    observations=result.observations,
+                    environmental_differences=result.environmental_differences,
+                    references=result.references,
+                ))
+                accepted += 1
+            except (KeyError, TypeError, ValueError):
+                continue
+        return accepted
+
+    def _schedule_findings(self, ledger: FactoryLedger, paths: RunPaths, run_id: str,
+                           parent_item: dict[str, Any], model_profile: str,
+                           model_tools: Any, proposals: Any) -> tuple[int, int]:
+        findings = FindingMemory(_project_memory_log(paths))
+        parent_payload = json.loads(parent_item["payload_json"])
+        scheduled = rejected = 0
+        for proposal in proposals or ():
+            try:
+                if proposal.scope != "target":
+                    raise ValueError("finding would broaden target scope")
+                if not findings.propose(
+                    proposal,
+                    origin_worker_id=parent_payload["workerId"],
+                    origin_session_id=f"session:{parent_payload['workerId']}",
+                    origin_model_profile=model_profile,
+                ):
+                    continue
+                self._enqueue_finding_validation(
+                    ledger, paths, run_id, parent_item, model_profile, model_tools,
+                    proposal.id, 1,
+                )
+                findings.mark_validation_pending(proposal.id)
+                scheduled += 1
+            except (KeyError, TypeError, ValueError):
+                rejected += 1
+        return scheduled, rejected
+
+    def _schedule_remaining_reproduction(self, ledger: FactoryLedger, paths: RunPaths,
+                                         run_id: str, parent_item: dict[str, Any],
+                                         model_profile: str, model_tools: Any,
+                                         finding_id: str) -> None:
+        memory = _project_memory_log(paths).replay()
+        finding = memory.findings.get(finding_id)
+        if finding is None or finding["status"] != "reproduction-pending":
+            return
+        attempts = [item for item in memory.finding_attempts.values()
+                    if item["findingId"] == finding_id]
+        required = int(finding["proofPolicy"]["successful_clean_reproductions"])
+        if len(attempts) >= required or any(
+            item["outcome"] in {"negative", "flaky", "contradictory", "inconclusive"}
+            for item in attempts
+        ):
+            return
+        self._enqueue_finding_validation(
+            ledger, paths, run_id, parent_item, model_profile, model_tools,
+            finding_id, len(attempts) + 1,
+        )
+
+    def _enqueue_finding_validation(self, ledger: FactoryLedger, paths: RunPaths,
+                                    run_id: str, parent_item: dict[str, Any],
+                                    model_profile: str, model_tools: Any,
+                                    finding_id: str, attempt_number: int) -> str:
+        finding = _project_memory_log(paths).replay().findings[finding_id]
+        recipe = finding["recipe"]
+        attempt_id = f"repro-{finding_id}-{attempt_number}"
+        plan_id = f"finding-validation:{finding_id}:{attempt_number}"
+        worker_id = ledger.add_planned_worker(
+            run_id, plan_id, f"finding-validator:{finding_id}", model_profile
+        )
+        if worker_id == finding["originWorkerId"]:
+            raise ValueError("independent validation cannot reuse the origin worker")
+        environment_id = "clean:" + stable_key(
+            "finding-environment", run_id, finding_id, str(attempt_number)
+        )
+        material_refs = sorted({
+            f"{item['kind']}:{item['id']}"
+            for item in recipe["staged_inputs"] + finding["references"]
+        })
+        goal = (
+            f"Independent reproduction assignment {attempt_id}.\n"
+            f"Recipe id: {recipe['id']}\n"
+            f"Steps: {json.dumps(recipe['steps'], sort_keys=True)}\n"
+            f"Expected observable: {recipe['expected_observation']}\n"
+            f"Clean environment requirements: "
+            f"{json.dumps(recipe['clean_environment_requirements'], sort_keys=True)}\n"
+            f"Material evidence references: {json.dumps(material_refs)}\n"
+            "Execute only the recipe and report exact observables; do not infer conclusions. "
+            "Return results only through reproduction_results using the "
+            f"assigned finding_id={finding_id!r} and attempt_id={attempt_id!r}."
+        )
+        return ledger.enqueue(
+            run_id=run_id,
+            key=stable_key(
+                "finding-validation", finding_id, str(attempt_number),
+                json.dumps(recipe, sort_keys=True, separators=(",", ":")),
+            ),
+            target=parent_item["target"], operation="model-worker",
+            category="finding-validation", title=f"Reproduce finding {finding_id}",
+            priority=220, depends_on=[parent_item["id"]],
+            payload={
+                "workerId": worker_id,
+                "role": f"finding-validator:{finding_id}",
+                "goal": goal,
+                "modelProfile": model_profile,
+                "availableTools": list(model_tools),
+                "planId": plan_id,
+                "dedupeKey": stable_key(plan_id),
+                "costUnits": 10,
+                "origin": "finding-validation",
+                "evidenceIds": sorted({item["id"] for item in
+                                       recipe["staged_inputs"] + finding["references"]}),
+                "retryCeiling": 1,
+                "findingId": finding_id,
+                "recipeId": recipe["id"],
+                "reproductionAttemptId": attempt_id,
+                "validatorSessionId": f"session:{worker_id}",
+                "validatorEnvironmentId": environment_id,
+                "cleanEnvironment": True,
+                "originWorkerId": finding["originWorkerId"],
+            }, state_label="queued",
+        )
+
     def _enqueue_planned_worker(self, ledger: FactoryLedger, run_id: str, target: str,
                                 model_profile: str, model_tools: tuple[str, ...] | list[str],
                                 plan: InvestigationPlan, planned: PlannedWork,
@@ -976,6 +1176,27 @@ class InvestigationController:
             },
             state_label="queued",
         )
+
+    def _record_inconclusive_reproduction(self, paths: RunPaths, payload: dict[str, Any],
+                                          model_profile: str, observation: str,
+                                          reference: EvidenceRef) -> None:
+        findings = FindingMemory(_project_memory_log(paths))
+        if payload["reproductionAttemptId"] in findings.log.replay().finding_attempts:
+            return
+        findings.record_attempt(ReproductionAttempt(
+            id=payload["reproductionAttemptId"],
+            finding_id=payload["findingId"],
+            recipe_id=payload["recipeId"],
+            outcome="inconclusive",
+            worker_id=payload["workerId"],
+            session_id=payload["validatorSessionId"],
+            environment_id=payload["validatorEnvironmentId"],
+            clean_environment=payload["cleanEnvironment"],
+            model_profile=model_profile,
+            observations=[observation],
+            environmental_differences=["validator protocol did not yield an observable result"],
+            references=[reference],
+        ))
 
     def _enqueue_follow_ups(self, ledger: FactoryLedger, run_id: str,
                             item: dict[str, Any], payload: dict[str, Any],
@@ -1273,14 +1494,19 @@ def _target_snapshot(target: Path, *, max_files: int = 30, max_chars: int = 60_0
     return "\n\n".join(chunks) or f"[no readable text files under {target}]"
 
 
-def _tool_context(ledger: FactoryLedger, run_id: str, max_chars: int = 30_000) -> str:
+def _tool_context(ledger: FactoryLedger, run_id: str, max_chars: int = 30_000,
+                  evidence_ids: list[str] | None = None) -> str:
     rows = ledger.conn.execute(
-        "select path, origin from artifacts where run_id=? and kind='tool-output' "
+        "select id, sha256, path, origin from artifacts where run_id=? and kind='tool-output' "
         "order by created_at", (run_id,)
     ).fetchall()
+    allowed = set(evidence_ids) if evidence_ids is not None else None
     chunks = []
     used = 0
     for row in rows:
+        if allowed is not None and row["id"] not in allowed \
+                and (not row["sha256"] or f"sha256:{row['sha256']}" not in allowed):
+            continue
         path = Path(row["path"])
         if not path.is_file():
             continue

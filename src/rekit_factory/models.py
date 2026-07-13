@@ -22,6 +22,7 @@ from muster.pydantic_runtime import (
 )
 from rekit_factory.memory import MemoryAction
 from rekit_factory.hypotheses import HypothesisProposal, HypothesisUpdate
+from rekit_factory.findings import FindingProposal, ReproductionResultProposal
 
 
 class WorkerReport(BaseModel):
@@ -32,6 +33,8 @@ class WorkerReport(BaseModel):
     proposed_memory_actions: list[MemoryAction] = Field(default_factory=list)
     proposed_hypotheses: list[HypothesisProposal] = Field(default_factory=list)
     hypothesis_updates: list[HypothesisUpdate] = Field(default_factory=list)
+    proposed_findings: list[FindingProposal] = Field(default_factory=list)
+    reproduction_results: list[ReproductionResultProposal] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -215,7 +218,10 @@ class PydanticWorkerBackend:
                 "references. Propose testable competing explanations only through "
                 "proposed_hypotheses, and report discriminating-test outcomes only through "
                 "hypothesis_updates with cited observations. The Factory validates proposals, "
-                "scope, transitions, and scheduling and owns all persistence."
+                "scope, transitions, and scheduling and owns all persistence. Propose findings "
+                "only through proposed_findings with every required citation and recipe field. "
+                "When assigned independent validation, report observable outcomes only through "
+                "reproduction_results; prose never changes finding state."
             ),
         )
 
