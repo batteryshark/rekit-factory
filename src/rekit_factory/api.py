@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlparse
 import uuid
 
 from rekit_factory.control import InvestigationController, RunRequest
+from rekit_factory.scope import AuthorizedScope
 from rekit_factory.strategies import DEFAULT_STRATEGIES
 
 
@@ -207,6 +208,8 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     retries_per_worker=int(payload.get("retriesPerWorker", 1)),
                     cost_units=int(payload.get("costUnits", 100)),
                     max_workers=int(payload.get("maxWorkers", 8)),
+                    scope=(AuthorizedScope.from_dict(payload["scope"])
+                           if payload.get("scope") is not None else None),
                 )
                 run_dir = self.server.controller.create(request)
                 self.server.supervisor.submit(run_dir)

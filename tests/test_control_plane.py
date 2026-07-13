@@ -25,6 +25,24 @@ from rekit_factory.rekit_client import ToolManifest, ToolResult
 from rekit_factory.remote import InvocationRequest, LocalRekitWorker
 from rekit_factory.store import FactoryLedger
 from muster import resolve_run_dir
+from rekit_factory.scope import (
+    ActionAuthority, AuthorizedScope, ScopeApproval, ScopeEnvelope, TargetGrant,
+)
+
+
+def authorized_dynamic_scope(target):
+    envelope = ScopeEnvelope(
+        scope_id="scope-control-test", revision=1,
+        valid_from="2026-07-01T00:00:00Z", valid_until="2026-08-01T00:00:00Z",
+        targets=(TargetGrant.from_path(target),),
+        actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.EXECUTE_UNTRUSTED),
+    )
+    return AuthorizedScope(envelope, ScopeApproval(
+        scope_id=envelope.scope_id, revision=envelope.revision,
+        content_digest=envelope.content_digest, approved_by="test-operator",
+        approved_at="2026-07-01T00:00:00Z", expires_at="2026-08-01T00:00:00Z",
+        rationale="Deterministic test authorization for the exact fixture",
+    ))
 
 
 class FakeBackend:
@@ -118,7 +136,7 @@ class FakeRekit:
             description="fixture tool",
             safety_tier=3 if self.risky else 0,
             executes_input="full" if self.risky else "no",
-            network="target-controlled" if self.risky else "none",
+            network="none",
         )
 
     def list_tools(self):
@@ -219,6 +237,7 @@ class ControlPlaneTests(unittest.TestCase):
                 goal="Observe behavior only if the operator permits it",
                 tools=("exec-observe",),
                 worker_roles=("analyst",),
+                scope=authorized_dynamic_scope(target),
             ))
             suspended = asyncio.run(controller.drive(run_dir))
 
@@ -250,6 +269,7 @@ class ControlPlaneTests(unittest.TestCase):
                 goal="Run the approved observation",
                 tools=("exec-observe",),
                 worker_roles=("analyst",),
+                scope=authorized_dynamic_scope(target),
             ))
             suspended = asyncio.run(controller.drive(run_dir))
             qid = suspended["pendingQuestions"][0]["id"]
@@ -360,6 +380,7 @@ class ControlPlaneTests(unittest.TestCase):
                 goal="Request gated evidence",
                 model_tools=("exec-observe",),
                 worker_roles=("analyst",),
+                scope=authorized_dynamic_scope(target),
             ))
             suspended = asyncio.run(controller.drive(run_dir))
 
@@ -493,6 +514,7 @@ class ControlPlaneTests(unittest.TestCase):
                     "goal": "Exercise the API permission path",
                     "tools": ["exec-observe"],
                     "workerRoles": ["analyst"],
+                    "scope": authorized_dynamic_scope(target).to_dict(),
                 }, expected=202)
                 run_id = launched["run"]["id"]
                 suspended = self._wait_status(base, run_id, "needs_input")

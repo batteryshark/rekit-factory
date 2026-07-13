@@ -43,6 +43,14 @@ from rekit_factory.evidence import (
 )
 from rekit_factory.memory import MemoryAction, ProjectMemoryLog, memory_context
 from rekit_factory.rekit_client import RekitAdapter
+from rekit_factory.scope import (
+    ActionAuthority,
+    AuthorizedScope,
+    ScopeRequest,
+    TargetGrant,
+    decide_scope,
+    legacy_local_read_only_scope,
+)
 from rekit_factory.store import FactoryLedger
 from rekit_factory.strategies import (
     DEFAULT_STRATEGIES,
@@ -70,6 +78,7 @@ class RunRequest:
     retries_per_worker: int = 1
     cost_units: int = 100
     max_workers: int = 8
+    scope: AuthorizedScope | None = None
 
     def validate(self) -> "RunRequest":
         target = self.target.expanduser().resolve()
@@ -99,6 +108,7 @@ class RunRequest:
             retries_per_worker=ceilings.retries_per_worker,
             cost_units=ceilings.cost_units,
             max_workers=ceilings.max_workers,
+            scope=self.scope,
         )
 
 
@@ -128,8 +138,22 @@ class InvestigationController:
 
     def create(self, request: RunRequest) -> Path:
         request = request.validate()
-        self.storage_root.mkdir(parents=True, exist_ok=True)
         worker_backend = self.worker_backend(request.model_profile)
+        manifests = [self.rekit.manifest(tool_id)
+                     for tool_id in (*request.tools, *request.model_tools)]
+        scope = request.scope
+        if scope is None:
+            non_read_only = [manifest.id for manifest in manifests
+                             if _manifest_actions(manifest) != (ActionAuthority.READ_LOCAL_TARGET,)]
+            if non_read_only:
+                raise PermissionError(
+                    "explicit engagement scope is required for non-read-only tools: "
+                    + ", ".join(non_read_only)
+                )
+            scope = legacy_local_read_only_scope(request.target, now=utcnow())
+        target_grant = TargetGrant.from_path(request.target)
+        _require_scope_for_creation(scope, target_grant, manifests, now=utcnow())
+        self.storage_root.mkdir(parents=True, exist_ok=True)
         plan = _request_plan(request)
         plan_payload = _plan_payload(plan)
         public_config = {
@@ -140,6 +164,7 @@ class InvestigationController:
             "concurrency": request.concurrency,
             "modelProfile": worker_backend.profile.public_dict(),
             "strategyPlan": plan_payload,
+            "scope": scope.envelope.public_dict(),
         }
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
@@ -159,11 +184,16 @@ class InvestigationController:
             "concurrency": request.concurrency,
             "modelProfile": worker_backend.profile.public_dict(),
             "strategyPlan": plan_payload,
+            "scope": scope.envelope.public_dict(),
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
         }
         atomic_write(paths.run_json, json.dumps(meta, indent=2, sort_keys=True) + "\n")
+        atomic_write(
+            paths.run_dir / "scope.json",
+            json.dumps(scope.to_dict(), indent=2, sort_keys=True) + "\n",
+        )
 
         with FactoryLedger(paths.db_path) as ledger:
             ledger.create_run(
@@ -382,6 +412,42 @@ class InvestigationController:
         payload = json.loads(item["payload_json"])
         tool_id = payload["toolId"]
         manifest = self.rekit.manifest(tool_id)
+        scope = _load_scope(ctx.deps.paths, Path(item["target"]))
+        decision = None
+        for action in _manifest_actions(manifest):
+            candidate = decide_scope(
+                scope,
+                ScopeRequest(
+                    action=action,
+                    target=TargetGrant.from_path(item["target"]),
+                    endpoint=(payload.get("endpoint")
+                              if action is ActionAuthority.NETWORK_ACCESS else None),
+                    account_ref=payload.get("accountRef"),
+                    uses_credentials=bool(payload.get("usesCredentials", False)),
+                ),
+                now=utcnow(),
+            )
+            if not candidate.allowed:
+                decision = candidate
+                break
+        if decision is None:
+            decision = candidate
+        if not decision.allowed:
+            ledger.resolve(
+                item["id"],
+                result={"toolId": tool_id, "decision": "scope-denied",
+                        "reasonCode": decision.reason_code},
+                evidence="Engagement authorization denied the requested action",
+                state_label="scope_denied",
+            )
+            ledger.event_log(
+                ctx.state.run_id,
+                "security.scope_denied",
+                "Engagement scope denied a Rekit dispatch",
+                payload=decision.browser_dict(),
+            )
+            self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
+            return
         qid = stable_key(ctx.state.run_id, item["id"], tool_id, "permission")
         answer = ledger.get_answer(ctx.state.run_id, qid)
 
@@ -827,7 +893,7 @@ class InvestigationController:
             if row is None or row["status"] not in {"done", "failed"}:
                 raise RuntimeError(f"tool result {call['callId']} is not ready")
             result = json.loads(row["result_json"]) if row["result_json"] else {}
-            denied = result.get("decision") == "denied"
+            denied = result.get("decision") in {"denied", "scope-denied"}
             if denied:
                 content = f"Operator denied Rekit tool {call['toolId']}."
             elif result.get("output"):
@@ -854,6 +920,43 @@ def _project_memory_log(paths: RunPaths) -> ProjectMemoryLog:
     """
     project_dir = paths.run_dir.parents[1]
     return ProjectMemoryLog(project_dir)
+
+
+def _manifest_actions(manifest: Any) -> tuple[ActionAuthority, ...]:
+    actions = [ActionAuthority.READ_LOCAL_TARGET]
+    if manifest.executes_input == "full":
+        actions.append(ActionAuthority.EXECUTE_UNTRUSTED)
+    if manifest.network not in {"none", "emulated"}:
+        actions.append(ActionAuthority.NETWORK_ACCESS)
+    return tuple(actions)
+
+
+def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,
+                                manifests: list[Any], *, now: str) -> None:
+    scope.validate(now=now)
+    actions = [ActionAuthority.READ_LOCAL_TARGET]
+    for manifest in manifests:
+        actions.extend(_manifest_actions(manifest))
+    for action in dict.fromkeys(actions):
+        endpoint = None
+        if action is ActionAuthority.NETWORK_ACCESS and scope.envelope.endpoints:
+            # Creation authorizes making the tool available. Dispatch still requires
+            # the exact endpoint carried by the durable work item.
+            endpoint = scope.envelope.endpoints[0]
+        decision = decide_scope(
+            scope, ScopeRequest(action=action, target=target, endpoint=endpoint), now=now,
+        )
+        if not decision.allowed:
+            raise PermissionError(f"run creation denied: {decision.reason_code}")
+
+
+def _load_scope(paths: RunPaths, target: Path) -> AuthorizedScope:
+    scope_path = paths.run_dir / "scope.json"
+    if scope_path.is_file():
+        return AuthorizedScope.from_dict(json.loads(scope_path.read_text(encoding="utf-8")))
+    # Pre-scope runs receive only a short-lived, exact-target, network-none grant.
+    # Any non-read-only queued work will fail at the dispatch decision matrix.
+    return legacy_local_read_only_scope(target, now=utcnow())
 
 
 def _request_plan(request: RunRequest) -> InvestigationPlan:
