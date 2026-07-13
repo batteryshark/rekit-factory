@@ -177,7 +177,18 @@ class PydanticWorkerBackend:
             from pydantic_ai.providers.openai import OpenAIProvider
 
             provider = OpenAIProvider(base_url=profile.base_url, api_key=profile.api_key)
-            model = OpenAIChatModel(profile.model, provider=provider)
+            model = OpenAIChatModel(
+                profile.model,
+                provider=provider,
+                profile={
+                    # Custom OpenAI-compatible endpoints disagree on the legacy
+                    # ``json_object`` response-format extension. PromptedOutput already
+                    # carries and validates the JSON schema in text, while native mode
+                    # below still uses the standard ``json_schema`` response format.
+                    "supports_json_object_output": False,
+                    "supports_json_schema_output": True,
+                },
+            )
             model_settings = None
         structured_output = (
             PromptedOutput(WorkerReport)

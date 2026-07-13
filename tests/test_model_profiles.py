@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from rekit_factory.cli import _enforce_concurrency, _load_profiles, parser
-from rekit_factory.models import ModelProfile
+from rekit_factory.models import ModelProfile, PydanticWorkerBackend
 
 
 class ModelProfilePolicyTests(unittest.TestCase):
@@ -96,6 +96,17 @@ class ModelProfilePolicyTests(unittest.TestCase):
         _enforce_concurrency(profile, 2)
         with self.assertRaisesRegex(ValueError, "exceeds model profile 'bounded' ceiling 2"):
             _enforce_concurrency(profile, 3)
+
+    def test_openai_compatible_prompted_output_does_not_require_json_object_extension(self):
+        profile = ModelProfile(
+            name="local", provider="openai-compatible", model="local-model",
+            base_url="http://127.0.0.1:1234/v1", api_key="local-placeholder",
+            api_format="openai", structured_output_mode="prompted",
+        )
+        backend = PydanticWorkerBackend(profile)
+
+        self.assertFalse(backend._agent.model.profile["supports_json_object_output"])
+        self.assertTrue(backend._agent.model.profile["supports_json_schema_output"])
 
 
 if __name__ == "__main__":
