@@ -738,7 +738,9 @@ function renderDetail() {
   const snapshot = state.snapshot, run = snapshot.run, meta = snapshot.meta;
   const events = snapshot.events || [], artifacts = snapshot.artifacts || [], questions = snapshot.pendingQuestions || [];
   $("detailTitle").textContent = meta.target.split("/").pop(); $("detailGoal").textContent = meta.goal;
-  $("runMeta").innerHTML = [["status", run.status], ["run", run.id], ["model", meta.modelProfile.model], ["coverage", `${snapshot.coverage.terminal}/${snapshot.coverage.workItemsTotal}`], ["target", meta.target]].map(([name, value]) => `<div class="kv"><span>${esc(name)}</span><span>${esc(value)}</span></div>`).join("");
+  const boundPolicy = meta.safetyPolicy, boundPolicyDocument = boundPolicy?.document;
+  const boundPolicyLabel = boundPolicyDocument ? `${boundPolicyDocument.name} r${boundPolicyDocument.revision} · ${String(boundPolicy.policyId).slice(-10)}` : "legacy deny-all";
+  $("runMeta").innerHTML = [["status", run.status], ["run", run.id], ["model", meta.modelProfile.model], ["safety", boundPolicyLabel], ["coverage", `${snapshot.coverage.terminal}/${snapshot.coverage.workItemsTotal}`], ["target", meta.target]].map(([name, value]) => `<div class="kv"><span>${esc(name)}</span><span>${esc(value)}</span></div>`).join("");
   renderScope(meta);
   $("workers").innerHTML = snapshot.workers.map(worker => `<div class="worker"><div class="worker-top"><span class="worker-role">${esc(worker.role)}</span><span class="worker-status">${esc(worker.status)}</span></div><div class="worker-step">${esc(worker.current_step || "queued")}</div>${worker.error ? `<div class="worker-error">${esc(worker.error)}</div>` : ""}</div>`).join("");
   $("activitySummary").innerHTML = MissionObservability.activitySummary(events);
@@ -811,6 +813,15 @@ function selectedProfile() {
   return profiles.find(profile => profile.name === $("profileSelect").value) || state.config?.modelProfile;
 }
 
+function safetyPolicyByName(name) {
+  return (state.config?.safetyPolicies || []).find(policy => policy.document?.name === name);
+}
+
+function selectedSafetyPolicy() {
+  const name = document.querySelector('input[name="safetyPolicy"]:checked')?.value || "supervised";
+  return safetyPolicyByName(name);
+}
+
 function positiveInteger(id, label, {allowZero = false} = {}) {
   const input = $(id), value = Number(input.value), minimum = allowZero ? 0 : 1;
   input.setCustomValidity(Number.isInteger(value) && value >= minimum ? "" : `${label} must be a whole number of at least ${minimum}.`);
@@ -833,6 +844,7 @@ function renderComposerState() {
     } else $("concurrency").removeAttribute("max");
   }
   const policy = document.querySelector('input[name="safetyPolicy"]:checked')?.value || "supervised";
+  const policyRecord = safetyPolicyByName(policy);
   document.querySelectorAll(".safety-option").forEach(option => option.classList.toggle("active", option.querySelector("input").checked));
   $("gatedPolicyLabel").textContent = policy === "automatic-only" ? "excluded" : "ask me";
   $("toolPicker").querySelectorAll(".tool").forEach(row => {
@@ -842,7 +854,8 @@ function renderComposerState() {
     row.classList.toggle("policy-disabled", excluded);
   });
   const checkedTools = $("toolPicker").querySelectorAll("input:checked").length;
-  $("launchSummary").innerHTML = `<div><span>strategy</span><b>${esc(custom ? "custom roles" : strategy)}</b></div><div><span>profile</span><b>${esc(profile?.name || "default")}</b></div><div><span>worker ceiling</span><b>${esc($("maxWorkers").value)} / ${esc($("concurrency").value)} concurrent</b></div><div><span>tool policy</span><b>${esc(policy)} · ${checkedTools} selected</b></div>`;
+  const policyIdentity = policyRecord?.policyId ? policyRecord.policyId.slice(-10) : "unavailable";
+  $("launchSummary").innerHTML = `<div><span>strategy</span><b>${esc(custom ? "custom roles" : strategy)}</b></div><div><span>profile</span><b>${esc(profile?.name || "default")}</b></div><div><span>worker ceiling</span><b>${esc($("maxWorkers").value)} / ${esc($("concurrency").value)} concurrent</b></div><div><span>tool policy</span><b>${esc(policy)} r${esc(policyRecord?.document?.revision || "—")} · ${esc(policyIdentity)} · ${checkedTools} selected</b></div>`;
 }
 
 function renderConfig() {
@@ -851,6 +864,11 @@ function renderConfig() {
   $("profileSelect").innerHTML = profiles.map(profile => `<option value="${esc(profile.name)}" ${profile.name === config.defaultModelProfile ? "selected" : ""}>${esc(profile.name)} · ${esc(profile.model)} · ${esc(profile.apiFormat || "openai")}</option>`).join("");
   const strategies = config.strategies || [];
   $("strategySelect").innerHTML = strategies.map(strategy => `<option value="${esc(strategy.name)}">${esc(strategy.name)}</option>`).join("") + `<option value="custom-roles">custom roles</option>`;
+  document.querySelectorAll('[data-policy-name]').forEach(option => {
+    const available = Boolean(safetyPolicyByName(option.dataset.policyName));
+    option.querySelector("input").disabled = !available;
+    option.classList.toggle("policy-disabled", !available);
+  });
   $("profile").innerHTML = profiles.map(profile => `<div class="profile-block"><div class="kv"><span>profile</span><span>${esc(profile.name)}</span></div><div class="kv"><span>provider</span><span>${esc(profile.provider)}</span></div><div class="kv"><span>protocol</span><span>${esc(profile.apiFormat || "openai")}</span></div><div class="kv"><span>model</span><span class="model-name">${esc(profile.model)}</span></div><div class="kv"><span>endpoint</span><span>${esc(profile.baseUrl)}</span></div><div class="kv"><span>secret</span><span>${esc(profile.apiKeySource)}</span></div></div>`).join("");
   const knowledgeRoots = config.knowledgeRoots || [];
   $("knowledgeRootCatalog").innerHTML = knowledgeRoots.length ? knowledgeRoots.map(root => `<div class="knowledge-root-card"><i aria-hidden="true"></i><span><b>${esc(root.name)}</b><small>named OKF index · path withheld</small></span><em>read only</em></div>`).join("") : `<div class="hint">No knowledge roots configured.</div>`;
@@ -880,10 +898,12 @@ $("runForm").onsubmit = async event => {
     const costUnits = positiveInteger("costUnits", "Cost-unit ceiling");
     if (concurrency > maxWorkers) $("concurrency").setCustomValidity("Concurrent workers cannot exceed the maximum worker ceiling.");
     const profile = selectedProfile();
+    const safetyPolicy = selectedSafetyPolicy();
+    if (!safetyPolicy?.policyId) throw new Error("Selected safety policy is unavailable or stale; reload Mission Control.");
     if (Number.isInteger(profile?.concurrencyLimit) && concurrency > profile.concurrencyLimit) $("concurrency").setCustomValidity(`This profile allows at most ${profile.concurrencyLimit} concurrent workers.`);
     if (strategy === "custom-roles" && !workerRoles.length) $("roles").setCustomValidity("Add at least one custom worker role."); else $("roles").setCustomValidity("");
     if (!$("runForm").reportValidity()) return;
-    const result = await api("/api/runs", {method: "POST", body: JSON.stringify({target: $("target").value, goal: $("goal").value, tools: [], modelTools, workerRoles, modelProfile: $("profileSelect").value, strategy: strategy === "custom-roles" ? null : strategy, concurrency, retriesPerWorker, costUnits, maxWorkers})});
+    const result = await api("/api/runs", {method: "POST", body: JSON.stringify({target: $("target").value, goal: $("goal").value, tools: [], modelTools, workerRoles, modelProfile: $("profileSelect").value, safetyPolicyId: safetyPolicy.policyId, strategy: strategy === "custom-roles" ? null : strategy, concurrency, retriesPerWorker, costUnits, maxWorkers})});
     toast("Investigation launched"); await refreshFleet(); openRun(result.run.id);
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; button.textContent = "Launch Investigation"; }

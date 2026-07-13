@@ -58,6 +58,13 @@ from rekit_factory.findings import (
 )
 from rekit_factory.dossiers import DossierPublisher, dossier_list
 from rekit_factory.outcomes import project_outcomes
+from rekit_factory.policy_runtime import (
+    SafetyPolicyCatalog,
+    builtin_policy_catalog,
+    policy_from_meta,
+    policy_record,
+    validate_policy_authority,
+)
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.remote import LocalRekitWorker
 from rekit_factory.scope import (
@@ -129,6 +136,7 @@ class RunRequest:
     cost_units: int = 100
     max_workers: int = 8
     scope: AuthorizedScope | None = None
+    safety_policy_id: str | None = None
 
     def validate(self) -> "RunRequest":
         target = self.target.expanduser().resolve()
@@ -159,6 +167,7 @@ class RunRequest:
             cost_units=ceilings.cost_units,
             max_workers=ceilings.max_workers,
             scope=self.scope,
+            safety_policy_id=self.safety_policy_id,
         )
 
 
@@ -166,7 +175,8 @@ class InvestigationController:
     def __init__(self, *, storage_root: str | Path, rekit: RekitAdapter,
                  workers: WorkerBackend | dict[str, WorkerBackend],
                  remote_tool_workers: tuple[RemoteWorkerBinding, ...] = (),
-                 knowledge_roots: Iterable[KnowledgeRoot | str | Path] = ()):
+                 knowledge_roots: Iterable[KnowledgeRoot | str | Path] = (),
+                 safety_policies: SafetyPolicyCatalog | None = None):
         self.storage_root = Path(storage_root).expanduser().resolve()
         self.rekit = rekit
         configured_knowledge = tuple(knowledge_roots)
@@ -178,6 +188,8 @@ class InvestigationController:
         else:
             self.worker_backends = {workers.profile.name: workers}
         self.default_profile = next(iter(self.worker_backends))
+        configured_manifests = rekit.list_tools() if hasattr(rekit, "list_tools") else ()
+        self.safety_policies = safety_policies or builtin_policy_catalog(configured_manifests)
         self.tool_router = ToolWorkerRouter(
             LocalRekitWorker(rekit), remote_tool_workers,
         )
@@ -201,16 +213,36 @@ class InvestigationController:
         return backend
 
     def validate_run_concurrency(self, run_dir: str | Path) -> None:
-        """Recheck a durable plan against the currently configured named profile."""
+        """Recheck durable runtime authority before accepting supervisor work."""
         paths = resolve_run_dir(run_dir)
         meta = _read_meta(paths)
         plan = _plan_from_meta(meta)
         self._worker_backend_with_concurrency(
             _model_profile_name(meta), plan.ceilings.concurrency,
         )
+        self._validate_persisted_policy(paths, meta, plan)
+
+    def public_safety_policies(self) -> list[dict[str, object]]:
+        return self.safety_policies.public_dicts()
+
+    def _validate_persisted_policy(
+        self, paths: RunPaths, meta: dict[str, Any], plan: InvestigationPlan,
+    ) -> None:
+        policy = policy_from_meta(meta, plan.ceilings)
+        tool_ids = tuple(dict.fromkeys((*meta.get("tools", ()), *meta.get("modelTools", ()))))
+        manifests = {tool_id: self.rekit.manifest(tool_id) for tool_id in tool_ids}
+        scope = None
+        scope_path = paths.run_dir / "scope.json"
+        if scope_path.is_file():
+            scope = AuthorizedScope.from_dict(json.loads(scope_path.read_text(encoding="utf-8")))
+        validate_policy_authority(
+            policy, requested_tool_ids=tool_ids, manifests=manifests,
+            ceilings=plan.ceilings, scope=scope,
+        )
 
     def create(self, request: RunRequest) -> Path:
         request = request.validate()
+        policy = self.safety_policies.resolve(request.safety_policy_id)
         worker_backend = self._worker_backend_with_concurrency(
             request.model_profile, request.concurrency,
         )
@@ -231,13 +263,21 @@ class InvestigationController:
             scope = legacy_local_read_only_scope(request.target, now=utcnow())
         target_grant = TargetGrant.from_path(request.target)
         _require_scope_for_creation(scope, target_grant, manifests, now=utcnow())
+        plan = _request_plan(request)
+        validate_policy_authority(
+            policy,
+            requested_tool_ids=(*request.tools, *request.model_tools),
+            manifests={manifest.id: manifest for manifest in manifests},
+            ceilings=plan.ceilings,
+            scope=scope,
+        )
         tool_routes = {
             tool_id: self._route_payload(tool_id, request.target)
             for tool_id in dict.fromkeys((*request.tools, *request.model_tools))
         }
         self.storage_root.mkdir(parents=True, exist_ok=True)
-        plan = _request_plan(request)
         plan_payload = _plan_payload(plan)
+        safety_policy = policy_record(policy)
         public_config = {
             "goal": request.goal,
             "tools": list(request.tools),
@@ -251,6 +291,7 @@ class InvestigationController:
             "knowledgeRoots": [root.name for root in self.knowledge.roots]
             if self.knowledge else [],
             "toolAuthorities": manifest_contracts,
+            "safetyPolicy": safety_policy,
         }
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
@@ -275,6 +316,7 @@ class InvestigationController:
             "knowledgeRoots": [root.name for root in self.knowledge.roots]
             if self.knowledge else [],
             "toolAuthorities": manifest_contracts,
+            "safetyPolicy": safety_policy,
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
@@ -343,6 +385,7 @@ class InvestigationController:
         plan = _plan_from_meta(meta)
         concurrency = plan.ceilings.concurrency
         self._worker_backend_with_concurrency(_model_profile_name(meta), concurrency)
+        self._validate_persisted_policy(paths, meta, plan)
 
         with FactoryLedger(paths.db_path) as ledger:
             ledger.requeue_stale_leases(paths.run_id)
@@ -475,6 +518,11 @@ class InvestigationController:
         project_memory = _project_memory_log(paths).replay()
         memory_projection = project_memory.deterministic_dict()
         meta = _read_meta(paths)
+        if "safetyPolicy" not in meta:
+            meta = dict(meta)
+            meta["safetyPolicy"] = policy_record(
+                policy_from_meta(meta, _plan_from_meta(meta).ceilings)
+            )
         if ledger.conn.in_transaction:
             raise RuntimeError("snapshot requires a clean ledger connection")
         ledger.conn.execute("begin")
@@ -565,6 +613,13 @@ class InvestigationController:
         scope = _load_scope(
             ctx.deps.paths, Path(item["target"]),
             expected_binding=_run_scope_binding(ledger, ctx.state.run_id),
+        )
+        meta = _read_meta(ctx.deps.paths)
+        plan = _plan_from_meta(meta)
+        policy = policy_from_meta(meta, plan.ceilings)
+        validate_policy_authority(
+            policy, requested_tool_ids=(tool_id,), manifests={tool_id: manifest},
+            ceilings=plan.ceilings, scope=scope,
         )
         decision = None
         actions = list(_manifest_actions(manifest))

@@ -95,6 +95,7 @@ button:focus-visible,[tabindex]:focus-visible,input:focus-visible,textarea:focus
 @media(max-width:720px){.dossier-card{grid-template-columns:auto minmax(0,1fr)}.dossier-actions{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr}.dossier-actions .btn{width:100%}.dossier-stage-head{align-items:flex-start}.dossier-seal{width:54px;height:54px;flex-basis:54px}}
 @media(max-width:440px){.dossier-card{grid-template-columns:1fr}.dossier-card-signal{display:none}.dossier-actions{grid-template-columns:1fr}.dossier-seal{display:none}}
 .report-facets{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.report-facets .report-status{display:inline-flex;border:1px solid color-mix(in srgb,var(--green) 30%,var(--line));border-radius:999px;background:color-mix(in srgb,var(--green) 7%,transparent);padding:4px 7px;text-align:left;white-space:nowrap}
+.safety-option.policy-disabled{opacity:.42;cursor:not-allowed}
 .fleet-search>svg{width:14px;height:14px;flex:0 0 14px}
 .target-kind i{display:grid;place-items:center}.target-kind i svg{width:19px;height:19px;display:block}
 [data-theme="light"] .rail{background:rgba(238,245,249,.94)}

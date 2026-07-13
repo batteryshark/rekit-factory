@@ -135,6 +135,10 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     "modelProfiles": [backend.profile.public_dict()
                                       for backend in self.server.controller.worker_backends.values()],
                     "defaultModelProfile": self.server.controller.default_profile,
+                    "defaultSafetyPolicyId": (
+                        self.server.controller.safety_policies.default_policy_id
+                    ),
+                    "safetyPolicies": self.server.controller.public_safety_policies(),
                     "strategies": [
                         {"name": item.name, "description": item.description}
                         for item in DEFAULT_STRATEGIES.values()
@@ -270,6 +274,7 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     max_workers=int(payload.get("maxWorkers", 8)),
                     scope=(AuthorizedScope.from_dict(payload["scope"])
                            if payload.get("scope") is not None else None),
+                    safety_policy_id=payload.get("safetyPolicyId"),
                 )
                 run_dir = self.server.controller.create(request)
                 self.server.supervisor.submit(run_dir)

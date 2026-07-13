@@ -518,9 +518,12 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn('id="strategySelect"', page)
         self.assertIn('id="retriesPerWorker"', page)
         self.assertIn('value="automatic-only"', page)
+        self.assertIn('data-policy-name="supervised"', page)
+        self.assertIn('data-policy-name="automatic-only"', page)
         self.assertIn('id="evidenceLifecycle"', page)
-        for field in ("strategy", "concurrency", "retriesPerWorker", "costUnits", "maxWorkers"):
+        for field in ("strategy", "concurrency", "retriesPerWorker", "costUnits", "maxWorkers", "safetyPolicyId"):
             self.assertIn(field, script)
+        self.assertIn("boundPolicyLabel", script)
         self.assertIn("cannot bypass server-side gates", page)
         self.assertIn("updateEvidence", script)
         self.assertNotIn("rawPath", script)
