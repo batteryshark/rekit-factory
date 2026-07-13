@@ -17,6 +17,7 @@ class ToolManifest:
     safety_tier: int
     executes_input: str
     network: str
+    source: str = "default"
 
     @property
     def requires_permission(self) -> bool:
@@ -40,8 +41,9 @@ class RekitAdapter(Protocol):
 
 
 class RekitClient:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, source: str = "default"):
         self.root = Path(root).expanduser().resolve()
+        self.source = _source_label(source)
         self.binary = self.root / "bin" / "rekit"
         registry_path = self.root / "registry.json"
         if not self.binary.is_file() or not registry_path.is_file():
@@ -61,6 +63,7 @@ class RekitClient:
             safety_tier=int(safety.get("tier", 0)),
             executes_input=str(safety.get("executes_input", "no")),
             network=str(safety.get("network", "none")),
+            source=self.source,
         )
 
     def list_tools(self) -> list[ToolManifest]:
@@ -84,3 +87,62 @@ class RekitClient:
             stderr=proc.stderr,
             command_label=f"rekit run {tool_id} <target>",
         )
+
+
+class FederatedRekitClient:
+    """Compose ordered Rekit CLI catalogs while retaining each owning dispatcher.
+
+    Tool IDs remain the public addressing contract. Ambiguous IDs therefore fail closed
+    instead of silently acquiring order-dependent precedence. Every root must implement
+    the existing ``bin/rekit`` plus ``registry.json`` contract; a generic skills directory
+    or MCP registry is not a compatible root and requires a future adapter.
+    """
+
+    def __init__(self, clients: list[RekitClient] | tuple[RekitClient, ...]):
+        if not clients:
+            raise ValueError("at least one Rekit root is required")
+        self._clients = tuple(clients)
+        owners: dict[str, RekitClient] = {}
+        for client in self._clients:
+            for manifest in client.list_tools():
+                previous = owners.get(manifest.id)
+                if previous is not None:
+                    raise ValueError(
+                        f"duplicate Rekit tool id {manifest.id!r} in sources "
+                        f"{previous.source!r} and {client.source!r}"
+                    )
+                owners[manifest.id] = client
+        self._owners = owners
+
+    @classmethod
+    def from_roots(cls, roots: list[str | Path] | tuple[str | Path, ...]):
+        values = tuple(roots)
+        labels = ("default",) if len(values) == 1 else tuple(
+            f"source-{index}" for index in range(1, len(values) + 1)
+        )
+        return cls(tuple(RekitClient(root, source=label)
+                         for root, label in zip(values, labels, strict=True)))
+
+    def manifest(self, tool_id: str) -> ToolManifest:
+        try:
+            owner = self._owners[tool_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown Rekit tool {tool_id!r}") from exc
+        return owner.manifest(tool_id)
+
+    def list_tools(self) -> list[ToolManifest]:
+        return [manifest for client in self._clients for manifest in client.list_tools()]
+
+    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False) -> ToolResult:
+        try:
+            owner = self._owners[tool_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown Rekit tool {tool_id!r}") from exc
+        return owner.run(tool_id, target, allow_dynamic=allow_dynamic)
+
+
+def _source_label(value: str) -> str:
+    label = value.strip()
+    if not label or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in label):
+        raise ValueError("Rekit source labels must use lowercase letters, digits, '-' or '_'")
+    return label
