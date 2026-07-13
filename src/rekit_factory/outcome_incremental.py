@@ -28,6 +28,7 @@ from rekit_factory.outcomes import (
     _json_snapshot,
     _set,
     _source_diagnostics,
+    _validate_operator_decision_identity_uniqueness,
 )
 
 
@@ -432,12 +433,12 @@ def _all_entity_keys(state: _SourceState) -> set[EntityKey]:
 
 
 def _validate_cross_source_identities(state: _SourceState) -> None:
-    decisions = set(_memory_map(state, "finding_operator_decisions"))
-    collision = decisions & set(state.pending_decisions)
-    if collision:
-        raise OutcomeSourceChangeError(
-            f"pending and finding decision IDs collide: {sorted(collision)}"
+    try:
+        _validate_operator_decision_identity_uniqueness(
+            state.memory, state.pending_decisions.values(),
         )
+    except ValueError as exc:
+        raise OutcomeSourceChangeError(str(exc)) from exc
 
 
 def _refold_key(state: _SourceState, key: EntityKey) -> dict[str, Any] | None:
@@ -607,6 +608,8 @@ def _state_from_snapshot(snapshot: Mapping[str, Any]) -> _SourceState:
         pending_decisions=_list_to_map(snapshot["pendingDecisions"], "pendingDecisions"),
         source_watermarks=_record(snapshot["sourceWatermarks"], "sourceWatermarks"),
     )
+    for record in state.dossiers.values():
+        _identifier(record.get("findingId"), "dossier.findingId")
     _validate_cross_source_identities(state)
     return state
 

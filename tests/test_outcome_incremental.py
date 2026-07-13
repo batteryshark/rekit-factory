@@ -244,11 +244,18 @@ def test_out_of_order_revisions_do_not_rewind_and_invalid_cross_source_ids_fail_
     })
     assert fold.apply(memory)
     before_collision = fold.projection()
-    with pytest.raises(OutcomeSourceChangeError, match="collide"):
+    with pytest.raises(OutcomeSourceChangeError, match="identities must be unique"):
         fold.apply(change(
             "pending-1", "pending-decision", 1, {"id": "decision-a"},
         ))
     assert fold.projection() == before_collision
+
+    with pytest.raises(ValueError, match="identities must be unique"):
+        project_outcomes(
+            run={"id": "run-a", "status": "running"},
+            workers=(), work_items=(), memory=memory.value, dossiers=(),
+            pending_questions=({"id": "decision-a"},),
+        )
 
 
 def test_selective_refold_handles_cross_entity_deletes_reappearance_and_unknowns():
@@ -438,6 +445,18 @@ def test_source_snapshot_restart_is_canonical_byte_identical_and_detached():
     snapshot["projectMemory"].clear()
     snapshot["workers"].clear()
     assert restarted.source_snapshot() == decoded
+
+
+@pytest.mark.parametrize("invalid_parent", [None, ["finding-a"]])
+def test_source_snapshot_validates_dossier_parent_identity_like_live_changes(invalid_parent):
+    fold = IncrementalOutcomeFold()
+    fold.apply(change("dossier-1", "dossier", 1, {
+        "id": "dossier-a", "findingId": "finding-a", "verificationStatus": "published",
+    }))
+    snapshot = fold.source_snapshot()
+    snapshot["dossiers"][0]["findingId"] = invalid_parent
+    with pytest.raises(OutcomeSourceChangeError, match="dossier.findingId"):
+        IncrementalOutcomeFold.from_source_snapshot(snapshot)
 
 
 def test_shared_consistency_contract_is_path_neutral_not_derivation_metadata():

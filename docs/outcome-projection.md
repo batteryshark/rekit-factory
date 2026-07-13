@@ -28,11 +28,12 @@ The canonical byte domain is `factory-outcomes/semantic-sha256/v1`. Its UTF-8 JS
 ```
 
 The `projection` member contains every present top-level public field except exactly
-`semanticSha256` itself and `sourceWatermarks`. Objects are recursively copied and serialized
-with keys sorted, no insignificant whitespace, UTF-8 characters unescaped, and only exact JSON
-objects, arrays, strings, booleans, nulls, and finite numbers accepted. Python-only containers,
-non-string object keys, and non-finite numbers fail closed. Arrays retain their order; the
-projector canonicalizes every set-like entity and diagnostic collection before hashing.
+`semanticSha256` itself, its nonsemantic transport mirror `semanticCanonicalBase64`, and
+`sourceWatermarks`. Objects are recursively copied and serialized with keys sorted, no
+insignificant whitespace, UTF-8 characters unescaped, and only exact JSON objects, arrays,
+strings, booleans, nulls, and finite numbers accepted. Python-only containers, non-string object
+keys, and non-finite numbers fail closed. Arrays retain their order; the projector canonicalizes
+every set-like entity and diagnostic collection before hashing.
 
 This include-by-default rule binds `schemaVersion`, `vocabularyVersion`, facet and authority
 definitions, every entity field and parent, every raw and normalized facet value, every
@@ -49,14 +50,27 @@ The helper never removes fields from its caller, and the projector snapshots JSO
 attaching the identity so later mutation of input containers cannot invalidate the returned
 projection. Mutating a returned semantic field is detectable because the verifier then fails.
 
+`semanticCanonicalBase64` is standard Base64, including canonical padding, of the exact bytes
+hashed for `semanticSha256`. Shared finalization computes the canonical bytes once, Base64
+encodes that byte string, and hashes that same byte string. A browser can therefore verify the
+SHA over decoded bytes without reparsing JSON numbers or reproducing Python float formatting.
+`decode_outcome_semantic_canonical_base64` strictly rejects malformed, noncanonical, or
+byte-mismatched transport text.
+
+The transport mirror is deliberately nonsemantic and does not revise
+`factory-outcomes/semantic-sha256/v1`: moving the field within an object or changing its text
+cannot change the recomputed semantic identity. Such a change does make transport verification
+fail, so consumers can distinguish an intact semantic claim from an untrustworthy byte carrier.
+
 ### Incremental parity reference
 
 `rekit_factory.outcome_incremental` provides a pure in-memory parity reference. It is a
 genuine source accumulator: accepted changes update a detached canonical source snapshot,
 identify affected entity relationships, and refold only those intrinsic entities with the
 same facet/entity primitives used by the full projector. Global ordering, source diagnostics,
-dangling-parent diagnostics, degradation, consistency semantics, and `semanticSha256` are then
-materialized by the shared finalizer. The incremental path never calls `project_outcomes`.
+dangling-parent diagnostics, degradation, consistency semantics, `semanticCanonicalBase64`, and
+`semanticSha256` are then materialized by the shared finalizer. The incremental path never calls
+`project_outcomes`.
 
 The strict change domain is `factory-outcome-source-change/v1`:
 

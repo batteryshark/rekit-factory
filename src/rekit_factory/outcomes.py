@@ -7,6 +7,8 @@ ledger rows, replayed project memory, and dossier publication facts.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -19,8 +21,9 @@ SCHEMA_VERSION = 1
 VOCABULARY_VERSION = "factory-outcomes/v1"
 SEMANTIC_IDENTITY_DOMAIN = "factory-outcomes/semantic-sha256/v1"
 SEMANTIC_IDENTITY_FIELD = "semanticSha256"
+SEMANTIC_CANONICAL_BASE64_FIELD = "semanticCanonicalBase64"
 _NONSEMANTIC_TOP_LEVEL_FIELDS = frozenset({
-    SEMANTIC_IDENTITY_FIELD, "sourceWatermarks",
+    SEMANTIC_IDENTITY_FIELD, SEMANTIC_CANONICAL_BASE64_FIELD, "sourceWatermarks",
 })
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 FACETS = (
@@ -133,6 +136,31 @@ def verify_outcome_semantic_sha256(projection: Mapping[str, Any]) -> bool:
     return hmac.compare_digest(claimed, outcome_semantic_sha256(projection))
 
 
+def decode_outcome_semantic_canonical_base64(projection: Mapping[str, Any]) -> bytes:
+    """Decode and verify the exact canonical semantic bytes carried by a projection."""
+    if type(projection) is not dict:
+        raise TypeError("outcome projection must be a JSON object")
+    encoded = projection.get(SEMANTIC_CANONICAL_BASE64_FIELD)
+    if type(encoded) is not str:
+        raise ValueError(f"{SEMANTIC_CANONICAL_BASE64_FIELD} must be standard Base64 text")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(
+            f"{SEMANTIC_CANONICAL_BASE64_FIELD} must be canonical standard Base64"
+        ) from exc
+    if base64.b64encode(decoded).decode("ascii") != encoded:
+        raise ValueError(
+            f"{SEMANTIC_CANONICAL_BASE64_FIELD} must be canonical standard Base64"
+        )
+    expected = canonical_outcome_semantic_bytes(projection)
+    if not hmac.compare_digest(decoded, expected):
+        raise ValueError(
+            f"{SEMANTIC_CANONICAL_BASE64_FIELD} does not match the semantic projection"
+        )
+    return decoded
+
+
 def _na(owner: str) -> dict[str, Any]:
     return {**_NA, "owner": owner}
 
@@ -229,12 +257,29 @@ def _source_diagnostics(run: Mapping[str, Any] | None,
     return values
 
 
+def _validate_operator_decision_identity_uniqueness(
+    memory: Mapping[str, Any], pending_questions: Iterable[Mapping[str, Any]],
+) -> None:
+    identities = [
+        str(value.get("id", "missing-question")) for value in pending_questions
+    ]
+    identities.extend(
+        str(value.get("id", "missing-decision"))
+        for value in (memory.get("finding_operator_decisions") or {}).values()
+    )
+    if len(set(identities)) != len(identities):
+        raise ValueError("operator-decision entity identities must be unique across sources")
+
+
 def _finalize_outcome_projection(*, entities: Iterable[Mapping[str, Any]],
                                  source_diagnostics: Iterable[Mapping[str, Any]],
                                  source_watermarks: Mapping[str, Any] | None) -> dict[str, Any]:
     """Materialize shared public meaning from already folded intrinsic entities."""
     materialized = [_json_snapshot(dict(item)) for item in entities]
     materialized.sort(key=lambda value: (value["entityType"], value["entityId"]))
+    identities = [(value["entityType"], value["entityId"]) for value in materialized]
+    if len(set(identities)) != len(identities):
+        raise ValueError("outcome entity identities must be unique")
     diagnostics = [_json_snapshot(dict(value)) for value in source_diagnostics]
     diagnostics.extend(
         _json_snapshot(value) for item in materialized for value in item["diagnostics"]
@@ -270,7 +315,11 @@ def _finalize_outcome_projection(*, entities: Iterable[Mapping[str, Any]],
         },
     }
     detached = _json_snapshot(projection)
-    detached[SEMANTIC_IDENTITY_FIELD] = outcome_semantic_sha256(detached)
+    canonical_bytes = canonical_outcome_semantic_bytes(detached)
+    detached[SEMANTIC_CANONICAL_BASE64_FIELD] = base64.b64encode(
+        canonical_bytes
+    ).decode("ascii")
+    detached[SEMANTIC_IDENTITY_FIELD] = hashlib.sha256(canonical_bytes).hexdigest()
     return detached
 
 
@@ -284,6 +333,8 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
     """Return the complete v1 projection from canonical, already-redacted inputs."""
     entities: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
+    pending_question_values = list(pending_questions)
+    _validate_operator_decision_identity_uniqueness(memory, pending_question_values)
     run_id = str((run or {}).get("id", "missing-run"))
     run_parent = {"entityType": "run", "entityId": run_id}
     if run is not None:
@@ -435,7 +486,7 @@ def project_outcomes(*, run: Mapping[str, Any] | None,
         }
         entities.append(item)
 
-    for question in pending_questions:
+    for question in pending_question_values:
         item = _entity("operator-decision", question.get("id", "missing-question"), parent=run_parent)
         item["facets"]["disposition"] = {
             "rawState": "pending", "state": "needs-review", "known": True, "terminal": False,
