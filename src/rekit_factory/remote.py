@@ -103,6 +103,7 @@ class InvocationRequest(_Envelope):
     approval_id: str | None = None
     endpoint: str | None = None
     scope_digest: str | None = None
+    expected_manifest_digest: str | None = None
     scope_revision: dict[str, Any] | None = None
     requested_actions: tuple[str, ...] = ()
     account_ref: str | None = None
@@ -123,6 +124,9 @@ class InvocationRequest(_Envelope):
             _require_text(self.endpoint, "endpoint")
         if self.scope_digest is not None and not _SHA256.fullmatch(self.scope_digest):
             raise ValueError("scope_digest must be a lowercase SHA-256 digest")
+        if self.expected_manifest_digest is not None \
+                and not _SHA256.fullmatch(self.expected_manifest_digest):
+            raise ValueError("expected_manifest_digest must be a lowercase SHA-256 digest")
         if (self.scope_digest is None) != (self.scope_revision is None):
             raise ValueError("scope_digest and scope_revision must be supplied together")
         if self.scope_revision is not None:
@@ -209,6 +213,7 @@ class InvocationResult(_Envelope):
     stdout: str
     stderr: str
     artifacts: tuple[ArtifactRecord, ...] = ()
+    manifest_digest: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("invocation_id", "run_id", "work_item_id", "worker_id"):
@@ -219,6 +224,8 @@ class InvocationResult(_Envelope):
             isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
         ):
             raise ValueError("exit_code must be an integer or null")
+        if self.manifest_digest is not None and not _SHA256.fullmatch(self.manifest_digest):
+            raise ValueError("manifest_digest must be a lowercase SHA-256 digest")
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -266,11 +273,17 @@ class LocalRekitWorker:
             raise PermissionError("local invocations cannot request a mounted target")
         target = Path(request.target_path)
         validate_invocation_scope(request, target)
+        expected_digest = (
+            request.expected_manifest_digest or manifest.effective_manifest_digest
+        )
         result: ToolResult = self.rekit.run(
             request.tool_id,
             target,
             allow_dynamic=manifest.requires_permission,
+            expected_manifest_digest=expected_digest,
         )
+        if result.exit_code == 0 and result.manifest_digest != expected_digest:
+            raise ValueError("local worker result did not attest the expected manifest digest")
         return InvocationResult(
             invocation_id=request.invocation_id,
             run_id=request.run_id,
@@ -280,6 +293,7 @@ class LocalRekitWorker:
             stdout=result.stdout,
             stderr=result.stderr,
             worker_id=self.worker_id,
+            manifest_digest=result.manifest_digest,
         )
 
     def cancel(self, invocation_id: str) -> bool:

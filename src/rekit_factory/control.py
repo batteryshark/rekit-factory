@@ -57,7 +57,7 @@ from rekit_factory.findings import (
 )
 from rekit_factory.dossiers import DossierPublisher, dossier_list
 from rekit_factory.rekit_client import RekitAdapter
-from rekit_factory.remote import LocalRekitWorker
+from rekit_factory.remote import InvocationResult, LocalRekitWorker
 from rekit_factory.scope import (
     ActionAuthority,
     AuthorizedScope,
@@ -176,6 +176,9 @@ class InvestigationController:
         worker_backend = self.worker_backend(request.model_profile)
         manifests = [self.rekit.manifest(tool_id)
                      for tool_id in (*request.tools, *request.model_tools)]
+        manifest_contracts = {
+            manifest.id: manifest.public_authority() for manifest in manifests
+        }
         scope = request.scope
         if scope is None:
             non_read_only = [manifest.id for manifest in manifests
@@ -207,6 +210,7 @@ class InvestigationController:
             "toolRoutes": tool_routes,
             "knowledgeRoots": [root.name for root in self.knowledge.roots]
             if self.knowledge else [],
+            "toolAuthorities": manifest_contracts,
         }
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
@@ -230,6 +234,7 @@ class InvestigationController:
             "toolRoutes": tool_routes,
             "knowledgeRoots": [root.name for root in self.knowledge.roots]
             if self.knowledge else [],
+            "toolAuthorities": manifest_contracts,
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
@@ -275,7 +280,7 @@ class InvestigationController:
                     title=f"Run Rekit tool {tool_id}",
                     priority=200,
                     payload={"toolId": tool_id, "safetyTier": manifest.safety_tier,
-                             **route_payload},
+                             **route_payload, **_manifest_work_payload(manifest)},
                     state_label="queued",
                 ))
             item_ids: dict[str, str] = {}
@@ -481,9 +486,26 @@ class InvestigationController:
         decision = None
         actions = list(_manifest_actions(manifest))
         requested_action = payload.get("requestedAction")
-        if requested_action:
+        if payload.get("manifestDigest") != manifest.effective_manifest_digest:
+            decision = _manifest_denial(scope, item["target"], payload, "manifest.digest_changed")
+        elif payload.get("endpoint") and ActionAuthority.NETWORK_ACCESS not in manifest.actions:
+            decision = _manifest_denial(scope, item["target"], payload, "manifest.endpoint_not_declared")
+        elif payload.get("usesCredentials") and not manifest.credential_use:
+            decision = _manifest_denial(scope, item["target"], payload, "manifest.credentials_not_declared")
+        elif (payload.get("accountRef") and not manifest.credential_use
+              and not set(manifest.actions).intersection(_ACCOUNT_INTENT_ACTIONS)):
+            decision = _manifest_denial(scope, item["target"], payload, "manifest.account_not_declared")
+        elif (manifest.credential_use
+              or set(manifest.actions).intersection(_ACCOUNT_INTENT_ACTIONS)) \
+                and not payload.get("accountRef"):
+            decision = _manifest_denial(scope, item["target"], payload, "manifest.account_intent_required")
+        if requested_action and decision is None:
             try:
-                actions.append(ActionAuthority(requested_action))
+                requested = ActionAuthority(requested_action)
+                if requested not in manifest.actions:
+                    decision = _manifest_denial(
+                        scope, item["target"], payload, "manifest.action_not_declared"
+                    )
             except ValueError:
                 decision = ScopeDecision(
                     False,
@@ -516,7 +538,8 @@ class InvestigationController:
                     endpoint=(payload.get("endpoint")
                               if action is ActionAuthority.NETWORK_ACCESS else None),
                     account_ref=payload.get("accountRef"),
-                    uses_credentials=bool(payload.get("usesCredentials", False)),
+                    uses_credentials=(manifest.credential_use
+                                      or bool(payload.get("usesCredentials", False))),
                 ),
                 now=utcnow(),
             )
@@ -558,7 +581,10 @@ class InvestigationController:
                 prompt=prompt,
                 options=["allow", "deny"],
             )
-            ledger.link_permission(qid, ctx.state.run_id, item["id"], tool_id)
+            ledger.link_permission(
+                qid, ctx.state.run_id, item["id"], tool_id,
+                manifest.effective_manifest_digest,
+            )
             ledger.set_work_status(
                 item["id"], "blocked", error="Awaiting operator permission",
                 state_label="needs_permission",
@@ -567,7 +593,9 @@ class InvestigationController:
                 ctx.state.run_id, "permission.requested",
                 f"{tool_id} requires operator permission",
                 payload={"questionId": qid, "toolId": tool_id,
-                         "safetyTier": manifest.safety_tier},
+                         "safetyTier": manifest.safety_tier,
+                         "manifestDigest": manifest.effective_manifest_digest,
+                         "actions": [action.value for action in manifest.actions]},
             )
             return
 
@@ -584,7 +612,10 @@ class InvestigationController:
 
         ledger.event_log(ctx.state.run_id, "tool.started", f"Running {tool_id}")
         call_id = ledger.start_tool_call(
-            ctx.state.run_id, item["id"], tool_id, manifest.safety_tier
+            ctx.state.run_id, item["id"], tool_id, manifest.safety_tier,
+            manifest_digest=manifest.effective_manifest_digest,
+            declared_actions=tuple(action.value for action in manifest.actions),
+            credential_use=manifest.credential_use,
         )
         target_grant = TargetGrant.from_path(item["target"])
         try:
@@ -615,26 +646,37 @@ class InvestigationController:
                 endpoint=payload.get("endpoint"),
                 account_ref=payload.get("accountRef"),
                 uses_credentials=bool(payload.get("usesCredentials", False)),
+                expected_manifest_digest=payload["manifestDigest"],
             )
             result = await asyncio.to_thread(route.transport.invoke, invocation)
             _validate_invocation_result(invocation, result, route.capabilities.worker_id)
+            if result.exit_code == 0 and result.manifest_digest != payload["manifestDigest"]:
+                raise ValueError("tool worker did not attest the run-pinned manifest digest")
         except Exception as exc:
-            ledger.finish_tool_call(
-                call_id, status="failed", output_path=None, exit_code=None,
-            )
-            ledger.set_work_status(
-                item["id"], "failed",
-                error=f"tool worker routing failed ({type(exc).__name__})",
-                state_label="worker_unavailable",
-            )
-            ledger.event_log(
-                ctx.state.run_id,
-                "security.worker_route_denied",
-                "No authorized capability-compatible tool route completed",
-                payload={"toolId": tool_id, "errorType": type(exc).__name__},
-            )
-            self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
-            return
+            if "attest" in str(exc).lower():
+                result = InvocationResult(
+                    invocation_id=call_id, run_id=ctx.state.run_id,
+                    work_item_id=item["id"], worker_id=route.capabilities.worker_id,
+                    status="failed", exit_code=5, stdout="", stderr=str(exc),
+                    manifest_digest=None,
+                )
+            else:
+                ledger.finish_tool_call(
+                    call_id, status="failed", output_path=None, exit_code=None,
+                )
+                ledger.set_work_status(
+                    item["id"], "failed",
+                    error=f"tool worker routing failed ({type(exc).__name__})",
+                    state_label="worker_unavailable",
+                )
+                ledger.event_log(
+                    ctx.state.run_id,
+                    "security.worker_route_denied",
+                    "No authorized capability-compatible tool route completed",
+                    payload={"toolId": tool_id, "errorType": type(exc).__name__},
+                )
+                self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
+                return
         captured_at = utcnow()
         evidence = EvidenceStore(ctx.deps.paths.run_dir / "evidence")
         outcome = evidence.capture_tool_output(
@@ -697,6 +739,10 @@ class InvestigationController:
                 "truncated": evidence_record.truncated,
                 "retentionClass": evidence_record.retention_class.value,
                 "capturePolicy": evidence_record.capture_policy,
+                "effectiveManifestDigest": payload["manifestDigest"],
+                "verifiedManifestDigest": result.manifest_digest,
+                "declaredActions": [action.value for action in manifest.actions],
+                "credentialUse": manifest.credential_use,
                 "provenance": asdict(evidence_record.provenance),
                 "toolWorkerId": route.capabilities.worker_id,
                 "remote": route.remote,
@@ -706,7 +752,8 @@ class InvestigationController:
         if result.exit_code == 0:
             ledger.resolve(
                 item["id"],
-                result={"toolId": tool_id, "output": str(output_path)},
+                result={"toolId": tool_id, "output": str(output_path),
+                        "manifestDigest": result.manifest_digest},
                 evidence=str(output_path),
                 state_label="completed",
             )
@@ -923,10 +970,17 @@ class InvestigationController:
                 raise ValueError(
                     "workers may request only one progressive knowledge operation per turn"
                 )
+            # The run configuration is the authority source of truth. Worker payloads
+            # carry a projection for auditability, but cannot replace or widen it.
+            pinned_authorities = _run_tool_authorities(
+                ledger, ctx.state.run_id, payload.get("availableTools", [])
+            )
             pending_calls = [
                 {"callId": call.call_id, "toolId": call.tool_id,
                  "toolName": call.tool_name,
                  "capability": call.capability,
+                 **({} if call.capability == "knowledge" else
+                    _pinned_manifest_work_payload(pinned_authorities, call.tool_id)),
                  "endpoint": call.endpoint,
                  "accountRef": _account_intent_ref(call.account_ref),
                  "usesCredentials": call.uses_credentials,
@@ -987,6 +1041,9 @@ class InvestigationController:
                                 "usesCredentials": call.uses_credentials,
                                 "requestedAction": call.requested_action,
                                 **route_payload,
+                                **_pinned_manifest_work_payload(
+                                    pinned_authorities, call.tool_id
+                                ),
                             }, state_label="model_requested",
                         )
                 ledger.set_work_status(
@@ -1241,6 +1298,9 @@ class InvestigationController:
                             "Return the outcome only through hypothesis_updates with cited observations."
                         ),
                         "modelProfile": model_profile, "availableTools": list(model_tools),
+                        "toolAuthorities": _run_tool_authorities(
+                            ledger, run_id, model_tools
+                        ),
                         "planId": plan_id, "dedupeKey": stable_key(plan_id),
                         "costUnits": test.cost_units, "origin": "hypothesis-test",
                         "evidenceIds": [],
@@ -1386,6 +1446,7 @@ class InvestigationController:
                 "goal": goal,
                 "modelProfile": model_profile,
                 "availableTools": list(model_tools),
+                "toolAuthorities": _run_tool_authorities(ledger, run_id, model_tools),
                 "planId": plan_id,
                 "dedupeKey": stable_key(plan_id),
                 "costUnits": 10,
@@ -1422,6 +1483,7 @@ class InvestigationController:
                 "workerId": worker_id, "role": planned.role,
                 "goal": f"{plan.goal}\nAssigned objective: {planned.objective}",
                 "modelProfile": model_profile, "availableTools": list(model_tools),
+                "toolAuthorities": _run_tool_authorities(ledger, run_id, model_tools),
                 "planId": planned.id, "dedupeKey": planned.dedupe_key,
                 "costUnits": planned.cost_units, "origin": planned.origin,
                 "evidenceIds": list(planned.evidence_ids),
@@ -1620,12 +1682,75 @@ def _project_memory_log(paths: RunPaths) -> ProjectMemoryLog:
 
 
 def _manifest_actions(manifest: Any) -> tuple[ActionAuthority, ...]:
-    actions = [ActionAuthority.READ_LOCAL_TARGET]
-    if manifest.executes_input == "full":
-        actions.append(ActionAuthority.EXECUTE_UNTRUSTED)
-    if manifest.network not in {"none", "emulated"}:
-        actions.append(ActionAuthority.NETWORK_ACCESS)
-    return tuple(actions)
+    actions = tuple(manifest.actions)
+    if not actions or any(not isinstance(action, ActionAuthority) for action in actions):
+        raise ValueError("tool manifest has no valid semantic action authority")
+    return actions
+
+
+_ACCOUNT_INTENT_ACTIONS = {
+    ActionAuthority.REGISTER_ACCOUNT,
+    ActionAuthority.ENROLL_CHALLENGE,
+    ActionAuthority.CREATE_CREDENTIAL,
+    ActionAuthority.SUBMIT_CHALLENGE,
+    ActionAuthority.THIRD_PARTY_MESSAGE,
+}
+
+
+def _manifest_work_payload(manifest: Any) -> dict[str, Any]:
+    return {
+        "manifestDigest": manifest.effective_manifest_digest,
+        "declaredActions": [action.value for action in manifest.actions],
+        "declaredCredentialUse": manifest.credential_use,
+        "authorityVersion": manifest.authority_version,
+    }
+
+
+def _pinned_manifest_work_payload(authorities: dict[str, Any], tool_id: str) -> dict[str, Any]:
+    contract = authorities.get(tool_id)
+    if not isinstance(contract, dict) or not isinstance(contract.get("digest"), str):
+        raise ValueError(f"run has no pinned authority contract for tool {tool_id!r}")
+    actions = contract.get("actions")
+    if not isinstance(actions, list) or not actions:
+        raise ValueError(f"run has invalid pinned actions for tool {tool_id!r}")
+    return {
+        "manifestDigest": contract["digest"],
+        "declaredActions": list(actions),
+        "declaredCredentialUse": contract.get("credentialUse") is True,
+        "authorityVersion": contract.get("version"),
+    }
+
+
+def _tool_authorities(rekit: RekitAdapter, tool_ids: Any) -> dict[str, Any]:
+    return {tool_id: rekit.manifest(tool_id).public_authority() for tool_id in tool_ids}
+
+
+def _run_tool_authorities(ledger: FactoryLedger, run_id: str,
+                          tool_ids: Any) -> dict[str, Any]:
+    run = ledger.get_run(run_id)
+    config = json.loads(run["config_json"])
+    authorities = config.get("toolAuthorities")
+    if not isinstance(authorities, dict):
+        raise ValueError("run has no pinned tool authority contracts")
+    selected: dict[str, Any] = {}
+    for tool_id in tool_ids:
+        contract = authorities.get(tool_id)
+        if not isinstance(contract, dict) or not contract.get("digest"):
+            raise ValueError(f"run has no pinned authority contract for tool {tool_id!r}")
+        selected[tool_id] = contract
+    return selected
+
+
+def _manifest_denial(scope: AuthorizedScope, target: str, payload: dict[str, Any],
+                     reason: str) -> ScopeDecision:
+    return ScopeDecision(
+        False, reason,
+        (f"scope:{scope.envelope.scope_id}:r{scope.envelope.revision}:"
+         f"{scope.envelope.content_digest[:12]}"),
+        TargetGrant.from_path(target).path_fingerprint,
+        (opaque_ref("endpoint", payload["endpoint"]) if payload.get("endpoint") else None),
+        payload.get("requestedAction"),
+    )
 
 
 def _redact_intent(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1729,20 +1854,31 @@ def _knowledge_selected_hash(ledger: FactoryLedger, run_id: str, worker_id: Any,
 def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,
                                 manifests: list[Any], *, now: str) -> None:
     scope.validate(now=now)
-    actions = [ActionAuthority.READ_LOCAL_TARGET]
     for manifest in manifests:
-        actions.extend(_manifest_actions(manifest))
-    for action in dict.fromkeys(actions):
-        endpoint = None
-        if action is ActionAuthority.NETWORK_ACCESS and scope.envelope.endpoints:
-            # Creation authorizes making the tool available. Dispatch still requires
-            # the exact endpoint carried by the durable work item.
-            endpoint = scope.envelope.endpoints[0]
-        decision = decide_scope(
-            scope, ScopeRequest(action=action, target=target, endpoint=endpoint), now=now,
-        )
-        if not decision.allowed:
-            raise PermissionError(f"run creation denied: {decision.reason_code}")
+        for action in _manifest_actions(manifest):
+            endpoint = None
+            if action is ActionAuthority.NETWORK_ACCESS and scope.envelope.endpoints:
+                # Creation authorizes exposure under at least one exact endpoint.
+                # Dispatch still requires the exact durable runtime endpoint.
+                endpoint = scope.envelope.endpoints[0]
+            decision = decide_scope(
+                scope,
+                ScopeRequest(
+                    action=action, target=target, endpoint=endpoint,
+                    account_ref=(
+                        scope.envelope.account_refs[0]
+                        if (manifest.credential_use
+                            or set(manifest.actions).intersection(_ACCOUNT_INTENT_ACTIONS))
+                        and scope.envelope.account_refs else None
+                    ),
+                    uses_credentials=manifest.credential_use,
+                ),
+                now=now,
+            )
+            if not decision.allowed:
+                raise PermissionError(
+                    f"run creation denied for {manifest.id}: {decision.reason_code}"
+                )
 
 
 def _load_scope(paths: RunPaths, target: Path, *,

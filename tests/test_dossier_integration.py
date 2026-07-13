@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -10,12 +9,13 @@ import threading
 from urllib.error import HTTPError
 from urllib.request import urlopen
 import zipfile
+import pytest
 
 from muster import resolve_run_dir, stable_key, utcnow
 
 from rekit_factory.control import InvestigationController, RunRequest, _project_memory_log
 from rekit_factory.api import FactoryServer
-from rekit_factory.dossiers import DossierPublisher, verify_published_dossier
+from rekit_factory.dossiers import DossierNotReady, DossierPublisher, verify_published_dossier
 from rekit_factory.evidence import EvidenceStore, Provenance
 from rekit_factory.findings import (
     FindingMemory, FindingProposal, FindingTransition, ObservationEvidence, ReproductionAttempt,
@@ -27,6 +27,7 @@ from rekit_factory.hypotheses import (
 from rekit_factory.memory import EvidenceRef
 from rekit_factory.models import ModelProfile, WorkerReport
 from rekit_factory.rekit_client import ToolManifest
+from rekit_factory.scope import ActionAuthority
 from rekit_factory.store import FactoryLedger
 
 
@@ -34,7 +35,8 @@ class FixtureRekit:
     def __init__(self):
         self.value = ToolManifest(
             id="fixture-reader", name="Fixture reader", description="Read a staged fixture",
-            safety_tier=0, executes_input="none", network="none", source="fixture",
+            safety_tier=0, executes_input="no", network="none", source="fixture",
+            actions=(ActionAuthority.READ_LOCAL_TARGET,),
         )
 
     def manifest(self, tool_id):
@@ -54,11 +56,6 @@ class QuietBackend:
 
     async def analyze(self, **_kwargs):
         return WorkerReport(summary="done", status_update="done"), {}
-
-
-def _manifest_digest(manifest) -> str:
-    raw = json.dumps(asdict(manifest), sort_keys=True, separators=(",", ":"))
-    return sha256(raw.encode()).hexdigest()
 
 
 def _published_fixture(tmp_path: Path):
@@ -139,11 +136,9 @@ def _published_fixture(tmp_path: Path):
             title="Validate fixture", priority=200,
             payload={
                 "findingId": "f-fixture", "workerId": "validator-worker",
-                "recipeToolManifests": {
-                    "fixture-reader": _manifest_digest(rekit.manifest("fixture-reader")),
-                },
             },
         )
+        manifest = rekit.manifest("fixture-reader")
         tool_work = ledger.enqueue(
             run_id=paths.run_id, key=stable_key("tool-validation", "f-fixture"),
             target=str(target), operation="model-rekit-tool", category="tool",
@@ -151,7 +146,27 @@ def _published_fixture(tmp_path: Path):
             payload={
                 "findingId": "f-fixture", "workerItemId": "work-validation",
                 "toolId": "fixture-reader",
-                "effectiveManifestSha256": _manifest_digest(rekit.manifest("fixture-reader")),
+                "manifestDigest": manifest.effective_manifest_digest,
+                "authorityVersion": manifest.authority_version,
+            },
+        )
+        call_id = ledger.start_tool_call(
+            paths.run_id, tool_work, "fixture-reader", 0,
+            manifest_digest=manifest.effective_manifest_digest,
+            declared_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+            credential_use=False,
+        )
+        ledger.finish_tool_call(
+            call_id, status="done", output_path=str(target), exit_code=0,
+        )
+        ledger.add_artifact(
+            run_id=paths.run_id, kind="tool-output", path=target,
+            logical_path="tool-output/fixture-reader.txt", origin="rekit:fixture-reader",
+            metadata={
+                "toolId": "fixture-reader",
+                "effectiveManifestDigest": manifest.effective_manifest_digest,
+                "verifiedManifestDigest": manifest.effective_manifest_digest,
+                "provenance": {"work_item_id": tool_work},
             },
         )
         ledger.set_work_status(tool_work, "done", result={"observation": "OBSERVED:hello"})
@@ -210,12 +225,43 @@ def test_publication_uses_run_bound_target_and_tool_identities_despite_drift(tmp
     target.write_bytes(b"drifted after run")
     rekit.value = ToolManifest(
         id="fixture-reader", name="Drifted", description="different registry entry",
-        safety_tier=3, executes_input="full", network="live", source="drifted",
+        safety_tier=3, executes_input="full", network="optional", source="drifted",
+        actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.EXECUTE_UNTRUSTED,
+                 ActionAuthority.NETWORK_ACCESS),
     )
     with FactoryLedger(paths.db_path) as ledger:
         repeated = DossierPublisher(paths, ledger, rekit).publish("f-fixture")
     assert repeated["manifestSha256"] == dossier["manifestSha256"]
     assert (root / "proof.json").read_bytes() == before
+
+
+def test_dossier_rejects_incomplete_or_unattested_finding_tool_calls(tmp_path):
+    _controller, paths, _dossier, _snapshot, _unrelated, rekit = _published_fixture(tmp_path)
+    with FactoryLedger(paths.db_path) as ledger:
+        publisher = DossierPublisher(paths, ledger, rekit)
+        memory = _project_memory_log(paths).replay()
+        ledger.conn.execute(
+            "update factory_tool_calls set status='failed' where tool_id='fixture-reader'"
+        )
+        ledger.conn.commit()
+        with pytest.raises(DossierNotReady, match="attestation"):
+            publisher._build_manifest(memory, "f-fixture")
+
+        ledger.conn.execute(
+            "update factory_tool_calls set status='done' where tool_id='fixture-reader'"
+        )
+        row = ledger.conn.execute(
+            "select id,metadata_json from artifacts where kind='tool-output'"
+        ).fetchone()
+        metadata = json.loads(row["metadata_json"])
+        metadata["verifiedManifestDigest"] = "f" * 64
+        ledger.conn.execute(
+            "update artifacts set metadata_json=? where id=?",
+            (json.dumps(metadata, sort_keys=True), row["id"]),
+        )
+        ledger.conn.commit()
+        with pytest.raises(DossierNotReady, match="attestation"):
+            publisher._build_manifest(memory, "f-fixture")
 
 
 def test_generic_snapshot_does_not_rehash_published_dossiers(tmp_path, monkeypatch):

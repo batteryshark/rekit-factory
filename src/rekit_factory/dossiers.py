@@ -416,22 +416,49 @@ class DossierPublisher:
 
     def _tool_versions(self, actions: tuple[ProofAction, ...],
                        work: list[dict[str, Any]]) -> tuple[ToolVersion, ...]:
-        recorded = {}
+        recorded: dict[str, set[tuple[str, str]]] = {}
         for item in work:
-            if (item["operation"] in {"rekit-tool", "model-rekit-tool"}
-                    and item["status"] == "done" and item["payload"].get("toolId")
-                    and item["payload"].get("effectiveManifestSha256")):
-                recorded[item["payload"]["toolId"]] = item["payload"]["effectiveManifestSha256"]
+            payload = item["payload"]
+            if (item["operation"] not in {"rekit-tool", "model-rekit-tool"}
+                    or item["status"] != "done" or not payload.get("findingId")
+                    or not payload.get("toolId") or not payload.get("manifestDigest")):
+                continue
+            call = self.ledger.conn.execute(
+                "select manifest_digest,status,exit_code from factory_tool_calls "
+                "where run_id=? and work_item_id=? and tool_id=? order by created_at desc",
+                (self.paths.run_id, item["id"], payload["toolId"]),
+            ).fetchone()
+            if (call is None or call["status"] != "done" or call["exit_code"] != 0
+                    or call["manifest_digest"] != payload["manifestDigest"]):
+                continue
+            verified = None
+            for row in self.ledger.conn.execute(
+                    "select metadata_json from artifacts where run_id=? and kind='tool-output'",
+                    (self.paths.run_id,),
+            ).fetchall():
+                metadata = json.loads(row["metadata_json"])
+                provenance = metadata.get("provenance", {})
+                if (metadata.get("toolId") == payload["toolId"]
+                        and provenance.get("work_item_id") == item["id"]
+                        and metadata.get("effectiveManifestDigest") == call["manifest_digest"]
+                        and metadata.get("verifiedManifestDigest") == call["manifest_digest"]):
+                    verified = metadata["verifiedManifestDigest"]
+                    break
+            if verified is not None:
+                recorded.setdefault(payload["toolId"], set()).add((
+                    verified, f"authority-v{payload.get('authorityVersion', 1)}",
+                ))
         result = []
         for tool_id in sorted({item.tool_id for item in actions if item.tool_id}):
-            digest = recorded.get(tool_id)
-            if digest is None:
+            identities = recorded.get(tool_id, set())
+            if len(identities) != 1:
                 raise DossierNotReady(
-                    f"executed tool manifest identity for {tool_id} was not durably recorded"
+                    f"completed finding-linked attestation for {tool_id} is unavailable or ambiguous"
                 )
+            digest, authority_version = next(iter(identities))
             result.append(ToolVersion(
                 tool_id=tool_id, version=f"manifest-sha256:{digest}",
-                capability_id=f"rekit:{tool_id}", capability_version="registry-v1",
+                capability_id=f"rekit:{tool_id}", capability_version=authority_version,
             ))
         return tuple(result)
 

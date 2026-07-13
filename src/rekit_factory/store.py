@@ -73,6 +73,9 @@ create table if not exists factory_tool_calls (
     work_item_id   text not null,
     tool_id        text not null,
     safety_tier    integer not null,
+    manifest_digest text not null,
+    declared_actions_json text not null default '[]',
+    credential_use integer not null default 0,
     status         text not null,
     output_path    text,
     exit_code      integer,
@@ -86,6 +89,7 @@ create table if not exists factory_permissions (
     run_id         text not null,
     work_item_id   text not null,
     tool_id        text not null,
+    manifest_digest text not null,
     created_at     text not null
 );
 
@@ -109,6 +113,25 @@ class FactoryLedger(Ledger):
     def __init__(self, db_path: str | Path):
         # Factory tables are operational history and deliberately survive resume.
         super().__init__(db_path, extra_schema=FACTORY_SCHEMA)
+        self._migrate_manifest_authority_columns()
+
+    def _migrate_manifest_authority_columns(self) -> None:
+        migrations = {
+            "factory_tool_calls": (
+                ("manifest_digest", "text not null default ''"),
+                ("declared_actions_json", "text not null default '[]'"),
+                ("credential_use", "integer not null default 0"),
+            ),
+            "factory_permissions": (
+                ("manifest_digest", "text not null default ''"),
+            ),
+        }
+        with self.conn:
+            for table, columns in migrations.items():
+                existing = {row[1] for row in self.conn.execute(f"pragma table_info({table})")}
+                for name, declaration in columns:
+                    if name not in existing:
+                        self.conn.execute(f"alter table {table} add column {name} {declaration}")
 
     def set_run_status(self, run_id: str, status: str, *, error: str | None = None) -> None:
         self.conn.execute(
@@ -236,13 +259,16 @@ class FactoryLedger(Ledger):
         return result
 
     def start_tool_call(self, run_id: str, work_item_id: str, tool_id: str,
-                        safety_tier: int) -> str:
+                        safety_tier: int, *, manifest_digest: str,
+                        declared_actions: tuple[str, ...], credential_use: bool) -> str:
         call_id = new_id("tool")
         self.conn.execute(
             "insert into factory_tool_calls "
-            "(id, run_id, work_item_id, tool_id, safety_tier, status, created_at) "
-            "values (?,?,?,?,?,?,?)",
-            (call_id, run_id, work_item_id, tool_id, safety_tier, "running", utcnow()),
+            "(id, run_id, work_item_id, tool_id, safety_tier, manifest_digest, "
+            "declared_actions_json, credential_use, status, created_at) "
+            "values (?,?,?,?,?,?,?,?,?,?)",
+            (call_id, run_id, work_item_id, tool_id, safety_tier, manifest_digest,
+             json.dumps(declared_actions), credential_use, "running", utcnow()),
         )
         self.conn.commit()
         return call_id
@@ -256,11 +282,13 @@ class FactoryLedger(Ledger):
         )
         self.conn.commit()
 
-    def link_permission(self, qid: str, run_id: str, work_item_id: str, tool_id: str) -> None:
+    def link_permission(self, qid: str, run_id: str, work_item_id: str, tool_id: str,
+                        manifest_digest: str) -> None:
         self.conn.execute(
             "insert or ignore into factory_permissions "
-            "(question_id, run_id, work_item_id, tool_id, created_at) values (?,?,?,?,?)",
-            (qid, run_id, work_item_id, tool_id, utcnow()),
+            "(question_id, run_id, work_item_id, tool_id, manifest_digest, created_at) "
+            "values (?,?,?,?,?,?)",
+            (qid, run_id, work_item_id, tool_id, manifest_digest, utcnow()),
         )
         self.conn.commit()
 
@@ -382,6 +410,12 @@ class FactoryLedger(Ledger):
         return result
 
     def tool_calls(self, run_id: str) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.conn.execute(
+        result = []
+        for row in self.conn.execute(
             "select * from factory_tool_calls where run_id=? order by created_at", (run_id,)
-        ).fetchall()]
+        ).fetchall():
+            item = dict(row)
+            item["declaredActions"] = json.loads(item.pop("declared_actions_json"))
+            item["credentialUse"] = bool(item.pop("credential_use"))
+            result.append(item)
+        return result

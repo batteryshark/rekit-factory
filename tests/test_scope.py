@@ -197,9 +197,10 @@ class FakeRekit:
     def list_tools(self):
         return [self._manifest]
 
-    def run(self, tool_id, target, *, allow_dynamic=False):
+    def run(self, tool_id, target, *, allow_dynamic=False,
+            expected_manifest_digest=None):
         self.calls += 1
-        return ToolResult(0, "ok", "", "fixture")
+        return ToolResult(0, "ok", "", "fixture", expected_manifest_digest)
 
 
 class InjectedIntentBackend(FakeBackend):
@@ -252,6 +253,7 @@ class ScopeControllerTests(unittest.TestCase):
             target.write_text("fixture", encoding="utf-8")
             rekit = FakeRekit(ToolManifest(
                 "probe", "Probe", "network", 2, "no", "target-controlled",
+                actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.NETWORK_ACCESS),
             ))
             controller = InvestigationController(
                 storage_root=Path(tmp) / "runs", rekit=rekit, workers=FakeBackend(),
@@ -266,6 +268,7 @@ class ScopeControllerTests(unittest.TestCase):
             target.write_text("fixture", encoding="utf-8")
             rekit = FakeRekit(ToolManifest(
                 "probe", "Probe", "network", 2, "no", "target-controlled",
+                actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.NETWORK_ACCESS),
             ))
             endpoint = normalize_endpoint("https://approved.private.test/api")
             scoped = authorize(envelope(
@@ -296,6 +299,7 @@ class ScopeControllerTests(unittest.TestCase):
             target.write_text("fixture", encoding="utf-8")
             rekit = FakeRekit(ToolManifest(
                 "probe", "Probe", "network", 2, "no", "target-controlled",
+                actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.NETWORK_ACCESS),
             ))
             backend = InjectedIntentBackend()
             approved_endpoint = normalize_endpoint("https://approved.private.test/api")
@@ -321,7 +325,8 @@ class ScopeControllerTests(unittest.TestCase):
             model_tool = next(item for item in result["workItems"]
                               if item["operation"] == "model-rekit-tool")
             self.assertIn("endpointRef", model_tool["payload"])
-            self.assertEqual("scope.credentials_not_authorized", model_tool["result"]["reasonCode"])
+            self.assertEqual("manifest.credentials_not_declared",
+                             model_tool["result"]["reasonCode"])
 
 
 if __name__ == "__main__":

@@ -118,9 +118,8 @@ class FactoryHandler(BaseHTTPRequestHandler):
             if parts == ["api", "config"]:
                 tools = []
                 if hasattr(self.server.controller.rekit, "list_tools"):
-                    tools = [{
-                        **tool.__dict__, "requires_permission": tool.requires_permission,
-                    } for tool in self.server.controller.rekit.list_tools()]
+                    tools = [tool.public_dict()
+                             for tool in self.server.controller.rekit.list_tools()]
                 self._json(HTTPStatus.OK, {
                     "serviceInstance": self.server.instance_id,
                     "restartAvailable": self.server.allow_restart,

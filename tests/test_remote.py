@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from rekit_factory.rekit_client import ToolManifest, ToolResult
+from rekit_factory.scope import ActionAuthority
 from rekit_factory.remote import (
     ArtifactRecord,
     InvocationRequest,
@@ -16,13 +17,14 @@ from rekit_factory.remote import (
 )
 from rekit_factory.scope import (
     ActionAuthority, AuthorizedScope, ScopeApproval, ScopeEnvelope, TargetGrant,
+    legacy_local_read_only_scope,
 )
 
 
 class FakeRekit:
     def __init__(self, *, risky: bool = False):
         self.risky = risky
-        self.calls: list[tuple[str, Path, bool]] = []
+        self.calls: list[tuple[str, Path, bool, str | None]] = []
 
     def manifest(self, tool_id: str) -> ToolManifest:
         return ToolManifest(
@@ -32,14 +34,18 @@ class FakeRekit:
             safety_tier=2 if self.risky else 0,
             executes_input="full" if self.risky else "no",
             network="none",
+            actions=((ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.EXECUTE_UNTRUSTED)
+                     if self.risky else (ActionAuthority.READ_LOCAL_TARGET,)),
         )
 
     def list_tools(self) -> list[ToolManifest]:
         return [self.manifest("fixture-scan")]
 
-    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False) -> ToolResult:
-        self.calls.append((tool_id, target, allow_dynamic))
-        return ToolResult(0, "fixture output", "", f"rekit run {tool_id} <target>")
+    def run(self, tool_id: str, target: Path, *, allow_dynamic: bool = False,
+            expected_manifest_digest: str | None = None) -> ToolResult:
+        self.calls.append((tool_id, target, allow_dynamic, expected_manifest_digest))
+        return ToolResult(0, "fixture output", "", f"rekit run {tool_id} <target>",
+                          expected_manifest_digest)
 
 
 class RemoteEnvelopeTests(unittest.TestCase):
@@ -172,6 +178,9 @@ class RemoteEnvelopeTests(unittest.TestCase):
                 invocation_id="invoke-1", run_id="run-1", work_item_id="work-1",
                 tool_id="fixture-scan", target_path=str(target), approval_id="approval-1",
                 **common,
+                expected_manifest_digest=rekit.manifest(
+                    "fixture-scan"
+                ).effective_manifest_digest,
             )
             result = worker.invoke(allowed)
 
@@ -180,6 +189,39 @@ class RemoteEnvelopeTests(unittest.TestCase):
             self.assertEqual("work-1", result.work_item_id)
             self.assertEqual("worker-local", result.worker_id)
             self.assertTrue(rekit.calls[0][2])
+            self.assertEqual(allowed.expected_manifest_digest, rekit.calls[0][3])
+            self.assertEqual(allowed.expected_manifest_digest, result.manifest_digest)
+
+    def test_local_worker_rejects_missing_manifest_attestation(self):
+        class MissingAttestationRekit(FakeRekit):
+            def run(self, tool_id, target, *, allow_dynamic=False,
+                    expected_manifest_digest=None):
+                result = super().run(
+                    tool_id, target, allow_dynamic=allow_dynamic,
+                    expected_manifest_digest=expected_manifest_digest,
+                )
+                return ToolResult(
+                    result.exit_code, result.stdout, result.stderr,
+                    result.command_label, None,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.bin"
+            target.write_bytes(b"fixture")
+            rekit = MissingAttestationRekit()
+            expected = rekit.manifest("fixture-scan").effective_manifest_digest
+            scope = legacy_local_read_only_scope(target, now="2026-07-13T06:00:00Z")
+            request = InvocationRequest(
+                invocation_id="invoke-missing", run_id="run-1", work_item_id="work-1",
+                tool_id="fixture-scan", target_path=str(target),
+                expected_manifest_digest=expected,
+                target_sha256=TargetGrant.from_path(target).content_sha256,
+                scope_digest=scope.envelope.content_digest,
+                scope_revision=scope.to_dict(),
+                requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+            )
+            with self.assertRaisesRegex(ValueError, "attest"):
+                LocalRekitWorker(rekit).invoke(request)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,7 @@ class ToolRoute:
         endpoint: str | None,
         account_ref: str | None,
         uses_credentials: bool,
+        expected_manifest_digest: str,
     ) -> InvocationRequest:
         networked = ActionAuthority.NETWORK_ACCESS in actions
         return InvocationRequest(
@@ -109,6 +110,7 @@ class ToolRoute:
             endpoint=endpoint,
             account_ref=account_ref,
             uses_credentials=uses_credentials,
+            expected_manifest_digest=expected_manifest_digest,
             scope_digest=scope.envelope.content_digest,
             scope_revision=scope.to_dict(),
             requested_actions=tuple(action.value for action in actions),

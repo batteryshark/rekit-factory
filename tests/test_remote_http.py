@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from rekit_factory.remote import InvocationRequest, InvocationResult, WorkerCapabilities
 from rekit_factory.remote_http import (
@@ -53,6 +54,7 @@ class FixtureWorker:
     def __init__(self):
         self.requests: list[InvocationRequest] = []
         self.result_worker_id = "fixture-worker"
+        self.result_manifest_digest: str | None | object = object()
 
     def capabilities(self) -> WorkerCapabilities:
         return WorkerCapabilities(
@@ -65,6 +67,11 @@ class FixtureWorker:
 
     def invoke(self, request: InvocationRequest) -> InvocationResult:
         self.requests.append(request)
+        manifest_digest = (
+            request.expected_manifest_digest
+            if not isinstance(self.result_manifest_digest, (str, type(None)))
+            else self.result_manifest_digest
+        )
         return InvocationResult(
             invocation_id=request.invocation_id,
             run_id=request.run_id,
@@ -74,6 +81,7 @@ class FixtureWorker:
             exit_code=0,
             stdout=Path(request.target_path).read_text(encoding="utf-8"),
             stderr="",
+            manifest_digest=manifest_digest,
         )
 
     def cancel(self, invocation_id: str) -> bool:
@@ -198,6 +206,46 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                 self.assertEqual("failed", result.status)
                 self.assertEqual("fixture-worker", result.worker_id)
                 self.assertIn("ValueError", result.stderr)
+
+    def test_rejects_missing_or_spoofed_remote_manifest_attestation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            scope = offline_scope(target_hash)
+            expected = "a" * 64
+            for attestation in (None, "b" * 64):
+                with self.subTest(attestation=attestation), running_server(root) as (worker, client):
+                    worker.result_manifest_digest = attestation
+                    result = client.invoke(self.request(
+                        invocation_id="invoke-attestation-" + (attestation or "missing")[:8],
+                        expected_manifest_digest=expected,
+                        target_sha256=target_hash,
+                        scope_digest=scope.envelope.content_digest,
+                        scope_revision=scope.to_dict(),
+                        requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,),
+                    ))
+                    self.assertEqual("failed", result.status)
+                    self.assertIsNone(result.manifest_digest)
+                    self.assertIn("ValueError", result.stderr)
+
+    def test_controller_rejects_spoofed_manifest_from_remote_server(self):
+        client = HTTPWorkerTransport("https://worker.invalid", auth_token="token")
+        request = self.request(expected_manifest_digest="a" * 64)
+        spoofed = InvocationResult(
+            invocation_id=request.invocation_id,
+            run_id=request.run_id,
+            work_item_id=request.work_item_id,
+            worker_id="fixture-worker",
+            status="done", exit_code=0, stdout="spoof", stderr="",
+            manifest_digest="b" * 64,
+        )
+        with mock.patch.object(client, "_request", side_effect=[
+            (202, {"status": "accepted"}), (200, spoofed.to_dict()),
+        ]):
+            with self.assertRaisesRegex(RemoteWorkerError, "manifest digest"):
+                client.invoke(request)
 
     def test_auth_and_policy_configuration_are_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:

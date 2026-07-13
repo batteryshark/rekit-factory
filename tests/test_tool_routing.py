@@ -52,6 +52,7 @@ class FakeTransport:
                 path="reports/scan.json", sha256="b" * 64, size=42,
                 media_type="application/json",
             ),),
+            manifest_digest=request.expected_manifest_digest,
         )
 
     def cancel(self, invocation_id):
@@ -225,6 +226,7 @@ class ToolRoutingTests(unittest.TestCase):
                 tool_id="scan", target_sha256=hash_path(target), scope=scope,
                 actions=actions, approval_id="question-allow", endpoint=endpoint,
                 account_ref="account:lab", uses_credentials=True,
+                expected_manifest_digest="a" * 64,
             )
             self.assertEqual("restricted", request.network_policy)
             self.assertEqual("staged-input-read-only", request.mount_policy)
