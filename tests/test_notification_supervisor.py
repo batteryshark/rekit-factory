@@ -11,7 +11,7 @@ from rekit_factory.notification_delivery import (
 )
 from rekit_factory.notification_outbox import NotificationOutbox
 from rekit_factory.notification_outbox import NotificationStateConflict
-from rekit_factory.notification_policy import notification_candidates
+from rekit_factory.notification_policy import FindingNotificationPolicy, notification_candidates
 from rekit_factory.notification_preferences import NotificationPreferences
 from rekit_factory.notification_supervisor import (
     NotificationDeliverySupervisor,
@@ -89,6 +89,95 @@ def test_cross_run_campaign_proof_schedules_by_source_and_delivers_exact_link(tm
         "view": "mission-control", "runId": "run-proof", "tab": "dossiers",
         "entityType": "proof-bundle", "entityId": "dossier-exact",
     }
+    ledger.close()
+
+
+def test_configured_finding_stage_reaches_provider_once_with_exact_proof_link(tmp_path):
+    """Exercise canonical fold through the actual provider-visible webhook boundary."""
+    clock = FakeClock(datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc))
+    ledger = FactoryLedger(tmp_path / "run.db")
+    common = {"workers": (), "work_items": (), "pending_questions": ()}
+    candidate = project_outcomes(
+        run={"id": "run-1", "status": "running"},
+        memory={"findings": {"finding-1": {"id": "finding-1", "status": "candidate"}}},
+        dossiers=(), **common,
+    )
+    reproduced = project_outcomes(
+        run={"id": "run-1", "status": "running"},
+        memory={"findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}}},
+        dossiers=[{"id": "dossier-1", "findingId": "finding-1",
+                   "verificationStatus": "published"}], **common,
+    )
+    accepted = project_outcomes(
+        run={"id": "run-1", "status": "running"},
+        memory={
+            "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+            "finding_operator_decisions": {
+                "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                               "decision": "accepted", "_eventSeq": 1},
+            },
+        },
+        dossiers=[{"id": "dossier-1", "findingId": "finding-1",
+                   "verificationStatus": "published"}], **common,
+    )
+    policy = FindingNotificationPolicy.for_stage("accepted")
+    assert ledger.admit_notification_projection(
+        "run-1", candidate, finding_policy=policy,
+    ) == []
+    assert ledger.admit_notification_projection(
+        "run-1", reproduced, finding_policy=policy,
+    ) == []
+    [notification_id] = ledger.admit_notification_projection(
+        "run-1", accepted, finding_policy=policy,
+    )
+
+    supervisor = NotificationDeliverySupervisor(ledger.conn, clock=clock)
+    supervisor.schedule(
+        notification_id, _preferences(), project_id="project-1", campaign_id="campaign-1",
+        channel_refs=["webhook-primary"],
+    )
+    channel = WebhookChannel(
+        "webhook-primary", "https://hooks.example.test/factory", "credential:primary",
+    )
+
+    class Resolver:
+        def resolve(self, ref):
+            assert ref == "credential:primary"
+            return "secret-token"
+
+    class Transport:
+        def __init__(self):
+            self.bodies = []
+
+        def send(self, request, *, bearer_token):
+            assert bearer_token == "secret-token"
+            self.bodies.append(json.loads(request.body))
+
+    transport = Transport()
+    result = supervisor.run_once(
+        "sender", channels={"webhook-primary": channel}, webhook_transport=transport,
+        credential_resolver=Resolver(),
+    )
+    assert result == [{"deliveryId": result[0]["deliveryId"], "sent": True,
+                       "errorCode": None}]
+    assert len(transport.bodies) == 1
+    assert transport.bodies[0]["kind"] == "finding.accepted"
+    assert transport.bodies[0]["deepLink"] == {
+        "view": "mission-control", "runId": "run-1", "tab": "dossiers",
+        "entityType": "proof-bundle", "entityId": "dossier-1",
+    }
+
+    # Reconnect/restart observes the same canonical state and cannot create a second
+    # provider call for the already delivered configured-stage transition.
+    assert ledger.admit_notification_projection(
+        "run-1", accepted, finding_policy=policy,
+    ) == []
+    restarted = NotificationDeliverySupervisor(ledger.conn, clock=clock)
+    assert restarted.run_once(
+        "sender-restarted", channels={"webhook-primary": channel},
+        webhook_transport=transport, credential_resolver=Resolver(),
+    ) == []
+    assert len(transport.bodies) == 1
     ledger.close()
 
 

@@ -84,6 +84,10 @@ def test_configuration_preview_and_fixed_test_commands_are_redacted_and_exact(tm
             {"ref": "desktop-unselected", "kind": "desktop"},
         ]
         assert projected["channelRefs"] == ["desktop-main"]
+        assert projected["findingNotificationStageId"] == "reproduced"
+        assert [item["id"] for item in projected["findingNotificationStages"]] == [
+            "reproduced", "accepted",
+        ]
         preview = _request(
             base, f"/api/runs/run-1/notifications/{notification_id}/preview"
         )["preview"]
@@ -93,6 +97,7 @@ def test_configuration_preview_and_fixed_test_commands_are_redacted_and_exact(tm
         hostile = _request(base, "/api/notification-configuration", {
             "expectedRevision": projected["revision"],
             "preferencePresetId": "muted", "channelRefs": ["desktop-main"],
+            "findingNotificationStageId": "accepted",
             "endpoint": "https://private.example/TOKEN=do-not-echo",
         }, 400)
         assert "private.example" not in json.dumps(hostile)
@@ -121,6 +126,15 @@ def test_configuration_preview_and_fixed_test_commands_are_redacted_and_exact(tm
         )
         assert unselected["sent"] is True
         assert unselected["channelRef"] == "desktop-unselected"
+
+        updated = _request(base, "/api/notification-configuration", {
+            "expectedRevision": projected["revision"],
+            "preferencePresetId": projected["preferencePresetId"],
+            "channelRefs": projected["channelRefs"],
+            "findingNotificationStageId": "accepted",
+        })["configuration"]
+        assert updated["findingNotificationStageId"] == "accepted"
+        assert updated["revision"] != projected["revision"]
     finally:
         server.shutdown()
         server.server_close()

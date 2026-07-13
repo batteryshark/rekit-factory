@@ -135,6 +135,17 @@ def test_live_worker_delivers_selected_run_channel_and_is_stoppable(tmp_path):
     assert len(results) == len(transport.calls) == 1
     assert results[0]["sent"] is True
     assert transport.calls[0]["idempotency_key"].startswith("sha256:")
+    assert transport.calls[0]["message"] == (
+        "Operator decision is waiting in Mission Control."
+    )
+    # Re-observing the same committed decision and restarting the sender are both
+    # silent.  This proves the provider-visible boundary, rather than merely the
+    # outbox or schedule counts, remains exactly once across reconnect/restart.
+    controller.snapshot(run_dir)
+    restarted = NotificationDeliveryWorker(server, autostart=False)
+    assert restarted.run_cycle() == []
+    restarted.close()
+    assert len(transport.calls) == 1
     with FactoryLedger(Path(run_dir) / "run.db") as ledger:
         assert ledger.conn.execute(
             "select status from factory_notification_deliveries"

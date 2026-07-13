@@ -231,7 +231,8 @@ create table if not exists factory_notification_projection_state (
     semantic_sha256    text not null,
     projection_json    text not null,
     projection_sha256  text not null,
-    updated_at         text not null
+    updated_at         text not null,
+    finding_policy_revision text not null default ''
 );
 """
 
@@ -252,6 +253,9 @@ class FactoryLedger(Ledger):
             "factory_permissions": (
                 ("manifest_digest", "text not null default ''"),
             ),
+            "factory_notification_projection_state": (
+                ("finding_policy_revision", "text not null default ''"),
+            ),
         }
         with self.conn:
             for table, columns in migrations.items():
@@ -263,6 +267,7 @@ class FactoryLedger(Ledger):
     def admit_notification_projection(
             self, run_id: str, projection: dict[str, Any], *,
             proof_resolver: Callable[[str, str], tuple[str, str] | None] | None = None,
+            finding_policy: Any = None,
             failure_injector: Callable[[str], None] | None = None) -> list[str]:
         """Atomically advance the trusted outcome baseline and admit notifications.
 
@@ -274,13 +279,15 @@ class FactoryLedger(Ledger):
         """
         from rekit_factory.notification_outbox import NotificationOutbox
         from rekit_factory.notification_policy import (
+            finding_policy_reconciliation_candidates,
             notification_candidates,
             notification_supersession_ids,
         )
 
         # This validates the supported schema, vocabulary, semantic digest, and canonical bytes
         # even when there is no previous projection.
-        notification_candidates(None, projection)
+        notification_candidates(None, projection, finding_policy=finding_policy)
+        policy_revision = "" if finding_policy is None else finding_policy.revalidated().revision
         run_ids = sorted(
             item.get("entityId") for item in projection.get("entities", ())
             if item.get("entityType") == "run"
@@ -314,15 +321,60 @@ class FactoryLedger(Ledger):
                         "notification projection baseline identity conflicts with content"
                     )
                 # Revalidate stored content before it is allowed to influence policy.
-                notification_candidates(None, old)
+                notification_candidates(None, old, finding_policy=finding_policy)
+                # A policy change re-baselines the already observed state. It must never
+                # reinterpret a historical threshold crossing using the new stage choice.
+                if previous["finding_policy_revision"] != policy_revision:
+                    candidates = finding_policy_reconciliation_candidates(
+                        projection, finding_policy=finding_policy,
+                        proof_resolver=proof_resolver,
+                    ) if finding_policy is not None else []
+                    notified_findings = {
+                        row[0] for row in self.conn.execute(
+                            "select distinct json_extract(payload_json, '$.findingId') "
+                            "from factory_notification_outbox where "
+                            "json_extract(payload_json, '$.findingId') is not null"
+                        ).fetchall()
+                    }
+                    candidates = [item for item in candidates
+                                  if item.get("findingId") not in notified_findings]
+                    admitted = NotificationOutbox(self.conn).admit(candidates)
+                    if failure_injector:
+                        failure_injector("outbox-admitted")
+                    self.conn.execute(
+                        "update factory_notification_projection_state set semantic_sha256=?,"
+                        "projection_json=?,projection_sha256=?,updated_at=?,"
+                        "finding_policy_revision=? where run_id=?",
+                        (semantic_sha256, projection_json, projection_sha256, utcnow(),
+                         policy_revision, run_id),
+                    )
+                    self.conn.commit()
+                    return admitted
                 if previous["semantic_sha256"] == semantic_sha256:
                     self.conn.rollback()
                     return []
                 candidates = notification_candidates(
                     old, projection, proof_resolver=proof_resolver,
+                    finding_policy=finding_policy,
                 )
+                if finding_policy is not None:
+                    # A finding may cross both thresholds, but policy changes must not turn
+                    # that into a second notification. Durable payload identity records which
+                    # canonical finding has already been admitted, independent of proof routing.
+                    notified_findings = {
+                        row[0] for row in self.conn.execute(
+                            "select distinct json_extract(payload_json, '$.findingId') "
+                            "from factory_notification_outbox where "
+                            "json_extract(payload_json, '$.findingId') is not null"
+                        ).fetchall()
+                    }
+                    candidates = [
+                        item for item in candidates
+                        if item.get("findingId") not in notified_findings
+                    ]
                 supersession_ids = notification_supersession_ids(
                     old, projection, proof_resolver=proof_resolver,
+                    finding_policy=finding_policy,
                 )
                 outbox = NotificationOutbox(self.conn)
                 admitted = outbox.admit(candidates)
@@ -359,15 +411,18 @@ class FactoryLedger(Ledger):
                     failure_injector("notifications-reconciled")
                 self.conn.execute(
                     "update factory_notification_projection_state set semantic_sha256=?,"
-                    "projection_json=?,projection_sha256=?,updated_at=? where run_id=?",
-                    (semantic_sha256, projection_json, projection_sha256, utcnow(), run_id),
+                    "projection_json=?,projection_sha256=?,updated_at=?,"
+                    "finding_policy_revision=? where run_id=?",
+                    (semantic_sha256, projection_json, projection_sha256, utcnow(),
+                     policy_revision, run_id),
                 )
             else:
                 self.conn.execute(
                     "insert into factory_notification_projection_state "
-                    "(run_id,semantic_sha256,projection_json,projection_sha256,updated_at) "
-                    "values (?,?,?,?,?)",
-                    (run_id, semantic_sha256, projection_json, projection_sha256, utcnow()),
+                    "(run_id,semantic_sha256,projection_json,projection_sha256,updated_at,"
+                    "finding_policy_revision) values (?,?,?,?,?,?)",
+                    (run_id, semantic_sha256, projection_json, projection_sha256, utcnow(),
+                     policy_revision),
                 )
             if failure_injector:
                 failure_injector("baseline-advanced")

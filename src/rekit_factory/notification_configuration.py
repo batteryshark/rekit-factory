@@ -18,6 +18,7 @@ from typing import Any, Mapping, Sequence
 
 from rekit_factory.notification_delivery import DesktopChannel, WebhookChannel
 from rekit_factory.notification_preferences import NotificationPreferences
+from rekit_factory.notification_policy import FindingNotificationPolicy
 
 
 CONFIGURATION_SCHEMA_VERSION = 1
@@ -34,10 +35,11 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def _revision(preset_id: str, preference_id: str, channel_refs: Sequence[str]) -> str:
+def _revision(preset_id: str, preference_id: str, channel_refs: Sequence[str],
+              finding_stage: str) -> str:
     body = _canonical({
         "preferencePresetId": preset_id, "preferenceId": preference_id,
-        "channelRefs": sorted(channel_refs),
+        "channelRefs": sorted(channel_refs), "findingNotificationStageId": finding_stage,
     })
     return "sha256:" + hashlib.sha256(body.encode()).hexdigest()
 
@@ -127,27 +129,50 @@ class NotificationConfigurationStore:
                     updated_at text not null
                 );
             """)
+            columns = {row[1] for row in connection.execute(
+                "pragma table_info(notification_configuration)"
+            )}
+            migrated = "finding_stage" not in columns
+            if migrated:
+                connection.execute(
+                    "alter table notification_configuration add column finding_stage "
+                    "text not null default 'reproduced'"
+                )
             if connection.execute(
                     "select 1 from notification_configuration where singleton=1").fetchone() is None:
                 preset_id = next(iter(self.preferences))
                 refs = [next(iter(self.channels))]
                 connection.execute(
-                    "insert into notification_configuration values (1,?,?,?,?)",
-                    (preset_id, _canonical(refs), self._revision(preset_id, refs), _timestamp()),
+                    "insert into notification_configuration "
+                    "(singleton,preference_preset_id,channel_refs_json,revision,updated_at,"
+                    "finding_stage) values (1,?,?,?,?,?)",
+                    (preset_id, _canonical(refs), self._revision(preset_id, refs, "reproduced"),
+                     _timestamp(), "reproduced"),
+                )
+            elif migrated:
+                row = connection.execute(
+                    "select preference_preset_id,channel_refs_json from "
+                    "notification_configuration where singleton=1"
+                ).fetchone()
+                refs = json.loads(row["channel_refs_json"])
+                connection.execute(
+                    "update notification_configuration set revision=? where singleton=1",
+                    (self._revision(row["preference_preset_id"], refs, "reproduced"),),
                 )
 
-    def _revision(self, preset_id: str, channel_refs: Sequence[str]) -> str:
+    def _revision(self, preset_id: str, channel_refs: Sequence[str], finding_stage: str) -> str:
         preference = self.preferences.get(preset_id)
         if preference is None:
             raise ValueError("unknown notification preference preset")
-        return _revision(preset_id, preference.identity, channel_refs)
+        policy = FindingNotificationPolicy.for_stage(finding_stage)
+        return _revision(preset_id, preference.identity, channel_refs, policy.stage)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
         return connection
 
-    def _selection(self, connection: sqlite3.Connection) -> tuple[str, list[str], str, str]:
+    def _selection(self, connection: sqlite3.Connection) -> tuple[str, list[str], str, str, str]:
         row = connection.execute(
             "select * from notification_configuration where singleton=1"
         ).fetchone()
@@ -158,16 +183,21 @@ class NotificationConfigurationStore:
         except json.JSONDecodeError as exc:
             raise ValueError("notification configuration is corrupt") from exc
         preset_id = row["preference_preset_id"]
+        finding_stage = row["finding_stage"]
+        try:
+            FindingNotificationPolicy.for_stage(finding_stage)
+        except ValueError as exc:
+            raise ValueError("notification configuration is corrupt") from exc
         if preset_id not in self.preferences or type(refs) is not list \
                 or not 1 <= len(refs) <= MAX_CHANNELS or len(set(refs)) != len(refs) \
                 or any(ref not in self.channels for ref in refs) \
-                or row["revision"] != self._revision(preset_id, refs):
+                or row["revision"] != self._revision(preset_id, refs, finding_stage):
             raise ValueError("notification configuration is corrupt")
-        return preset_id, sorted(refs), row["revision"], row["updated_at"]
+        return preset_id, sorted(refs), row["revision"], row["updated_at"], finding_stage
 
     def public_snapshot(self) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
-            preset_id, refs, revision, updated_at = self._selection(connection)
+            preset_id, refs, revision, updated_at, finding_stage = self._selection(connection)
         presets = []
         for identity, preference in sorted(self.preferences.items()):
             rule = preference.document["default"]
@@ -185,10 +215,15 @@ class NotificationConfigurationStore:
             "revision": revision, "updatedAt": updated_at,
             "preferencePresetId": preset_id, "channelRefs": refs,
             "preferencePresets": presets, "channels": channels,
+            "findingNotificationStageId": finding_stage,
+            "findingNotificationStages": [
+                {"id": stage, "policyRevision": FindingNotificationPolicy.for_stage(stage).revision}
+                for stage in ("reproduced", "accepted")
+            ],
         }
 
     def update(self, *, expected_revision: str, preference_preset_id: str,
-               channel_refs: Sequence[str]) -> dict[str, Any]:
+               channel_refs: Sequence[str], finding_notification_stage_id: str) -> dict[str, Any]:
         _safe_id(expected_revision, "expectedRevision")
         preset_id = _safe_id(preference_preset_id, "preferencePresetId")
         if preset_id not in self.preferences:
@@ -198,11 +233,13 @@ class NotificationConfigurationStore:
         refs = sorted(_safe_id(item, "channel ref") for item in channel_refs)
         if len(set(refs)) != len(refs) or any(item not in self.channels for item in refs):
             raise ValueError("channelRefs contain duplicates or unknown references")
-        requested_revision = self._revision(preset_id, refs)
+        finding_stage = _safe_id(finding_notification_stage_id, "findingNotificationStageId")
+        FindingNotificationPolicy.for_stage(finding_stage)
+        requested_revision = self._revision(preset_id, refs, finding_stage)
         with self._lock, self._connect() as connection:
             connection.execute("begin immediate")
-            current_preset, current_refs, current_revision, _ = self._selection(connection)
-            if current_preset == preset_id and current_refs == refs:
+            current_preset, current_refs, current_revision, _, current_stage = self._selection(connection)
+            if current_preset == preset_id and current_refs == refs and current_stage == finding_stage:
                 connection.rollback()
                 return self.public_snapshot()
             if current_revision != expected_revision:
@@ -210,25 +247,30 @@ class NotificationConfigurationStore:
                 raise NotificationConfigurationConflict("notification configuration revision is stale")
             connection.execute(
                 "update notification_configuration set preference_preset_id=?,"
-                "channel_refs_json=?,revision=?,updated_at=? where singleton=1",
-                (preset_id, _canonical(refs), requested_revision, _timestamp()),
+                "channel_refs_json=?,revision=?,updated_at=?,finding_stage=? where singleton=1",
+                (preset_id, _canonical(refs), requested_revision, _timestamp(), finding_stage),
             )
             connection.commit()
         return self.public_snapshot()
 
     def selected_preference(self) -> NotificationPreferences:
         with self._lock, self._connect() as connection:
-            preset_id, _, _, _ = self._selection(connection)
+            preset_id, _, _, _, _ = self._selection(connection)
         return self.preferences[preset_id]
 
     def selected_delivery(self) -> tuple[NotificationPreferences, tuple[str, ...]]:
         """Return one lock-consistent, fully revalidated scheduling selection."""
         with self._lock, self._connect() as connection:
-            preset_id, refs, _, _ = self._selection(connection)
+            preset_id, refs, _, _, _ = self._selection(connection)
             preference = NotificationPreferences.from_json(
                 self.preferences[preset_id].canonical_json
             )
         return preference, tuple(refs)
+
+    def selected_finding_policy(self) -> FindingNotificationPolicy:
+        with self._lock, self._connect() as connection:
+            _, _, _, _, stage = self._selection(connection)
+        return FindingNotificationPolicy.for_stage(stage)
 
     def channel(self, channel_ref: str) -> DesktopChannel | WebhookChannel:
         _safe_id(channel_ref, "channel ref")

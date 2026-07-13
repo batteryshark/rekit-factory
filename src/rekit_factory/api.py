@@ -496,7 +496,8 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, snapshot)
                 return
             if parts == ["api", "notification-configuration"]:
-                expected = {"expectedRevision", "preferencePresetId", "channelRefs"}
+                expected = {"expectedRevision", "preferencePresetId", "channelRefs",
+                            "findingNotificationStageId"}
                 if set(payload) != expected:
                     raise ValueError(
                         "notification configuration body must contain only exact selection fields"
@@ -505,6 +506,7 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     expected_revision=payload["expectedRevision"],
                     preference_preset_id=payload["preferencePresetId"],
                     channel_refs=payload["channelRefs"],
+                    finding_notification_stage_id=payload["findingNotificationStageId"],
                 )
                 self._json(HTTPStatus.OK, {"configuration": configuration})
                 return

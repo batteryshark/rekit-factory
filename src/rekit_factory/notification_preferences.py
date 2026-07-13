@@ -260,6 +260,10 @@ def _validated_record(record: Mapping[str, Any]) -> tuple[str, str, datetime]:
             }
             if payload["deepLink"]["runId"] != source_run_id:
                 candidate["deepLinkRunId"] = payload["deepLink"]["runId"]
+            if {"findingStage", "policyRevision", "findingId"} & set(payload):
+                candidate["findingStage"] = payload.get("findingStage")
+                candidate["policyRevision"] = payload.get("policyRevision")
+                candidate["findingId"] = payload.get("findingId")
         canonical_payload = _payload(candidate)
     except (KeyError, TypeError, InvalidNotificationCandidate) as exc:
         raise InvalidOutboxRecord("outbox payload is invalid") from exc

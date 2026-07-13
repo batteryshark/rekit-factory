@@ -18,7 +18,7 @@ def test_notification_configuration_surface_uses_only_opaque_revision_bound_comm
     ):
         assert marker in page + script
     assert "expectedRevision: configuration.revision, preferencePresetId:" in script
-    assert "channelRefs})" in script
+    assert "findingNotificationStageId: $(\"notificationFindingStage\").value" in script
     assert "expectedRevision: state.notificationConfiguration.revision, testId" in script
     configuration_command = script[
         script.index("async function saveNotificationConfiguration"):

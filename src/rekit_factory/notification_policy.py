@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, Mapping
 
 from rekit_factory.outcomes import (
     SCHEMA_VERSION,
@@ -21,6 +22,7 @@ from rekit_factory.outcomes import (
 
 
 POLICY_VERSION = "factory-notification-policy/v1"
+FINDING_STAGE_POLICY_VERSION = "factory-finding-stage-policy/v1"
 STALE_DECISION_POLICY_VERSION = "factory-stale-decision-policy/v1"
 CANDIDATE_SCHEMA_VERSION = 1
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -28,6 +30,28 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 class InvalidOutcomeProjection(ValueError):
     """Raised when input is not an intact canonical v1 outcome projection."""
+
+
+@dataclass(frozen=True)
+class FindingNotificationPolicy:
+    """Server-owned, content-addressed choice of the one finding threshold to notify."""
+
+    stage: Literal["reproduced", "accepted"]
+    revision: str
+
+    @classmethod
+    def for_stage(cls, stage: str) -> "FindingNotificationPolicy":
+        if stage not in {"reproduced", "accepted"}:
+            raise ValueError("finding notification stage must be reproduced or accepted")
+        document = {"policyVersion": FINDING_STAGE_POLICY_VERSION, "stage": stage}
+        canonical = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return cls(stage=stage, revision="sha256:" + hashlib.sha256(canonical.encode()).hexdigest())
+
+    def revalidated(self) -> "FindingNotificationPolicy":
+        expected = self.for_stage(self.stage)
+        if self != expected:
+            raise ValueError("finding notification policy revision is invalid")
+        return expected
 
 
 def _validate_projection(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -99,7 +123,9 @@ def _finding_at(entity: Mapping[str, Any] | None, facet_name: str, state: str) -
 
 def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
                message: str, entity_type: str | None = None,
-               deep_link_run_id: str | None = None) -> dict[str, Any]:
+               deep_link_run_id: str | None = None,
+               finding_policy: FindingNotificationPolicy | None = None,
+               finding_id: str | None = None) -> dict[str, Any]:
     linked_type = entity_type or (
         "operator-decision" if kind == "operator-decision.waiting" else "finding"
     )
@@ -110,6 +136,9 @@ def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
         "entityId": entity_id,
         "transition": kind,
     }
+    if finding_policy is not None:
+        finding_policy = finding_policy.revalidated()
+        identity["policyRevision"] = finding_policy.revision
     canonical = json.dumps(identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     candidate = {
         "schemaVersion": CANDIDATE_SCHEMA_VERSION,
@@ -121,6 +150,12 @@ def _candidate(*, kind: str, severity: str, run_id: str, entity_id: str,
         "entity": {"entityType": linked_type, "entityId": entity_id},
         "message": message,
     }
+    if finding_policy is not None:
+        if linked_type not in {"finding", "proof-bundle"} or _safe_id(finding_id) is None:
+            raise ValueError("finding-stage candidate requires the canonical finding identity")
+        candidate["findingStage"] = finding_policy.stage
+        candidate["policyRevision"] = finding_policy.revision
+        candidate["findingId"] = finding_id
     if deep_link_run_id is not None and deep_link_run_id != run_id:
         candidate["deepLinkRunId"] = deep_link_run_id
     return candidate
@@ -213,6 +248,7 @@ def notification_candidates(
     old: Mapping[str, Any] | None,
     new: Mapping[str, Any],
     *, proof_resolver: ProofResolver | None = None,
+    finding_policy: FindingNotificationPolicy | None = None,
 ) -> list[dict[str, Any]]:
     """Return stable redacted candidates for consequential canonical transitions.
 
@@ -221,6 +257,8 @@ def notification_candidates(
     no delivery or persistence claim.
     """
     current = _validate_projection(new)
+    if finding_policy is not None:
+        finding_policy = finding_policy.revalidated()
     if old is None:
         return []
     previous = _validate_projection(old)
@@ -260,24 +298,75 @@ def notification_candidates(
             )
             linked_type = "proof-bundle" if proof is not None else "finding"
             linked_run_id, linked_id = proof if proof is not None else (run_id, entity_id)
-            if (_finding_at(entity, "validation", "reproduced")
+            if ((finding_policy is None or finding_policy.stage == "reproduced")
+                    and _finding_at(entity, "validation", "reproduced")
                     and not _finding_at(before, "validation", "reproduced")):
                 candidates.append(_candidate(
                     kind="finding.reproduced", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
                     deep_link_run_id=linked_run_id,
+                    finding_policy=finding_policy,
+                    finding_id=entity_id,
                     message="A finding reached the reproduced threshold.",
                 ))
-            if (_finding_at(entity, "acceptance", "accepted")
+            if ((finding_policy is None or finding_policy.stage == "accepted")
+                    and _finding_at(entity, "acceptance", "accepted")
                     and _finding_at(entity, "validation", "reproduced")
                     and not _finding_at(before, "acceptance", "accepted")):
                 candidates.append(_candidate(
                     kind="finding.accepted", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
                     deep_link_run_id=linked_run_id,
+                    finding_policy=finding_policy,
+                    finding_id=entity_id,
                     message="A finding was accepted by the operator.",
                 ))
 
+    return sorted(candidates, key=lambda item: (item["kind"], item["entity"]["entityId"]))
+
+
+def finding_policy_reconciliation_candidates(
+    projection: Mapping[str, Any], *, finding_policy: FindingNotificationPolicy,
+    proof_resolver: ProofResolver | None = None,
+) -> list[dict[str, Any]]:
+    """Return currently eligible findings when a server-owned stage policy changes.
+
+    The durable ledger filters findings that have ever been admitted before calling the outbox.
+    This pure half only verifies current canonical eligibility; degraded or ambiguous run state
+    fails closed and prose never participates.
+    """
+    current = _validate_projection(projection)
+    policy = finding_policy.revalidated()
+    if current.get("degraded") is not False:
+        return []
+    entities = _entity_map(current)
+    if entities is None:
+        return []
+    run_ids = sorted(entity_id for (entity_type, entity_id) in entities
+                     if entity_type == "run")
+    if len(run_ids) != 1:
+        return []
+    run_id = run_ids[0]
+    candidates = []
+    for (entity_type, finding_id), entity in sorted(entities.items()):
+        if entity_type != "finding" or not _finding_at(entity, "validation", "reproduced"):
+            continue
+        if policy.stage == "accepted" and not _finding_at(entity, "acceptance", "accepted"):
+            continue
+        proof = _proof_target(
+            entities, run_id=run_id, finding_id=finding_id, proof_resolver=proof_resolver,
+        )
+        linked_type = "proof-bundle" if proof is not None else "finding"
+        linked_run_id, linked_id = proof if proof is not None else (run_id, finding_id)
+        kind = "finding." + policy.stage
+        candidates.append(_candidate(
+            kind=kind, severity="consequential", run_id=run_id,
+            entity_id=linked_id, entity_type=linked_type, deep_link_run_id=linked_run_id,
+            finding_policy=policy, finding_id=finding_id,
+            message=("A finding reached the reproduced threshold."
+                     if policy.stage == "reproduced"
+                     else "A finding was accepted by the operator."),
+        ))
     return sorted(candidates, key=lambda item: (item["kind"], item["entity"]["entityId"]))
 
 
@@ -285,6 +374,7 @@ def notification_supersession_ids(
     old: Mapping[str, Any] | None,
     new: Mapping[str, Any],
     *, proof_resolver: ProofResolver | None = None,
+    finding_policy: FindingNotificationPolicy | None = None,
 ) -> list[str]:
     """Return previously admitted notification ids that no longer require delivery.
 
@@ -294,6 +384,8 @@ def notification_supersession_ids(
     wait/resolve/wait flap cannot create fresh delivery work.
     """
     current = _validate_projection(new)
+    if finding_policy is not None:
+        finding_policy = finding_policy.revalidated()
     if old is None:
         return []
     previous = _validate_projection(old)
@@ -332,15 +424,19 @@ def notification_supersession_ids(
             )
             linked_type = "proof-bundle" if proof is not None else "finding"
             linked_run_id, linked_id = proof if proof is not None else (run_id, entity_id)
-            if (_finding_at(before, "validation", "reproduced")
+            if ((finding_policy is None or finding_policy.stage == "reproduced")
+                    and _finding_at(before, "validation", "reproduced")
                     and not _finding_at(after, "validation", "reproduced")):
                 candidates.append(_candidate(
                     kind="finding.reproduced", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
                     deep_link_run_id=linked_run_id,
+                    finding_policy=finding_policy,
+                    finding_id=entity_id,
                     message="A finding reached the reproduced threshold.",
                 ))
-            if (_finding_at(before, "acceptance", "accepted")
+            if ((finding_policy is None or finding_policy.stage == "accepted")
+                    and _finding_at(before, "acceptance", "accepted")
                     and _finding_at(before, "validation", "reproduced")
                     and not (_finding_at(after, "acceptance", "accepted")
                              and _finding_at(after, "validation", "reproduced"))):
@@ -348,6 +444,8 @@ def notification_supersession_ids(
                     kind="finding.accepted", severity="consequential",
                     run_id=run_id, entity_id=linked_id, entity_type=linked_type,
                     deep_link_run_id=linked_run_id,
+                    finding_policy=finding_policy,
+                    finding_id=entity_id,
                     message="A finding was accepted by the operator.",
                 ))
         superseded.extend(

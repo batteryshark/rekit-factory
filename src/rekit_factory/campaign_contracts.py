@@ -554,6 +554,43 @@ class CheckpointSource:
 
 
 @dataclass(frozen=True)
+class CampaignRiskAssessment:
+    """A producer-authored 0..100 score over one exact checkpoint source.
+
+    Zero means the producer assessed no campaign risk and 100 means its bounded
+    maximum. The controller never derives this value from evidence or prose.
+    """
+
+    score: int
+    checkpoint_source: str
+    evidence_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not 0 <= _integer(self.score, "risk score") <= 100:
+            raise ValueError("risk score must not exceed 100")
+        _identifier(self.checkpoint_source, "risk checkpoint source")
+        evidence = _items(self.evidence_ids, "risk evidence ids", allow_empty=False)
+        if len(evidence) > 64:
+            raise ValueError("risk evidence ids exceed the finite limit")
+        object.__setattr__(self, "evidence_ids", evidence)
+
+    def to_dict(self) -> dict[str, object]:
+        return {"checkpointSource": self.checkpoint_source,
+                "evidenceIds": list(self.evidence_ids), "score": self.score,
+                "schemaVersion": SCHEMA_VERSION}
+
+    @classmethod
+    def from_dict(cls, value: object) -> Self:
+        raw = _strict(value, "campaign risk assessment", {
+            "checkpointSource", "evidenceIds", "schemaVersion", "score",
+        })
+        if raw["schemaVersion"] != SCHEMA_VERSION:
+            raise ValueError("unsupported campaign risk assessment version")
+        return cls(_integer(raw["score"], "risk score"), raw["checkpointSource"],
+                   _items(raw["evidenceIds"], "risk evidence ids", allow_empty=False))
+
+
+@dataclass(frozen=True)
 class CampaignRiskMeasurement:
     """One explicit, source-bound campaign risk score; never inferred from prose."""
 

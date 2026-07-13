@@ -187,7 +187,10 @@ def _outcome_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
         "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "message",
         "deepLink",
     }
-    if set(payload) not in (exact, exact | {"sourceRunId"}):
+    stage_fields = {"findingStage", "policyRevision", "findingId"}
+    if set(payload) not in (
+            exact, exact | {"sourceRunId"}, exact | stage_fields,
+            exact | {"sourceRunId"} | stage_fields):
         raise InvalidDeliveryConfiguration("delivery record payload is invalid")
     kind = payload.get("kind")
     severity = payload.get("severity")
@@ -198,6 +201,18 @@ def _outcome_delivery(payload: Mapping[str, Any]) -> dict[str, Any]:
             or type(dedupe_key) is not str or _DEDUPE_KEY.fullmatch(dedupe_key) is None \
             or type(deep_link) is not dict:
         raise InvalidDeliveryConfiguration("delivery payload is not canonical")
+    if stage_fields & set(payload):
+        from rekit_factory.notification_policy import FindingNotificationPolicy
+        try:
+            policy = FindingNotificationPolicy.for_stage(payload.get("findingStage"))
+        except ValueError as exc:
+            raise InvalidDeliveryConfiguration(
+                "delivery finding-stage policy is invalid"
+            ) from exc
+        if payload.get("policyRevision") != policy.revision \
+                or kind != "finding." + policy.stage:
+            raise InvalidDeliveryConfiguration("delivery finding-stage policy is invalid")
+        _safe_id(payload.get("findingId"), "finding id")
     if set(deep_link) != {"view", "runId", "tab", "entityType", "entityId"} \
             or deep_link.get("view") != "mission-control":
         raise InvalidDeliveryConfiguration("delivery deep link is invalid")

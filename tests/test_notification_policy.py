@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 
 from rekit_factory.notification_policy import (
+    FindingNotificationPolicy,
     InvalidOutcomeProjection,
     notification_candidates,
     notification_supersession_ids,
@@ -230,6 +231,47 @@ def test_reproduced_and_accepted_finding_thresholds_are_distinct_and_determinist
     assert len({item["dedupeKey"] for item in candidates}) == 2
     assert notification_candidates(old, new) == candidates
     assert notification_candidates(new, new) == []
+
+
+@pytest.mark.parametrize("stage,expected_kind", [
+    ("reproduced", "finding.reproduced"), ("accepted", "finding.accepted"),
+])
+def test_revision_bound_stage_policy_emits_exactly_one_candidate(stage, expected_kind):
+    old = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},
+    })
+    crossed = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+        "finding_operator_decisions": {
+            "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                           "decision": "accepted", "_eventSeq": 1},
+        },
+    })
+    policy = FindingNotificationPolicy.for_stage(stage)
+    [candidate] = notification_candidates(old, crossed, finding_policy=policy)
+    assert candidate["kind"] == expected_kind
+    assert candidate["findingStage"] == stage
+    assert candidate["policyRevision"] == policy.revision
+
+
+def test_accepted_stage_waits_for_acceptance_after_reproduction():
+    policy = FindingNotificationPolicy.for_stage("accepted")
+    old = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "candidate"}},
+    })
+    reproduced = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+    })
+    accepted = _projection(memory={
+        "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+        "finding_operator_decisions": {
+            "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                           "decision": "accepted", "_eventSeq": 1},
+        },
+    })
+    assert notification_candidates(old, reproduced, finding_policy=policy) == []
+    [candidate] = notification_candidates(reproduced, accepted, finding_policy=policy)
+    assert candidate["kind"] == "finding.accepted"
 
 
 def test_progress_and_model_authored_report_prose_never_become_candidates():

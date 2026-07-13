@@ -32,10 +32,12 @@ def test_configuration_is_external_redacted_revision_bound_and_restart_safe(tmp_
     updated = store.update(
         expected_revision=initial["revision"], preference_preset_id="daily-digest",
         channel_refs=["webhook-private", "desktop-main"],
+        finding_notification_stage_id="accepted",
     )
     replay = store.update(
         expected_revision=initial["revision"], preference_preset_id="daily-digest",
         channel_refs=["desktop-main", "webhook-private"],
+        finding_notification_stage_id="accepted",
     )
     assert replay == updated
     restarted = NotificationConfigurationStore(
@@ -49,7 +51,7 @@ def test_configuration_is_external_redacted_revision_bound_and_restart_safe(tmp_
     with pytest.raises(NotificationConfigurationConflict, match="revision is stale"):
         restarted.update(
             expected_revision=initial["revision"], preference_preset_id="muted",
-            channel_refs=["desktop-main"],
+            channel_refs=["desktop-main"], finding_notification_stage_id="reproduced",
         )
 
 
@@ -63,4 +65,21 @@ def test_configuration_rejects_unbounded_or_unknown_channel_selection(tmp_path, 
         store.update(
             expected_revision=store.public_snapshot()["revision"],
             preference_preset_id="immediate", channel_refs=channel_refs,
+            finding_notification_stage_id="reproduced",
+        )
+
+
+def test_finding_stage_catalog_is_server_declared_and_invalid_stage_fails_closed(tmp_path):
+    store = NotificationConfigurationStore(tmp_path / "notifications.sqlite3")
+    snapshot = store.public_snapshot()
+    assert snapshot["findingNotificationStageId"] == "reproduced"
+    assert [item["id"] for item in snapshot["findingNotificationStages"]] == [
+        "reproduced", "accepted",
+    ]
+    assert all(item["policyRevision"].startswith("sha256:")
+               for item in snapshot["findingNotificationStages"])
+    with pytest.raises(ValueError, match="reproduced or accepted"):
+        store.update(
+            expected_revision=snapshot["revision"], preference_preset_id="immediate",
+            channel_refs=["desktop-primary"], finding_notification_stage_id="custom-prose",
         )

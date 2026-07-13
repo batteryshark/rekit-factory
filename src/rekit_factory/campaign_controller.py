@@ -11,7 +11,8 @@ import threading
 from typing import Callable, Protocol
 
 from .campaign_contracts import (
-    CampaignCheckpoint, CampaignContract, CampaignRiskMeasurement, CheckpointSource,
+    CampaignCheckpoint, CampaignContract, CampaignRiskAssessment, CampaignRiskMeasurement,
+    CheckpointSource,
     EpochContract, EpochResult, ProgressSignal, ResourceUsage, ScopeBinding, TerminalOutcome,
 )
 from .campaign_lifecycle import CAMPAIGN_AUTHORITY, CampaignLifecycleStore
@@ -73,6 +74,7 @@ class EpochExecution:
     cumulative_usage: ResourceUsage
     result: EpochResult
     evidence_ids: tuple[str, ...]
+    risk_assessment: CampaignRiskAssessment | None = None
 
     def __post_init__(self) -> None:
         if self.result.epoch_id != self.epoch_id:
@@ -83,6 +85,9 @@ class EpochExecution:
             raise CampaignControllerError("execution requires bounded evidence references")
         if len(self.evidence_ids) > 64:
             raise CampaignControllerError("execution evidence references exceed the finite limit")
+        if self.risk_assessment is not None \
+                and type(self.risk_assessment) is not CampaignRiskAssessment:
+            raise CampaignControllerError("execution risk must be an explicit typed assessment")
 
 
 class EpochRunner(Protocol):
@@ -169,6 +174,8 @@ def _execution_dict(value: EpochExecution) -> dict[str, object]:
         "checkpointSources": [item.to_dict() for item in value.checkpoint_sources],
         "cumulativeUsage": value.cumulative_usage.to_dict(),
         "result": value.result.to_dict(), "evidenceIds": list(value.evidence_ids),
+        "riskAssessment": (None if value.risk_assessment is None
+                           else value.risk_assessment.to_dict()),
     }
 
 
@@ -179,6 +186,8 @@ def _execution_from_dict(raw: dict[str, object]) -> EpochExecution:
         tuple(CheckpointSource.from_dict(item) for item in raw["checkpointSources"]),
         ResourceUsage.from_dict(raw["cumulativeUsage"]),
         EpochResult.from_dict(raw["result"]), tuple(raw["evidenceIds"]),
+        (None if raw.get("riskAssessment") is None else
+         CampaignRiskAssessment.from_dict(raw["riskAssessment"])),
     )
 
 
@@ -380,6 +389,37 @@ class CampaignController:
             )
         self._fault("execution-staged")
 
+    def _record_execution_risk(self, execution: EpochExecution,
+                               checkpoint: CampaignCheckpoint) -> None:
+        """Publish a staged producer fact only after its exact checkpoint is durable."""
+        assessment = execution.risk_assessment
+        if assessment is None:
+            return
+        source = next((item for item in checkpoint.sources
+                       if item.source == assessment.checkpoint_source), None)
+        if source is None:
+            raise CampaignControllerError(
+                "risk assessment does not bind an exact checkpoint source"
+            )
+        previous = self.persistence.campaign(checkpoint.campaign_id).measured_risk
+        if previous is not None and previous.source.revision == source.revision:
+            retry = CampaignRiskMeasurement(
+                checkpoint.campaign_id, previous.sequence, assessment.score, source,
+            )
+            if retry != previous:
+                raise CampaignControllerError(
+                    "risk assessment retry conflicts with its durable checkpoint"
+                )
+            return
+        measurement = CampaignRiskMeasurement(
+            checkpoint.campaign_id, 1 if previous is None else previous.sequence + 1,
+            assessment.score, source,
+        )
+        self.record_risk_measurement(
+            measurement, operation_id=f"risk:{checkpoint.checkpoint_id}",
+        )
+        self._fault("risk-recorded")
+
     @_serialized
     def step(self, campaign_id: str, *, phase: CampaignPhase,
              totals: CanonicalOutcomeTotals,
@@ -454,6 +494,7 @@ class CampaignController:
                 checkpoint, operation_id=f"checkpoint:{epoch.epoch_id}",
             )
         self._fault("checkpointed")
+        self._record_execution_risk(execution, checkpoint)
         previous = None
         if epoch.ordinal > 1:
             prior = self.persistence.conn.execute(
@@ -1152,5 +1193,5 @@ class InvestigationEpochRunner:
         return EpochExecution(
             request.campaign.campaign_id, request.epoch.epoch_id, request.lease_id,
             run["id"], request.campaign.project_id, request.campaign.scope, (source,),
-            cumulative, result, execution.evidence_ids,
+            cumulative, result, execution.evidence_ids, execution.risk_assessment,
         )

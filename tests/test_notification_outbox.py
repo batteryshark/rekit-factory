@@ -12,7 +12,7 @@ from rekit_factory.notification_outbox import (
     NotificationOutbox,
     NotificationStateConflict,
 )
-from rekit_factory.notification_policy import notification_candidates
+from rekit_factory.notification_policy import FindingNotificationPolicy, notification_candidates
 from rekit_factory.outcomes import project_outcomes
 from rekit_factory.store import FactoryLedger
 
@@ -398,6 +398,118 @@ def test_projection_and_outbox_rollback_together_at_every_boundary(tmp_path):
         assert baseline == old["semanticSha256"]
         assert len(ledger.admit_notification_projection("run-1", new)) == 1
         ledger.close()
+
+
+def test_policy_change_rebaselines_and_restart_never_replays_a_finding_threshold(tmp_path):
+    old, reproduced = _transition("finding.reproduced")
+    accepted = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={
+            "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+            "finding_operator_decisions": {
+                "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                               "decision": "accepted", "_eventSeq": 1},
+            },
+        }, dossiers=(), pending_questions=(),
+    )
+    path = tmp_path / "run.db"
+    reproduced_policy = FindingNotificationPolicy.for_stage("reproduced")
+    accepted_policy = FindingNotificationPolicy.for_stage("accepted")
+    ledger = FactoryLedger(path)
+    ledger.admit_notification_projection("run-1", old, finding_policy=reproduced_policy)
+
+    # Changing policy and observing a transition concurrently is intentionally a re-baseline,
+    # not permission to reinterpret that transition under the new policy.
+    assert ledger.admit_notification_projection(
+        "run-1", reproduced, finding_policy=accepted_policy,
+    ) == []
+    [notification_id] = ledger.admit_notification_projection(
+        "run-1", accepted, finding_policy=accepted_policy,
+    )
+    assert NotificationOutbox(ledger.conn).get(notification_id)["payload"]["findingStage"] \
+        == "accepted"
+    ledger.close()
+
+    restarted = FactoryLedger(path)
+    assert restarted.admit_notification_projection(
+        "run-1", accepted, finding_policy=accepted_policy,
+    ) == []
+    assert restarted.conn.execute(
+        "select count(*) from factory_notification_outbox"
+    ).fetchone()[0] == 1
+    restarted.close()
+
+
+def test_policy_change_cannot_emit_a_second_stage_for_an_already_notified_finding(tmp_path):
+    old, reproduced = _transition("finding.reproduced")
+    accepted = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={
+            "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+            "finding_operator_decisions": {
+                "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                               "decision": "accepted", "_eventSeq": 1},
+            },
+        }, dossiers=(), pending_questions=(),
+    )
+    ledger = FactoryLedger(tmp_path / "run.db")
+    reproduced_policy = FindingNotificationPolicy.for_stage("reproduced")
+    accepted_policy = FindingNotificationPolicy.for_stage("accepted")
+    ledger.admit_notification_projection("run-1", old, finding_policy=reproduced_policy)
+    assert len(ledger.admit_notification_projection(
+        "run-1", reproduced, finding_policy=reproduced_policy,
+    )) == 1
+    assert ledger.admit_notification_projection(
+        "run-1", reproduced, finding_policy=accepted_policy,
+    ) == []
+    assert ledger.admit_notification_projection(
+        "run-1", accepted, finding_policy=accepted_policy,
+    ) == []
+    assert ledger.conn.execute(
+        "select count(*) from factory_notification_outbox"
+    ).fetchone()[0] == 1
+    ledger.close()
+
+
+def test_policy_change_reconciles_an_unnotified_already_reproduced_finding(tmp_path):
+    old, reproduced = _transition("finding.reproduced")
+    ledger = FactoryLedger(tmp_path / "run.db")
+    accepted_policy = FindingNotificationPolicy.for_stage("accepted")
+    reproduced_policy = FindingNotificationPolicy.for_stage("reproduced")
+    ledger.admit_notification_projection("run-1", old, finding_policy=accepted_policy)
+    assert ledger.admit_notification_projection(
+        "run-1", reproduced, finding_policy=accepted_policy,
+    ) == []
+    [notification_id] = ledger.admit_notification_projection(
+        "run-1", reproduced, finding_policy=reproduced_policy,
+    )
+    assert NotificationOutbox(ledger.conn).get(notification_id)["payload"]["findingStage"] \
+        == "reproduced"
+    ledger.close()
+
+
+def test_policy_change_reconciles_an_unnotified_already_accepted_finding(tmp_path):
+    accepted = project_outcomes(
+        run={"id": "run-1", "status": "running"}, workers=(), work_items=(),
+        memory={
+            "findings": {"finding-1": {"id": "finding-1", "status": "reproduced"}},
+            "finding_operator_decisions": {
+                "decision-1": {"id": "decision-1", "findingId": "finding-1",
+                               "decision": "accepted", "_eventSeq": 1},
+            },
+        }, dossiers=(), pending_questions=(),
+    )
+    ledger = FactoryLedger(tmp_path / "run.db")
+    reproduced_policy = FindingNotificationPolicy.for_stage("reproduced")
+    accepted_policy = FindingNotificationPolicy.for_stage("accepted")
+    # Initial hydration never emits, even if current state is already terminal.
+    ledger.admit_notification_projection("run-1", accepted, finding_policy=reproduced_policy)
+    [notification_id] = ledger.admit_notification_projection(
+        "run-1", accepted, finding_policy=accepted_policy,
+    )
+    assert NotificationOutbox(ledger.conn).get(notification_id)["payload"]["findingStage"] \
+        == "accepted"
+    ledger.close()
 
 
 def test_degraded_observation_does_not_erase_last_trusted_baseline(tmp_path):

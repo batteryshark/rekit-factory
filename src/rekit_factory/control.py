@@ -766,6 +766,7 @@ class InvestigationController:
                 ledger.admit_notification_projection(
                     paths.run_id, outcome_projection,
                     proof_resolver=self.notification_proof_resolver,
+                    finding_policy=self.notification_configuration.selected_finding_policy(),
                 )
                 stale_after = (
                     self.notification_configuration.stale_operator_decision_after_seconds

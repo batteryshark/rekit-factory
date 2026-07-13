@@ -83,7 +83,10 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "schemaVersion", "policyVersion", "dedupeKey", "kind", "severity", "runId",
         "entity", "message",
     }
-    if set(candidate) not in (exact, exact | {"deepLinkRunId"}):
+    stage_fields = {"findingStage", "policyRevision", "findingId"}
+    allowed = (exact, exact | {"deepLinkRunId"}, exact | stage_fields,
+               exact | {"deepLinkRunId"} | stage_fields)
+    if set(candidate) not in allowed:
         raise InvalidNotificationCandidate("candidate has unsupported fields")
     if candidate.get("schemaVersion") != CANDIDATE_SCHEMA_VERSION \
             or candidate.get("policyVersion") != POLICY_VERSION:
@@ -116,6 +119,18 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "policyVersion": POLICY_VERSION, "runId": run_id, "entityType": entity_type,
         "entityId": entity_id, "transition": kind,
     }
+    if stage_fields & set(candidate):
+        if kind not in {"finding.reproduced", "finding.accepted"}:
+            raise InvalidNotificationCandidate("finding-stage policy conflicts with candidate kind")
+        from rekit_factory.notification_policy import FindingNotificationPolicy
+        policy = FindingNotificationPolicy.for_stage(candidate.get("findingStage"))
+        finding_id = _safe_id(candidate.get("findingId"), "findingId")
+        if candidate.get("policyRevision") != policy.revision:
+            raise InvalidNotificationCandidate("finding-stage policy revision is invalid")
+        expected_kind = "finding." + policy.stage
+        if kind != expected_kind:
+            raise InvalidNotificationCandidate("candidate kind conflicts with finding-stage policy")
+        identity["policyRevision"] = policy.revision
     expected_dedupe = "sha256:" + _digest(_canonical(identity))
     if candidate.get("dedupeKey") != expected_dedupe:
         raise InvalidNotificationCandidate("candidate dedupe identity is invalid")
@@ -133,6 +148,10 @@ def _payload(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "entityType": entity_type, "entityId": entity_id,
         },
     }
+    if stage_fields & set(candidate):
+        payload["findingStage"] = candidate["findingStage"]
+        payload["policyRevision"] = candidate["policyRevision"]
+        payload["findingId"] = finding_id
     if deep_link_run_id != run_id:
         payload["sourceRunId"] = run_id
     return payload
@@ -345,6 +364,10 @@ class NotificationOutbox:
             }
             if payload["deepLink"]["runId"] != source_run_id:
                 candidate["deepLinkRunId"] = payload["deepLink"]["runId"]
+            if {"findingStage", "policyRevision", "findingId"} & set(payload):
+                candidate["findingStage"] = payload.get("findingStage")
+                candidate["policyRevision"] = payload.get("policyRevision")
+                candidate["findingId"] = payload.get("findingId")
         if _payload(candidate) != payload:
             raise ValueError("notification outbox payload is not canonical")
         deep_link = payload["deepLink"]
