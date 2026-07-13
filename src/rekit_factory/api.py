@@ -406,7 +406,17 @@ class FactoryHandler(BaseHTTPRequestHandler):
         try:
             while time.monotonic() < deadline:
                 events = self.server.controller.snapshot(run_dir)["events"]
-                fresh = _after(events, cursor)
+                fresh, reset_id = _event_batch(events, cursor)
+                if reset_id is not None:
+                    encoded = json.dumps(
+                        {"reason": "cursor-not-found", "latestEventId": reset_id},
+                        sort_keys=True,
+                    )
+                    self.wfile.write(
+                        f"id: {reset_id}\nevent: reset\ndata: {encoded}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                    cursor = reset_id
                 for event in fresh:
                     encoded = json.dumps(event, sort_keys=True)
                     self.wfile.write(
@@ -422,13 +432,16 @@ class FactoryHandler(BaseHTTPRequestHandler):
             return
 
 
-def _after(events: list[dict[str, Any]], cursor: str | None) -> list[dict[str, Any]]:
+def _event_batch(
+    events: list[dict[str, Any]], cursor: str | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return later events or a run-local reset anchor for an unknown cursor."""
     if cursor is None:
-        return events
+        return events, None
     for index, event in enumerate(events):
         if event["id"] == cursor:
-            return events[index + 1:]
-    return events
+            return events[index + 1:], None
+    return ([], events[-1]["id"]) if events else ([], None)
 
 
 def _run_meta(run_dir: Path) -> dict[str, Any]:

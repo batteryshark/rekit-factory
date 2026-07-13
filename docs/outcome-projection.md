@@ -227,6 +227,16 @@ metadata and carries no HTTP cache semantics, it is not advertised as an ETag or
 cursor. A cross-store revision and production incremental fold remain deferred. Clients obtain
 current state by fetching and replacing the complete versioned projection.
 
+The SSE stream is only an invalidation transport for that replacement. Mission Control seeds a
+run subscription with the latest event ID already included in its fetched snapshot, records a
+new cursor only after the corresponding replacement snapshot succeeds, and preserves that
+run-scoped cursor when it recreates an `EventSource`. A known cursor receives only later events.
+An ID absent from the selected run—including an ID copied from another run—receives one `reset`
+event anchored at the selected run's latest event, after which normal continuation resumes.
+This bounds stale-client recovery without treating an event ID as semantic identity or allowing
+a foreign cursor to skip current-run events. The old-stream identity and request-generation
+guards remain authoritative when delayed responses race a replacement stream.
+
 The in-memory incremental reference is not a production cache, durable accumulator, SSE source,
 or consumer migration. Mission Control, exports, notifications, and reports continue using
 their existing paths until a separate production design adopts the proven parity boundary.

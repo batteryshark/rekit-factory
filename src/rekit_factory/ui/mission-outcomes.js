@@ -157,6 +157,17 @@
     return stream === activeStream && runId === selectedRunId;
   }
 
+  function latestEventId(events) {
+    if (!Array.isArray(events) || !events.length) return null;
+    const id = events[events.length - 1]?.id;
+    return id === undefined || id === null || id === "" ? null : String(id);
+  }
+
+  function eventStreamUrl(runId, cursor = null) {
+    const base = `/api/runs/${encodeURIComponent(runId)}/events`;
+    return cursor ? `${base}?after=${encodeURIComponent(cursor)}` : base;
+  }
+
   const primitive = value => value === null || ["string", "number", "boolean"].includes(typeof value);
 
   function entityText(entity) {
@@ -213,5 +224,5 @@
     return null;
   }
 
-  return {DOMAIN, FACETS, canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker, decodeSemanticEnvelope, isCurrentEventStream, projectionView, semanticSha256, sha256Bytes};
+  return {DOMAIN, FACETS, canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker, decodeSemanticEnvelope, eventStreamUrl, isCurrentEventStream, latestEventId, projectionView, semanticSha256, sha256Bytes};
 });

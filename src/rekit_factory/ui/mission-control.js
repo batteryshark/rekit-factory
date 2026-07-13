@@ -64,7 +64,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
+const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, streamCursors: new Map(), restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, runRequests: MissionOutcomes.createGenerationGate(), snapshotRefreshes: MissionOutcomes.createGenerationGate(), outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", renders: MissionOutcomes.createGenerationGate(), filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -429,6 +429,9 @@ async function openRun(runId) {
     snapshot.workerReports = reportPayload.reports;
     snapshot.dossiers = dossierPayload.dossiers;
     state.snapshot = snapshot; state.evidence = evidence.records || [];
+    const snapshotCursor = MissionOutcomes.latestEventId(snapshot.events);
+    if (snapshotCursor) state.streamCursors.set(runId, snapshotCursor);
+    else state.streamCursors.delete(runId);
     renderDetail(); show("detail"); connectEvents(runId);
   }
   catch (error) {
@@ -718,9 +721,9 @@ function renderDetail() {
 function connectEvents(runId) {
   if (state.stream) state.stream.close();
   state.snapshotRefreshes.invalidate();
-  const stream = new EventSource(`/api/runs/${encodeURIComponent(runId)}/events`);
+  const stream = new EventSource(MissionOutcomes.eventStreamUrl(runId, state.streamCursors.get(runId)));
   state.stream = stream;
-  stream.onmessage = async () => {
+  const refresh = async event => {
     if (!MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) return;
     const refreshGeneration = state.snapshotRefreshes.begin();
     try {
@@ -736,6 +739,7 @@ function connectEvents(runId) {
       snapshot.dossiers = dossierPayload.dossiers;
       state.snapshot = snapshot;
       state.evidence = evidence.records || [];
+      if (event.lastEventId) state.streamCursors.set(runId, event.lastEventId);
       renderDetail();
     } catch (error) {
       if (state.snapshotRefreshes.isCurrent(refreshGeneration)
@@ -746,6 +750,8 @@ function connectEvents(runId) {
       if (MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) refreshFleet();
     }
   };
+  stream.onmessage = refresh;
+  stream.addEventListener("reset", refresh);
   stream.addEventListener("heartbeat", () => {
     if (MissionOutcomes.isCurrentEventStream(stream, state.stream, runId, state.selected)) refreshFleet();
   });

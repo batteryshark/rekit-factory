@@ -4,7 +4,8 @@ const assert = require("node:assert/strict");
 const {webcrypto} = require("node:crypto");
 const {
   canonicalLink, canonicalSemanticText, createGenerationGate, createSemanticTracker,
-  decodeSemanticEnvelope, isCurrentEventStream, projectionView, semanticSha256,
+  decodeSemanticEnvelope, eventStreamUrl, isCurrentEventStream, latestEventId,
+  projectionView, semanticSha256,
 } = require("../src/rekit_factory/ui/mission-outcomes.js");
 
 const empty = {
@@ -141,6 +142,11 @@ const entity = (entityType, entityId, values = {}, parent = null, diagnostics = 
   assert.equal(isCurrentEventStream(streamA, streamA, "run-a", "run-a"), true);
   assert.equal(isCurrentEventStream(streamA, streamB, "run-a", "run-a"), false, "an old source cannot act on a replacement stream");
   assert.equal(isCurrentEventStream(streamA, streamA, "run-a", "run-b"), false, "an old source cannot invalidate a newly selected run");
+
+  assert.equal(latestEventId([]), null);
+  assert.equal(latestEventId([{id: "event-a"}, {id: "event-b"}]), "event-b");
+  assert.equal(eventStreamUrl("run/a"), "/api/runs/run%2Fa/events");
+  assert.equal(eventStreamUrl("run/a", "event ?#2"), "/api/runs/run%2Fa/events?after=event%20%3F%232");
 
   console.log("mission outcomes behavior: ok");
 })().catch(error => {

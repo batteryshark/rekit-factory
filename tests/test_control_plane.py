@@ -12,7 +12,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from rekit_factory.api import FactoryServer, _after
+from rekit_factory.api import FactoryServer, _event_batch
 from rekit_factory.control import InvestigationController, RunRequest
 from rekit_factory.dossiers import dossier_list as canonical_dossier_list
 from rekit_factory.evidence import EvidenceStore, Provenance, hash_target
@@ -787,10 +787,29 @@ class ControlPlaneTests(unittest.TestCase):
                     )
                 controller.answer(run_dir, "empty-direction", "   ", resume=False)
 
-    def test_event_cursor_returns_only_events_after_last_id(self):
+    def test_event_cursor_distinguishes_initial_continuation_and_reset(self):
         events = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
-        self.assertEqual([{"id": "c"}], _after(events, "b"))
-        self.assertEqual(events, _after(events, None))
+        self.assertEqual(([{"id": "c"}], None), _event_batch(events, "b"))
+        self.assertEqual((events, None), _event_batch(events, None))
+        self.assertEqual(([], "c"), _event_batch(events, "foreign-run-event"))
+        self.assertEqual(([], None), _event_batch([], "stale-event"))
+
+        client_a, client_b = _event_batch(events, "b"), _event_batch(events, "b")
+        self.assertEqual(client_a, client_b)
+        self.assertEqual([{"id": "c"}], client_a[0])
+
+        later = [*events, {"id": "terminal", "kind": "run.completed"}]
+        self.assertEqual(
+            ([{"id": "terminal", "kind": "run.completed"}], None),
+            _event_batch(later, "c"),
+        )
+        self.assertEqual(([], None), _event_batch(later, "terminal"))
+        reset_batch, reset_cursor = _event_batch(events, "event-from-other-run")
+        self.assertEqual([], reset_batch)
+        self.assertEqual(
+            ([{"id": "terminal", "kind": "run.completed"}], None),
+            _event_batch(later, reset_cursor),
+        )
 
     def test_worker_envelope_requires_approval_for_gated_tools(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -63,6 +63,10 @@ def test_outcomes_surface_is_packaged_first_class_and_projection_only():
     assert "outcome-orbit" in style
     assert "prefers-reduced-motion:reduce" in style
     assert "max-width:560px" in style
+    assert "MissionOutcomes.latestEventId(snapshot.events)" in script
+    assert "MissionOutcomes.eventStreamUrl(runId, state.streamCursors.get(runId))" in script
+    assert 'stream.addEventListener("reset", refresh)' in script
+    assert "if (event.lastEventId) state.streamCursors.set(runId, event.lastEventId)" in script
 
 
 def test_outcomes_behavior_is_dom_independent_and_deterministic():
