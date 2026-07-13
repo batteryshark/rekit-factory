@@ -96,6 +96,8 @@ class InvocationRequest(_Envelope):
     scope_digest: str | None = None
     scope_revision: dict[str, Any] | None = None
     requested_actions: tuple[str, ...] = ()
+    account_ref: str | None = None
+    uses_credentials: bool = False
     invocation_id: str = field(default_factory=lambda: f"invoke-{uuid.uuid4().hex[:12]}")
 
     def __post_init__(self) -> None:
@@ -120,6 +122,10 @@ class InvocationRequest(_Envelope):
         if any(not isinstance(action, str) or not action.strip()
                for action in self.requested_actions):
             raise ValueError("requested_actions must contain non-empty action names")
+        if self.account_ref is not None:
+            _require_text(self.account_ref, "account_ref")
+        if not isinstance(self.uses_credentials, bool):
+            raise ValueError("uses_credentials must be a boolean")
         if any(not isinstance(argument, str) for argument in self.arguments):
             raise ValueError("arguments must contain only strings")
 

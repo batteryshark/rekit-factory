@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, is_dataclass
+import hashlib
 import os
 import re
 from typing import Any, Literal, Protocol
@@ -296,7 +297,7 @@ class PydanticWorkerBackend:
                     tool_id=tool.id,
                     tool_name=call.tool_name,
                     endpoint=_optional_string(intent.get("endpoint")),
-                    account_ref=_optional_string(intent.get("account_ref")),
+                    account_ref=_opaque_account_ref(intent.get("account_ref")),
                     uses_credentials=intent.get("uses_credentials") is True,
                     requested_action=_optional_string(intent.get("requested_action")),
                 ))
@@ -326,6 +327,15 @@ def _env_int(prefix: str, suffix: str, *, default: int) -> int:
 
 def _optional_string(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _opaque_account_ref(value: Any) -> str | None:
+    text = _optional_string(value)
+    if text is None:
+        return None
+    if re.fullmatch(r"account:[A-Za-z0-9._-]{1,128}", text):
+        return text
+    return "account:" + hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def _tool_name(tool_id: str) -> str:

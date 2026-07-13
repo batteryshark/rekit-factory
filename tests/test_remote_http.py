@@ -18,13 +18,15 @@ from rekit_factory.scope import (
 )
 
 
-def remote_scope(target_hash: str, endpoint: str) -> AuthorizedScope:
+def remote_scope(target_hash: str, endpoint: str, *, account_refs=(), credential_use=False) -> AuthorizedScope:
     envelope = ScopeEnvelope(
         scope_id="scope-remote", revision=1,
         valid_from="2026-07-01T00:00:00Z", valid_until="2026-08-01T00:00:00Z",
         targets=(TargetGrant(target_hash, opaque_ref("target-path", "/controller/input")),),
         endpoints=(endpoint,), network_mode=NetworkMode.EXACT_ENDPOINTS,
         actions=(ActionAuthority.READ_LOCAL_TARGET, ActionAuthority.NETWORK_ACCESS),
+        account_refs=account_refs,
+        credential_use=credential_use,
     )
     return AuthorizedScope(envelope, ScopeApproval(
         scope_id=envelope.scope_id, revision=1, content_digest=envelope.content_digest,
@@ -234,6 +236,49 @@ class RemoteHTTPTransportTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(RemoteWorkerError, "verified scope is required"):
                     client.invoke(missing)
+
+    def test_remote_revalidates_opaque_account_and_credential_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            allowed = normalize_endpoint("https://lab.example.test/api")
+            scope = remote_scope(
+                target_hash, allowed,
+                account_refs=("account:approved",), credential_use=True,
+            )
+            with running_server(root, allowed_network_policies=("restricted",)) as (_, client):
+                common = dict(
+                    target_sha256=target_hash,
+                    network_policy="restricted",
+                    endpoint=allowed,
+                    scope_digest=scope.envelope.content_digest,
+                    scope_revision=scope.to_dict(),
+                    requested_actions=(ActionAuthority.READ_LOCAL_TARGET.value,
+                                       ActionAuthority.NETWORK_ACCESS.value),
+                    uses_credentials=True,
+                )
+                approved = self.request(
+                    invocation_id="invoke-account-approved",
+                    account_ref="account:approved",
+                    **common,
+                )
+                self.assertEqual("done", client.invoke(approved).status)
+                denied = self.request(
+                    invocation_id="invoke-account-denied",
+                    account_ref="account:unlisted",
+                    **common,
+                )
+                with self.assertRaisesRegex(RemoteWorkerError, "account"):
+                    client.invoke(denied)
+
+                no_account = self.request(
+                    invocation_id="invoke-account-missing",
+                    **common,
+                )
+                with self.assertRaisesRegex(RemoteWorkerError, "requires an opaque account"):
+                    client.invoke(no_account)
 
 
 if __name__ == "__main__":

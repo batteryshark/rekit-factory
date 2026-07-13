@@ -695,7 +695,7 @@ class InvestigationController:
                 {"callId": call.call_id, "toolId": call.tool_id,
                  "toolName": call.tool_name,
                  "endpoint": call.endpoint,
-                 "accountRef": call.account_ref,
+                 "accountRef": _account_intent_ref(call.account_ref),
                  "usesCredentials": call.uses_credentials,
                  "requestedAction": call.requested_action}
                 for call in turn.deferred_calls
@@ -724,7 +724,7 @@ class InvestigationController:
                             "workerItemId": item["id"],
                             "safetyTier": manifest.safety_tier,
                             "endpoint": call.endpoint,
-                            "accountRef": call.account_ref,
+                            "accountRef": _account_intent_ref(call.account_ref),
                             "usesCredentials": call.uses_credentials,
                             "requestedAction": call.requested_action,
                         },
@@ -1115,6 +1115,14 @@ def _redact_intent(payload: dict[str, Any]) -> dict[str, Any]:
             else opaque_ref("account", str(account))
         )
     return public
+
+
+def _account_intent_ref(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if re.fullmatch(r"account:[A-Za-z0-9._-]{1,128}", value):
+        return value
+    return opaque_ref("account", value)
 
 
 def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,

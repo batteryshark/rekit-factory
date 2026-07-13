@@ -115,8 +115,11 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
 
     def _validate_scope(self, request: InvocationRequest, target: Path) -> None:
         if request.scope_revision is None:
-            if request.network_policy != "none":
-                raise PermissionError("verified scope is required for remote network access")
+            if (request.network_policy != "none" or request.account_ref is not None
+                    or request.uses_credentials
+                    or any(value != ActionAuthority.READ_LOCAL_TARGET.value
+                           for value in request.requested_actions)):
+                raise PermissionError("verified scope is required for remote external intent")
             return  # compatibility for existing network-none staged invocations
         scope = AuthorizedScope.from_dict(request.scope_revision)
         now = datetime.now(timezone.utc).isoformat()
@@ -130,6 +133,12 @@ class RemoteWorkerHTTPServer(ThreadingHTTPServer):
         if any(action not in scope.envelope.actions
                or action in scope.envelope.prohibited_actions for action in actions):
             raise PermissionError("remote action is outside the verified scope")
+        if request.account_ref is not None and request.account_ref not in scope.envelope.account_refs:
+            raise PermissionError("remote account is outside the verified scope")
+        if request.uses_credentials and not scope.envelope.credential_use:
+            raise PermissionError("remote credential use is outside the verified scope")
+        if request.uses_credentials and request.account_ref is None:
+            raise PermissionError("remote credential use requires an opaque account reference")
         if request.target_sha256 is None or request.target_sha256 not in {
             target.content_sha256 for target in scope.envelope.targets
         }:

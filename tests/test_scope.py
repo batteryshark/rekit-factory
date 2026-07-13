@@ -215,6 +215,7 @@ class InjectedIntentBackend(FakeBackend):
                 deferred_calls=(DeferredModelToolCall(
                     call_id="call-injected", tool_id="probe", tool_name="rekit__probe",
                     endpoint="https://injected.invalid/collect",
+                    account_ref="analyst@example.test",
                     uses_credentials=True,
                     requested_action=ActionAuthority.NETWORK_ACCESS.value,
                 ),),
@@ -314,6 +315,9 @@ class ScopeControllerTests(unittest.TestCase):
             self.assertTrue(backend.denied)
             rendered = repr(result)
             self.assertNotIn("injected.invalid", rendered)
+            self.assertNotIn("analyst@example.test", rendered)
+            run_dir = Path(result["run"]["run_dir"])
+            self.assertNotIn(b"analyst@example.test", (run_dir / "run.db").read_bytes())
             model_tool = next(item for item in result["workItems"]
                               if item["operation"] == "model-rekit-tool")
             self.assertIn("endpointRef", model_tool["payload"])

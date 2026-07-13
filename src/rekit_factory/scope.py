@@ -9,6 +9,7 @@ import hashlib
 import ipaddress
 import json
 from pathlib import Path
+import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -36,6 +37,21 @@ class ActionAuthority(str, Enum):
 class DataHandling(str, Enum):
     LOCAL_ONLY = "local_only"
     APPROVED_EXPORT = "approved_export"
+
+
+DEFAULT_PROHIBITED_ACTIONS = (
+    ActionAuthority.REGISTER_ACCOUNT,
+    ActionAuthority.ENROLL_CHALLENGE,
+    ActionAuthority.CREATE_CREDENTIAL,
+    ActionAuthority.SUBMIT_CHALLENGE,
+    ActionAuthority.PERSISTENCE,
+    ActionAuthority.DESTRUCTIVE,
+    ActionAuthority.THIRD_PARTY_MESSAGE,
+    ActionAuthority.EXPAND_SCOPE,
+)
+MAX_SCOPE_SECONDS = 30 * 24 * 60 * 60
+MAX_APPROVAL_SECONDS = 7 * 24 * 60 * 60
+_ACCOUNT_REF = re.compile(r"^account:[A-Za-z0-9._-]{1,128}$")
 
 
 @dataclass(frozen=True)
@@ -67,16 +83,7 @@ class ScopeEnvelope:
     network_mode: NetworkMode = NetworkMode.NONE
     credential_use: bool = False
     data_handling: DataHandling = DataHandling.LOCAL_ONLY
-    prohibited_actions: tuple[ActionAuthority, ...] = (
-        ActionAuthority.REGISTER_ACCOUNT,
-        ActionAuthority.ENROLL_CHALLENGE,
-        ActionAuthority.CREATE_CREDENTIAL,
-        ActionAuthority.SUBMIT_CHALLENGE,
-        ActionAuthority.PERSISTENCE,
-        ActionAuthority.DESTRUCTIVE,
-        ActionAuthority.THIRD_PARTY_MESSAGE,
-        ActionAuthority.EXPAND_SCOPE,
-    )
+    prohibited_actions: tuple[ActionAuthority, ...] = DEFAULT_PROHIBITED_ACTIONS
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -109,7 +116,7 @@ class ScopeEnvelope:
                 raise ValueError("domains must be lowercase host names")
         for value in self.ip_ranges:
             ipaddress.ip_network(value, strict=True)
-        if any(not value.startswith("account:") for value in self.account_refs):
+        if any(not _ACCOUNT_REF.fullmatch(value) for value in self.account_refs):
             raise ValueError("accounts must be stored as opaque account references")
         if self.network_mode is NetworkMode.NONE and (
             self.endpoints or self.domains or self.ip_ranges or ActionAuthority.NETWORK_ACCESS in self.actions
@@ -300,6 +307,84 @@ def legacy_local_read_only_scope(target: str | Path, *, now: str) -> AuthorizedS
     return AuthorizedScope(envelope, approval)
 
 
+def author_scope(
+    target: str | Path,
+    *,
+    scope_id: str,
+    revision: int,
+    actions: tuple[ActionAuthority, ...],
+    endpoints: tuple[str, ...] = (),
+    account_refs: tuple[str, ...] = (),
+    credential_use: bool = False,
+    approved_by: str,
+    rationale: str,
+    approved_at: str,
+    valid_until: str,
+    expires_at: str,
+) -> AuthorizedScope:
+    """Create an exact, inspectable scope without accepting credential values."""
+    if not scope_id or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_." for character in scope_id):
+        raise ValueError("scope_id must use lowercase letters, digits, '-', '_' or '.'")
+    if revision < 1:
+        raise ValueError("revision must be positive")
+    if not actions:
+        raise ValueError("at least one explicit action authority is required")
+    if len(set(actions)) != len(actions):
+        raise ValueError("action authorities must not contain duplicates")
+    if not all(isinstance(action, ActionAuthority) for action in actions):
+        raise ValueError("actions must use ActionAuthority values")
+    start = _time(approved_at)
+    end = _time(valid_until)
+    expiry = _time(expires_at)
+    if end <= start or (end - start).total_seconds() > MAX_SCOPE_SECONDS:
+        raise ValueError("scope validity must be positive and at most 30 days")
+    if expiry <= start or expiry > end or (expiry - start).total_seconds() > MAX_APPROVAL_SECONDS:
+        raise ValueError("approval expiry must be positive, within scope, and at most 7 days")
+    normalized_endpoints = tuple(normalize_endpoint(value) for value in endpoints)
+    if len(set(normalized_endpoints)) != len(normalized_endpoints):
+        raise ValueError("endpoint allowlist must not contain duplicates")
+    has_network = ActionAuthority.NETWORK_ACCESS in actions
+    if has_network != bool(normalized_endpoints):
+        raise ValueError("network authority and an exact endpoint allowlist must be supplied together")
+    if any(not _ACCOUNT_REF.fullmatch(value) for value in account_refs):
+        raise ValueError("account references must be opaque account: identifiers")
+    account_actions = {
+        ActionAuthority.ENROLL_CHALLENGE,
+        ActionAuthority.SUBMIT_CHALLENGE,
+        ActionAuthority.THIRD_PARTY_MESSAGE,
+    }
+    if set(actions).intersection(account_actions) and not account_refs:
+        raise ValueError("account-scoped actions require an opaque account reference")
+    if credential_use and not account_refs:
+        raise ValueError("credential use requires an opaque account reference")
+    prohibited = tuple(action for action in DEFAULT_PROHIBITED_ACTIONS if action not in actions)
+    envelope = ScopeEnvelope(
+        scope_id=scope_id,
+        revision=revision,
+        valid_from=approved_at,
+        valid_until=valid_until,
+        targets=(TargetGrant.from_path(target),),
+        endpoints=normalized_endpoints,
+        account_refs=account_refs,
+        actions=actions,
+        network_mode=(NetworkMode.EXACT_ENDPOINTS if normalized_endpoints else NetworkMode.NONE),
+        credential_use=credential_use,
+        prohibited_actions=prohibited,
+    )
+    approval = ScopeApproval(
+        scope_id=scope_id,
+        revision=revision,
+        content_digest=envelope.content_digest,
+        approved_by=approved_by,
+        approved_at=approved_at,
+        expires_at=expires_at,
+        rationale=rationale,
+    )
+    authorized = AuthorizedScope(envelope, approval)
+    authorized.validate(now=approved_at)
+    return authorized
+
+
 def normalize_endpoint(value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -307,6 +392,14 @@ def normalize_endpoint(value: str) -> str:
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("endpoint cannot contain credentials, query, or fragment")
     host = parsed.hostname.lower()
+    if "*" in host:
+        raise ValueError("wildcard endpoints are forbidden")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None and address.is_unspecified:
+        raise ValueError("unspecified-address endpoints are forbidden")
     if ":" in host:
         host = f"[{host}]"
     port = parsed.port or (443 if parsed.scheme == "https" else 80)

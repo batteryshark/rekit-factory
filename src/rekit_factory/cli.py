@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import sys
 from rekit_factory.control import InvestigationController, RunRequest, default_storage_root
 from rekit_factory.models import ModelProfile, PydanticWorkerBackend
 from rekit_factory.rekit_client import FederatedRekitClient
+from rekit_factory.scope import ActionAuthority, author_scope
 
 
 def parser() -> argparse.ArgumentParser:
@@ -57,6 +59,31 @@ def parser() -> argparse.ArgumentParser:
     serve_cmd.add_argument("--host", default="127.0.0.1")
     serve_cmd.add_argument("--port", type=int, default=8768)
     _add_model_options(serve_cmd)
+
+    authorize = commands.add_parser(
+        "scope-authorize", help="author an exact, expiring engagement scope",
+    )
+    authorize.add_argument("target", type=Path)
+    authorize.add_argument("--scope-id", required=True)
+    authorize.add_argument("--revision", type=int, default=1)
+    authorize.add_argument(
+        "--action", action="append", choices=[item.value for item in ActionAuthority],
+        help="explicit authority; repeat as needed (default: read_local_target)",
+    )
+    authorize.add_argument(
+        "--endpoint", action="append", default=[],
+        help="exact HTTP(S) endpoint; requires network_access authority",
+    )
+    authorize.add_argument(
+        "--account-ref", action="append", default=[],
+        help="opaque account: reference; never pass a username or credential",
+    )
+    authorize.add_argument("--credential-use", action="store_true",
+                           help="allow use of an externally held credential reference")
+    authorize.add_argument("--approved-by", required=True)
+    authorize.add_argument("--rationale", required=True)
+    authorize.add_argument("--valid-hours", type=int, default=24)
+    authorize.add_argument("--approval-hours", type=int, default=24)
     return root
 
 
@@ -128,6 +155,32 @@ class _UnusedBackend:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "scope-authorize":
+            approved = datetime.now(timezone.utc).replace(microsecond=0)
+            valid_until = approved + timedelta(hours=args.valid_hours)
+            expires_at = approved + timedelta(hours=args.approval_hours)
+            actions = tuple(ActionAuthority(value) for value in (
+                args.action or [ActionAuthority.READ_LOCAL_TARGET.value]
+            ))
+            scope = author_scope(
+                args.target,
+                scope_id=args.scope_id,
+                revision=args.revision,
+                actions=actions,
+                endpoints=tuple(args.endpoint),
+                account_refs=tuple(args.account_ref),
+                credential_use=args.credential_use,
+                approved_by=args.approved_by,
+                rationale=args.rationale,
+                approved_at=_utc(approved),
+                valid_until=_utc(valid_until),
+                expires_at=_utc(expires_at),
+            )
+            print(json.dumps({
+                "scope": scope.to_dict(),
+                "projection": scope.envelope.public_dict(),
+            }, indent=2, sort_keys=True))
+            return 0
         if args.command == "serve":
             from rekit_factory.api import serve
             controller = _controller(args, needs_model=True)
@@ -172,3 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"rekit-factory: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+
+
+def _utc(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
