@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import tempfile
 import threading
@@ -12,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from rekit_factory.api import FactoryServer, _after
 from rekit_factory.control import InvestigationController, RunRequest
+from rekit_factory.evidence import EvidenceStore
 from rekit_factory.models import (
     DeferredModelToolCall,
     ModelActivity,
@@ -132,6 +134,17 @@ class FakeRekit:
         )
 
 
+class SecretOutputRekit(FakeRekit):
+    def run(self, tool_id, target, *, allow_dynamic=False):
+        result = super().run(tool_id, target, allow_dynamic=allow_dynamic)
+        return ToolResult(
+            exit_code=result.exit_code,
+            stdout="api_key=fixture-secret-value\nproof: ok",
+            stderr="Authorization: Bearer fixture-bearer-token",
+            command_label=result.command_label,
+        )
+
+
 class ControlPlaneTests(unittest.TestCase):
     def _fixture(self, tmp):
         target = Path(tmp) / "target"
@@ -168,6 +181,30 @@ class ControlPlaneTests(unittest.TestCase):
             for path in run_dir.rglob("*"):
                 if path.is_file():
                     self.assertNotIn(b"never-persist-this-key", path.read_bytes())
+
+    def test_tool_evidence_projects_redacted_output_and_never_captures_cli_screenshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=SecretOutputRekit(),
+                workers=FakeBackend(),
+            )
+            result = controller.run(RunRequest(
+                target=target, goal="Capture the fixture proof",
+                tools=("fixture-scan",), worker_roles=("analyst",),
+            ))
+
+            artifact = next(item for item in result["artifacts"] if item["kind"] == "tool-output")
+            projected = Path(artifact["path"]).read_text(encoding="utf-8")
+            assert "fixture-secret-value" not in projected
+            assert "fixture-bearer-token" not in projected
+            assert "[REDACTED:CREDENTIAL]" in projected
+            assert any(event["kind"] == "evidence.redacted" for event in result["events"])
+            evidence = EvidenceStore(Path(result["run"]["run_dir"]) / "evidence")
+            evidence_id = json.loads(artifact["metadata_json"])["evidenceArtifactId"]
+            candidate = evidence.knowledge_candidate_text(evidence_id)
+            assert candidate is not None and "fixture-secret-value" not in candidate
+            assert not list(Path(result["run"]["run_dir"]).rglob("*.png"))
 
     def test_risky_tool_suspends_until_durable_deny_then_workers_resume(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,15 @@ from rekit_factory.models import (
     ModelToolResult,
     WorkerBackend,
     WorkerTurn,
+)
+from rekit_factory.evidence import (
+    EvidenceState,
+    EvidenceStore,
+    Provenance,
+    RetentionClass,
+    default_expiry,
+    hash_target,
+    render_tool_output,
 )
 from rekit_factory.rekit_client import RekitAdapter
 from rekit_factory.store import FactoryLedger
@@ -409,12 +419,41 @@ class InvestigationController:
             Path(item["target"]),
             allow_dynamic=manifest.requires_permission and answer == "allow",
         )
-        output_path = ctx.deps.paths.run_dir / "tool-output" / f"{item['id']}-{tool_id}.log"
-        atomic_write(
-            output_path,
-            f"command: {result.command_label}\nexit: {result.exit_code}\n\n"
-            f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}\n",
+        captured_at = utcnow()
+        evidence = EvidenceStore(ctx.deps.paths.run_dir / "evidence")
+        outcome = evidence.capture_tool_output(
+            render_tool_output(
+                result.command_label, result.exit_code, result.stdout, result.stderr
+            ),
+            Provenance(
+                run_id=ctx.state.run_id,
+                source=f"rekit:{tool_id}",
+                capture_reason="tool execution proof",
+                captured_at=captured_at,
+                environment_id=f"local:{platform.system()}:{platform.machine()}",
+                target_sha256=hash_target(Path(item["target"])),
+                tool_id=tool_id,
+                worker_id=payload.get("workerId"),
+                invocation_id=call_id,
+                work_item_id=item["id"],
+            ),
+            retention_class=RetentionClass.RUN,
+            expires_at=default_expiry(RetentionClass.RUN),
         )
+        for event in outcome.events:
+            ledger.event_log(
+                ctx.state.run_id,
+                f"evidence.{event.action.value}",
+                event.reason,
+                worker_id=payload.get("workerId"),
+                payload={"artifactId": event.artifact_id, **event.payload},
+            )
+        evidence_record = outcome.record
+        if evidence_record is None:
+            raise RuntimeError("required tool proof was withheld by evidence policy")
+        if evidence_record.state is EvidenceState.QUARANTINED:
+            raise RuntimeError("required tool proof was quarantined by evidence policy")
+        output_path = evidence.root / evidence_record.display_path
         status = "done" if result.exit_code == 0 else "failed"
         ledger.finish_tool_call(
             call_id, status=status, output_path=str(output_path), exit_code=result.exit_code
@@ -425,7 +464,19 @@ class InvestigationController:
             path=output_path,
             logical_path=f"tool-output/{output_path.name}",
             origin=f"rekit:{tool_id}",
-            metadata={"toolId": tool_id, "exitCode": result.exit_code},
+            metadata={
+                "toolId": tool_id,
+                "exitCode": result.exit_code,
+                "evidenceArtifactId": evidence_record.artifact_id,
+                "originalSha256": evidence_record.original_sha256,
+                "rawSha256": evidence_record.raw_sha256,
+                "displaySha256": evidence_record.display_sha256,
+                "redacted": evidence_record.redacted,
+                "truncated": evidence_record.truncated,
+                "retentionClass": evidence_record.retention_class.value,
+                "capturePolicy": evidence_record.capture_policy,
+                "provenance": asdict(evidence_record.provenance),
+            },
         )
         if result.exit_code == 0:
             ledger.resolve(
