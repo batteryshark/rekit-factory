@@ -68,6 +68,24 @@ class FederatedRekitTests(unittest.TestCase):
         ])
         self.assertEqual([Path("/first"), Path("/second")], args.rekit_root)
 
+    def test_cli_keeps_repeatable_named_knowledge_roots_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            first = parent / "knowledge-one"
+            second = parent / "knowledge-two"
+            first.mkdir()
+            second.mkdir()
+            args = parser().parse_args([
+                "--rekit-root", "/rekit",
+                "--knowledge-root", f"one={first}",
+                "--knowledge-root", f"two={second}",
+                "status", "/run",
+            ])
+        self.assertEqual([Path("/rekit")], args.rekit_root)
+        self.assertEqual(["one", "two"], [root.name for root in args.knowledge_root])
+        self.assertEqual([first.resolve(), second.resolve()],
+                         [root.path for root in args.knowledge_root])
+
     def test_source_labels_reject_path_like_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _root(Path(tmp), "one", ("alpha",))

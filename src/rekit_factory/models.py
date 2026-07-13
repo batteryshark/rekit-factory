@@ -56,10 +56,18 @@ class DeferredModelToolCall:
     call_id: str
     tool_id: str
     tool_name: str
+    capability: Literal["rekit", "knowledge"] = "rekit"
     endpoint: str | None = None
     account_ref: str | None = None
     uses_credentials: bool = False
     requested_action: str | None = None
+    query: str | None = None
+    limit: int | None = None
+    root: str | None = None
+    concept_id: str | None = None
+    source_id: str | None = None
+    link_target: str | None = None
+    rationale: str | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +166,7 @@ class WorkerBackend(Protocol):
 
     async def analyze(self, *, role: str, goal: str, target_snapshot: str,
                       tool_context: str, available_tools: tuple[ModelTool, ...] = (),
+                      knowledge_available: bool = False,
                       messages_json: str | None = None,
                       tool_results: tuple[ModelToolResult, ...] = (),
                       event_sink: ModelEventSink | None = None) -> WorkerTurn: ...
@@ -227,6 +236,7 @@ class PydanticWorkerBackend:
 
     async def analyze(self, *, role: str, goal: str, target_snapshot: str,
                       tool_context: str, available_tools: tuple[ModelTool, ...] = (),
+                      knowledge_available: bool = False,
                       messages_json: str | None = None,
                       tool_results: tuple[ModelToolResult, ...] = (),
                       event_sink: ModelEventSink | None = None) -> WorkerTurn:
@@ -264,6 +274,39 @@ class PydanticWorkerBackend:
                 description=f"Request Rekit tool {tool.id}: {tool.description}",
             )
 
+        if knowledge_available:
+            async def knowledge_search(query: str, limit: int = 4) -> None:
+                """Search configured OKF indexes for a small relevant concept set."""
+                raise CallDeferred
+
+            async def knowledge_get(root: str, concept_id: str, rationale: str) -> None:
+                """Select and read one search result by named root and concept ID."""
+                raise CallDeferred
+
+            async def knowledge_follow(root: str, source_id: str, link_target: str,
+                                       rationale: str) -> None:
+                """Follow one link returned by a previously opened OKF concept."""
+                raise CallDeferred
+
+            toolset.add_function(
+                knowledge_search, name="knowledge_search",
+                description="Bounded read-only search over configured OKF bundle indexes.",
+            )
+            toolset.add_function(
+                knowledge_get, name="knowledge_get",
+                description="Read one OKF concept selected from search; requires a rationale.",
+            )
+            toolset.add_function(
+                knowledge_follow, name="knowledge_follow",
+                description="Follow one discovered bundle link on demand; requires a rationale.",
+            )
+            if not messages_json:
+                prompt += (
+                    "\n\nKnowledge retrieval is read-only and progressively disclosed. Search first, "
+                    "then get one relevant concept or follow one returned link. Do not request bulk "
+                    "bundle loading and do not claim the bundle was modified."
+                )
+
         if names and not messages_json:
             prompt += (
                 "\n\nMANDATORY EVIDENCE STEP: Before returning WorkerReport, emit one actual "
@@ -292,7 +335,7 @@ class PydanticWorkerBackend:
             if names and not message_history else None,
             message_history=message_history,
             deferred_tool_results=deferred_results,
-            toolsets=[toolset] if names else None,
+            toolsets=[toolset] if names or knowledge_available else None,
             capabilities=[RequiredToolTurn(
                 disable_anthropic_cache=True,
                 event_sink=event_sink,
@@ -306,9 +349,26 @@ class PydanticWorkerBackend:
             calls = []
             for call in result.output.calls:
                 tool = names.get(call.tool_name)
+                intent = call.args_as_dict(raise_if_invalid=False)
+                if tool is None and call.tool_name.startswith("knowledge_"):
+                    operation = call.tool_name.removeprefix("knowledge_")
+                    calls.append(DeferredModelToolCall(
+                        call_id=call.tool_call_id,
+                        tool_id=f"knowledge.{operation}",
+                        tool_name=call.tool_name,
+                        capability="knowledge",
+                        query=_optional_string(intent.get("query")),
+                        limit=(intent.get("limit") if isinstance(intent.get("limit"), int)
+                               and not isinstance(intent.get("limit"), bool) else None),
+                        root=_optional_string(intent.get("root")),
+                        concept_id=_optional_string(intent.get("concept_id")),
+                        source_id=_optional_string(intent.get("source_id")),
+                        link_target=_optional_string(intent.get("link_target")),
+                        rationale=_optional_string(intent.get("rationale")),
+                    ))
+                    continue
                 if tool is None:
                     raise ValueError(f"model requested unknown Rekit tool {call.tool_name!r}")
-                intent = call.args_as_dict(raise_if_invalid=False)
                 calls.append(DeferredModelToolCall(
                     call_id=call.tool_call_id,
                     tool_id=tool.id,

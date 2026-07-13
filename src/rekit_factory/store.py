@@ -88,6 +88,20 @@ create table if not exists factory_permissions (
     tool_id        text not null,
     created_at     text not null
 );
+
+create table if not exists factory_knowledge_references (
+    run_id          text not null,
+    root_name       text not null,
+    concept_id      text not null,
+    query_rationale text not null,
+    citations_json  text not null default '[]',
+    provenance_json text not null default '{}',
+    content_hash    text not null,
+    selected_at     text not null,
+    primary key (run_id, root_name, concept_id, content_hash)
+);
+create index if not exists idx_factory_knowledge_refs_run
+    on factory_knowledge_references(run_id, selected_at);
 """
 
 
@@ -249,6 +263,39 @@ class FactoryLedger(Ledger):
             (qid, run_id, work_item_id, tool_id, utcnow()),
         )
         self.conn.commit()
+
+    def select_knowledge_reference(self, run_id: str, *, root_name: str, concept_id: str,
+                                   query_rationale: str, citations: list[str],
+                                   provenance: dict[str, Any], content_hash: str) -> None:
+        """Record a stable selection without copying the concept body into the ledger."""
+        self.conn.execute(
+            "insert or ignore into factory_knowledge_references "
+            "(run_id,root_name,concept_id,query_rationale,citations_json,provenance_json,"
+            "content_hash,selected_at) values (?,?,?,?,?,?,?,?)",
+            (run_id, root_name, concept_id, query_rationale,
+             json.dumps(citations, sort_keys=True), json.dumps(provenance, sort_keys=True),
+             content_hash, utcnow()),
+        )
+        self.conn.commit()
+
+    def knowledge_references(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "select * from factory_knowledge_references where run_id=? "
+            "order by selected_at, root_name, concept_id", (run_id,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["runId"] = item.pop("run_id")
+            item["root"] = item.pop("root_name")
+            item["conceptId"] = item.pop("concept_id")
+            item["queryRationale"] = item.pop("query_rationale")
+            item["citations"] = json.loads(item.pop("citations_json"))
+            item["provenance"] = json.loads(item.pop("provenance_json"))
+            item["contentHash"] = item.pop("content_hash")
+            item["selectedAt"] = item.pop("selected_at")
+            result.append(item)
+        return result
 
     def answer_permission(self, run_id: str, qid: str, answer: str) -> str:
         if answer not in {"allow", "deny"}:

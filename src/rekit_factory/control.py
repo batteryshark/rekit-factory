@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable
 
 from muster import (
     AsyncWorkDispatcher,
@@ -41,6 +41,7 @@ from rekit_factory.evidence import (
     render_tool_output,
 )
 from rekit_factory.memory import EvidenceRef, MemoryAction, ProjectMemoryLog, memory_context
+from rekit_factory.knowledge import KnowledgeCatalog, KnowledgeConcept, KnowledgeRoot
 from rekit_factory.hypotheses import (
     HypothesisMemory,
     HypothesisUpdate,
@@ -82,6 +83,12 @@ from rekit_factory.tool_routing import (
     ToolWorkerRouter,
     WorkerRequirements,
 )
+
+
+MAX_KNOWLEDGE_QUERY = 512
+MAX_KNOWLEDGE_RATIONALE = 1_000
+MAX_KNOWLEDGE_RESULTS = 4
+MAX_KNOWLEDGE_BODY = 12_000
 
 
 @dataclass(frozen=True)
@@ -134,9 +141,12 @@ class RunRequest:
 class InvestigationController:
     def __init__(self, *, storage_root: str | Path, rekit: RekitAdapter,
                  workers: WorkerBackend | dict[str, WorkerBackend],
-                 remote_tool_workers: tuple[RemoteWorkerBinding, ...] = ()):
+                 remote_tool_workers: tuple[RemoteWorkerBinding, ...] = (),
+                 knowledge_roots: Iterable[KnowledgeRoot | str | Path] = ()):
         self.storage_root = Path(storage_root).expanduser().resolve()
         self.rekit = rekit
+        configured_knowledge = tuple(knowledge_roots)
+        self.knowledge = KnowledgeCatalog(configured_knowledge) if configured_knowledge else None
         if isinstance(workers, dict):
             if not workers:
                 raise ValueError("at least one worker backend is required")
@@ -193,6 +203,8 @@ class InvestigationController:
             "strategyPlan": plan_payload,
             "scope": scope.envelope.public_dict(),
             "toolRoutes": tool_routes,
+            "knowledgeRoots": [root.name for root in self.knowledge.roots]
+            if self.knowledge else [],
         }
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
@@ -214,6 +226,8 @@ class InvestigationController:
             "strategyPlan": plan_payload,
             "scope": scope.envelope.public_dict(),
             "toolRoutes": tool_routes,
+            "knowledgeRoots": [root.name for root in self.knowledge.roots]
+            if self.knowledge else [],
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
@@ -301,6 +315,7 @@ class InvestigationController:
                     "rekit-tool": self._tool_handler,
                     "model-rekit-tool": self._tool_handler,
                     "model-worker": self._worker_handler,
+                    "model-knowledge": self._knowledge_handler,
                 },
                 node_label="InvestigationDrain",
             )
@@ -445,6 +460,7 @@ class InvestigationController:
             "memoryContext": memory_context(project_memory),
             "hypothesisState": hypothesis_snapshot(project_memory),
             "findingState": finding_snapshot(project_memory),
+            "knowledgeReferences": ledger.knowledge_references(paths.run_id),
         }
 
     async def _tool_handler(self, ctx, item: dict[str, Any]) -> None:
@@ -701,6 +717,84 @@ class InvestigationController:
             )
         self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
 
+    async def _knowledge_handler(self, ctx, item: dict[str, Any]) -> None:
+        """Execute one bounded, read-only OKF operation and persist only compact references."""
+        ledger: FactoryLedger = ctx.deps.ledger
+        payload = json.loads(item["payload_json"])
+        operation = payload.get("knowledgeOperation")
+        try:
+            if self.knowledge is None:
+                raise ValueError("no knowledge roots are configured")
+            if operation == "search":
+                query = _bounded_knowledge_text(
+                    payload.get("query"), "knowledge query", MAX_KNOWLEDGE_QUERY
+                )
+                limit = payload.get("limit", MAX_KNOWLEDGE_RESULTS)
+                if isinstance(limit, bool) or not isinstance(limit, int) \
+                        or not 1 <= limit <= MAX_KNOWLEDGE_RESULTS:
+                    raise ValueError(f"knowledge search limit must be 1..{MAX_KNOWLEDGE_RESULTS}")
+                hits = self.knowledge.search(query, limit=limit)
+                result = {
+                    "operation": "search", "query": query,
+                    "hits": [_knowledge_hit_payload(hit) for hit in hits],
+                }
+                evidence = f"knowledge-search:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
+                message = f"Knowledge search returned {len(hits)} concept(s)"
+            elif operation in {"get", "follow"}:
+                root = _bounded_knowledge_text(payload.get("root"), "knowledge root", 128)
+                rationale = _bounded_knowledge_text(
+                    payload.get("rationale"), "knowledge rationale", MAX_KNOWLEDGE_RATIONALE
+                )
+                if operation == "get":
+                    requested_id = _bounded_knowledge_text(
+                        payload.get("conceptId"), "knowledge concept ID", 512
+                    )
+                    concept = self.knowledge.get(root, requested_id, query=rationale)
+                    provenance = {"operation": "get", "toolCallId": payload.get("toolCallId")}
+                else:
+                    source_id = _bounded_knowledge_text(
+                        payload.get("sourceId"), "knowledge source ID", 512
+                    )
+                    link_target = _bounded_knowledge_text(
+                        payload.get("linkTarget"), "knowledge link target", 1_000
+                    )
+                    links = self.knowledge.related(root, source_id)
+                    link = next((candidate for candidate in links
+                                 if candidate.target == link_target), None)
+                    concept = self.knowledge.follow(root, source_id, link) if link else None
+                    provenance = {
+                        "operation": "follow", "sourceConceptId": source_id,
+                        "linkTarget": link_target, "toolCallId": payload.get("toolCallId"),
+                    }
+                if concept is None:
+                    raise ValueError("knowledge concept or link is unavailable")
+                ledger.select_knowledge_reference(
+                    ctx.state.run_id, root_name=concept.root, concept_id=concept.concept_id,
+                    query_rationale=rationale, citations=list(concept.citations),
+                    provenance=provenance, content_hash=concept.content_hash,
+                )
+                result = _knowledge_selection_payload(concept, operation)
+                evidence = f"knowledge:{concept.root}/{concept.concept_id}@{concept.content_hash}"
+                message = f"Selected knowledge concept {concept.root}/{concept.concept_id}"
+            else:
+                raise ValueError(f"unknown knowledge operation {operation!r}")
+            ledger.resolve(item["id"], result=result, evidence=evidence, state_label="completed")
+            ledger.event_log(
+                ctx.state.run_id, f"knowledge.{operation}", message,
+                worker_id=payload.get("workerId"),
+                payload={"operation": operation, "toolCallId": payload.get("toolCallId")},
+            )
+        except (KeyError, ValueError) as exc:
+            ledger.set_work_status(
+                item["id"], "failed", error=str(exc), state_label="knowledge_unavailable"
+            )
+            ledger.event_log(
+                ctx.state.run_id, "knowledge.failed", "Knowledge retrieval failed",
+                worker_id=payload.get("workerId"),
+                payload={"operation": operation, "error": str(exc)},
+            )
+        self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
+
     async def _worker_handler(self, ctx, item: dict[str, Any]) -> None:
         ledger: FactoryLedger = ctx.deps.ledger
         payload = json.loads(item["payload_json"])
@@ -770,6 +864,7 @@ class InvestigationController:
                 target_snapshot=ctx.deps.scratch["targetSnapshot"],
                 tool_context=bounded_context,
                 available_tools=available_tools,
+                knowledge_available=self.knowledge is not None,
                 messages_json=session["messages_json"] if session else None,
                 tool_results=tool_results,
                 event_sink=event_sink,
@@ -789,10 +884,15 @@ class InvestigationController:
             pending_calls = [
                 {"callId": call.call_id, "toolId": call.tool_id,
                  "toolName": call.tool_name,
+                 "capability": call.capability,
                  "endpoint": call.endpoint,
                  "accountRef": _account_intent_ref(call.account_ref),
                  "usesCredentials": call.uses_credentials,
-                 "requestedAction": call.requested_action}
+                 "requestedAction": call.requested_action,
+                 "query": call.query, "limit": call.limit,
+                 "root": call.root, "conceptId": call.concept_id,
+                 "sourceId": call.source_id, "linkTarget": call.link_target,
+                 "rationale": call.rationale}
                 for call in turn.deferred_calls
             ]
             ledger.save_worker_session(
@@ -803,46 +903,60 @@ class InvestigationController:
             )
             if turn.deferred_calls:
                 for call in turn.deferred_calls:
-                    manifest = self.rekit.manifest(call.tool_id)
-                    route_payload = payload.get("toolRoutes", {}).get(call.tool_id)
-                    if route_payload is None:
-                        route_payload = self._route_payload(
-                            call.tool_id, Path(item["target"]),
+                    if call.capability == "knowledge":
+                        operation = call.tool_id.removeprefix("knowledge.")
+                        if operation not in {"search", "get", "follow"}:
+                            raise ValueError(f"unknown knowledge capability {call.tool_id!r}")
+                        ledger.enqueue(
+                            run_id=ctx.state.run_id,
+                            key=stable_key("model-knowledge", worker_id, call.call_id),
+                            target=item["target"], operation="model-knowledge",
+                            category="knowledge",
+                            title=f"{role} requested knowledge {operation}", priority=150,
+                            payload={
+                                "knowledgeOperation": operation,
+                                "toolCallId": call.call_id, "workerId": worker_id,
+                                "workerItemId": item["id"], "query": call.query,
+                                "limit": call.limit, "root": call.root,
+                                "conceptId": call.concept_id, "sourceId": call.source_id,
+                                "linkTarget": call.link_target, "rationale": call.rationale,
+                            }, state_label="model_requested",
                         )
-                    ledger.enqueue(
-                        run_id=ctx.state.run_id,
-                        key=stable_key("model-tool", worker_id, call.call_id),
-                        target=item["target"],
-                        operation="model-rekit-tool",
-                        category="tool",
-                        title=f"{role} requested Rekit tool {call.tool_id}",
-                        priority=150,
-                        payload={
-                            "toolId": call.tool_id,
-                            "toolCallId": call.call_id,
-                            "workerId": worker_id,
-                            "workerItemId": item["id"],
-                            "safetyTier": manifest.safety_tier,
-                            "endpoint": call.endpoint,
-                            "accountRef": _account_intent_ref(call.account_ref),
-                            "usesCredentials": call.uses_credentials,
-                            "requestedAction": call.requested_action,
-                            **route_payload,
-                        },
-                        state_label="model_requested",
-                    )
+                    else:
+                        manifest = self.rekit.manifest(call.tool_id)
+                        route_payload = payload.get("toolRoutes", {}).get(call.tool_id)
+                        if route_payload is None:
+                            route_payload = self._route_payload(
+                                call.tool_id, Path(item["target"]),
+                            )
+                        ledger.enqueue(
+                            run_id=ctx.state.run_id,
+                            key=stable_key("model-tool", worker_id, call.call_id),
+                            target=item["target"], operation="model-rekit-tool",
+                            category="tool",
+                            title=f"{role} requested Rekit tool {call.tool_id}", priority=150,
+                            payload={
+                                "toolId": call.tool_id, "toolCallId": call.call_id,
+                                "workerId": worker_id, "workerItemId": item["id"],
+                                "safetyTier": manifest.safety_tier, "endpoint": call.endpoint,
+                                "accountRef": _account_intent_ref(call.account_ref),
+                                "usesCredentials": call.uses_credentials,
+                                "requestedAction": call.requested_action,
+                                **route_payload,
+                            }, state_label="model_requested",
+                        )
                 ledger.set_work_status(
                     item["id"], "blocked",
-                    error="Waiting for model-requested Rekit tool results",
+                    error="Waiting for model-requested capability results",
                     state_label="awaiting_tools",
                 )
                 ledger.update_worker(
-                    worker_id, status="queued", current_step="waiting for Rekit tools"
+                    worker_id, status="queued", current_step="waiting for capability results"
                 )
                 ledger.event_log(
                     ctx.state.run_id,
                     "worker.tools_requested",
-                    f"{role} requested {len(turn.deferred_calls)} Rekit tool(s)",
+                    f"{role} requested {len(turn.deferred_calls)} capability call(s)",
                     worker_id=worker_id,
                     payload={"tools": [call.tool_id for call in turn.deferred_calls]},
                 )
@@ -1349,7 +1463,7 @@ class InvestigationController:
             return
         rows = ledger.conn.execute(
             "select status, payload_json from work_items "
-            "where run_id=? and operation='model-rekit-tool'",
+            "where run_id=? and operation in ('model-rekit-tool','model-knowledge')",
             (run_id,),
         ).fetchall()
         statuses = {
@@ -1369,7 +1483,7 @@ class InvestigationController:
         ledger.conn.commit()
         ledger.update_worker(worker_id, status="queued", current_step="resuming with tool results")
         ledger.event_log(
-            run_id, "worker.resuming", "All requested Rekit tool results are available",
+            run_id, "worker.resuming", "All requested capability results are available",
             worker_id=worker_id,
         )
 
@@ -1386,7 +1500,7 @@ class InvestigationController:
                             session: dict[str, Any]) -> tuple[ModelToolResult, ...]:
         rows = ledger.conn.execute(
             "select status, result_json, error, payload_json from work_items "
-            "where run_id=? and operation='model-rekit-tool'",
+            "where run_id=? and operation in ('model-rekit-tool','model-knowledge')",
             (run_id,),
         ).fetchall()
         indexed = {}
@@ -1400,6 +1514,29 @@ class InvestigationController:
             if row is None or row["status"] not in {"done", "failed"}:
                 raise RuntimeError(f"tool result {call['callId']} is not ready")
             result = json.loads(row["result_json"]) if row["result_json"] else {}
+            if call.get("capability") == "knowledge":
+                denied = row["status"] == "failed"
+                if denied:
+                    content = row["error"] or "Knowledge retrieval failed."
+                elif result.get("operation") == "search":
+                    content = json.dumps(result, sort_keys=True)
+                else:
+                    try:
+                        concept = self.knowledge.get(
+                            result["root"], result["conceptId"],
+                            query=call.get("rationale") or "selected reference",
+                        ) if self.knowledge is not None else None
+                    except (KeyError, ValueError):
+                        concept = None
+                    if concept is None or concept.content_hash != result.get("contentHash"):
+                        denied = True
+                        content = "Selected knowledge changed or became unavailable before resume."
+                    else:
+                        content = _knowledge_model_content(concept)
+                results.append(ModelToolResult(
+                    call_id=call["callId"], content=content, denied=denied
+                ))
+                continue
             denied = result.get("decision") in {"denied", "scope-denied"}
             if denied:
                 content = f"Operator denied Rekit tool {call['toolId']}."
@@ -1460,6 +1597,47 @@ def _account_intent_ref(value: str | None) -> str | None:
     if re.fullmatch(r"account:[A-Za-z0-9._-]{1,128}", value):
         return value
     return opaque_ref("account", value)
+
+
+def _bounded_knowledge_text(value: Any, label: str, max_chars: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty string")
+    result = value.strip()
+    if len(result) > max_chars:
+        raise ValueError(f"{label} exceeds {max_chars} characters")
+    return result
+
+
+def _knowledge_hit_payload(hit: Any) -> dict[str, Any]:
+    return {
+        "root": hit.root, "conceptId": hit.concept_id, "title": hit.title,
+        "description": hit.description, "type": hit.type, "tags": list(hit.tags),
+        "citations": list(hit.citations), "contentHash": hit.content_hash,
+        "snippet": hit.snippet, "score": hit.score,
+    }
+
+
+def _knowledge_selection_payload(concept: KnowledgeConcept, operation: str) -> dict[str, Any]:
+    """Durable projection deliberately excludes the concept body."""
+    return {
+        "operation": operation, "root": concept.root, "conceptId": concept.concept_id,
+        "title": concept.title, "description": concept.description, "type": concept.type,
+        "tags": list(concept.tags), "citations": list(concept.citations),
+        "contentHash": concept.content_hash,
+        "links": [
+            {"label": link.label, "target": link.target, "conceptId": link.concept_id,
+             "external": link.external, "exists": link.exists}
+            for link in concept.links
+        ],
+    }
+
+
+def _knowledge_model_content(concept: KnowledgeConcept) -> str:
+    """Build an ephemeral bounded disclosure for the resumed model turn."""
+    return json.dumps({
+        **_knowledge_selection_payload(concept, "get"),
+        "body": concept.body[:MAX_KNOWLEDGE_BODY],
+    }, sort_keys=True)
 
 
 def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,

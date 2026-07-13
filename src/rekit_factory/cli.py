@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 
 from rekit_factory.control import InvestigationController, RunRequest, default_storage_root
+from rekit_factory.knowledge import KnowledgeRoot
 from rekit_factory.models import ModelProfile, PydanticWorkerBackend
 from rekit_factory.rekit_client import FederatedRekitClient
 from rekit_factory.remote_http import HTTPWorkerTransport
@@ -27,6 +28,11 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument(
         "--rekit-root", type=Path, action="append",
         help="Rekit checkout containing bin/rekit and registry.json; repeat to federate",
+    )
+    root.add_argument(
+        "--knowledge-root", type=_knowledge_root_arg, action="append", default=[],
+        metavar="NAME=PATH",
+        help="named read-only OKF bundle root; repeat to federate knowledge",
     )
     commands = root.add_subparsers(dest="command", required=True)
 
@@ -188,7 +194,18 @@ def _controller(args, *, needs_model: bool) -> InvestigationController:
         rekit=FederatedRekitClient.from_roots(roots),
         workers=backends,
         remote_tool_workers=_load_remote_workers(args) if needs_model else (),
+        knowledge_roots=args.knowledge_root,
     )
+
+
+def _knowledge_root_arg(value: str) -> KnowledgeRoot:
+    name, separator, raw_path = value.partition("=")
+    if not separator or not name or not raw_path:
+        raise argparse.ArgumentTypeError("knowledge roots must use NAME=PATH")
+    try:
+        return KnowledgeRoot.at(raw_path, name=name)
+    except (OSError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 class _UnusedBackend:

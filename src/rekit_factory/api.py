@@ -131,6 +131,11 @@ class FactoryHandler(BaseHTTPRequestHandler):
                         {"name": item.name, "description": item.description}
                         for item in DEFAULT_STRATEGIES.values()
                     ],
+                    "knowledgeRoots": [
+                        {"name": root.name}
+                        for root in (self.server.controller.knowledge.roots
+                                     if self.server.controller.knowledge else ())
+                    ],
                     "tools": tools,
                 })
                 return

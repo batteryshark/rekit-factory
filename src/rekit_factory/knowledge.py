@@ -33,7 +33,10 @@ class KnowledgeRoot:
         resolved = Path(path).expanduser().resolve()
         if not resolved.is_dir():
             raise FileNotFoundError(resolved)
-        return cls(name or resolved.name, resolved)
+        root_name = name or resolved.name
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", root_name):
+            raise ValueError("knowledge root name must be a short opaque label")
+        return cls(root_name, resolved)
 
 
 @dataclass(frozen=True)
