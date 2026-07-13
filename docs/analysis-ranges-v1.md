@@ -77,8 +77,12 @@ The fake enforces:
 
 Its canonical checkpoint contains range state, transition history, current scratch/output,
 evidence metadata, operation outcomes, clock, and pending one-shot failure injections. On
-restore it validates identities, template binding, transition/revision/generation history,
-handles, lease-local ownership, evidence counts, and stored result/error shapes. Exact
+restore it strictly decodes UTF-8 JSON without duplicate keys and validates identities,
+template binding, transition/revision/generation history, deterministic handles, lease-local
+ownership, evidence counts, and stored result/error shapes. Every operation persists its
+canonical typed request envelope and digest; successful results must resolve to the same
+materialized range history or exact evidence record, and evidence must resolve back to a
+successful execute request with matching node, handle, inputs, path, generation, and bytes. Exact
 retries after restart return or re-raise the recorded outcome without duplicating a lease.
 
 ## Explicit nonclaims

@@ -23,6 +23,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]{0,126}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_OPERATION_KINDS = frozenset({"provision", "execute", "reset", "destroy", "cancel", "expire"})
 
 RangeStatus = Literal[
     "requested", "provisioning", "ready", "in-use", "resetting", "destroyed",
@@ -210,6 +211,19 @@ def _endpoint(value: Any, name: str) -> str:
     return text
 
 
+def _credential_ref(value: str) -> bool:
+    return value.startswith("credential:") and len(value) > len("credential:")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"range checkpoint contains duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
 @dataclass(frozen=True)
 class RangeServiceV1(RangeContract):
     service_id: str
@@ -382,7 +396,7 @@ class RangeScopeV1(RangeContract):
         for item in endpoints:
             _endpoint(item, "scope endpoint")
         credentials = _strings(self.credential_refs, "credential_refs", identifiers=True)
-        if any(not item.startswith("credential:") for item in credentials):
+        if any(not _credential_ref(item) for item in credentials):
             raise ValueError("credentials must be opaque credential: references")
         inputs = _strings(self.input_ids, "scope input_ids", identifiers=True)
         if endpoints and "network_access" not in actions:
@@ -704,7 +718,7 @@ class RangeWorkIntentV1(RangeContract):
         for item in endpoints:
             _endpoint(item, "network endpoint")
         credentials = _strings(self.credential_refs, "credential_refs", identifiers=True)
-        if any(not item.startswith("credential:") for item in credentials):
+        if any(not _credential_ref(item) for item in credentials):
             raise ValueError("credential intent requires opaque credential: references")
         mounts = _strings(self.input_mounts, "input_mounts", identifiers=True)
         object.__setattr__(self, "network_endpoints", endpoints)
@@ -858,36 +872,104 @@ _ERRORS: dict[str, type[RangeError]] = {
 
 
 def _validate_history(
-    history: list[RangeLeaseStateV1], range_id: str, spec_sha256: str,
+    history: list[RangeLeaseStateV1], template: RangeTemplateV1, spec: RangeSpecV1,
 ) -> None:
     predecessor: RangeStatus | None = None
     previous_revision = 0
     previous_generation = 1
+    previous_time: datetime | None = None
     for state in history:
-        if state.range_id != range_id or state.spec_sha256 != spec_sha256:
+        if state.range_id != spec.range_id or state.spec_sha256 != spec.digest:
             raise ValueError("checkpoint transition history changes range identity")
         if state.revision != previous_revision + 1:
             raise ValueError("checkpoint transition revisions are not contiguous")
         rule = RANGE_TRANSITIONS[state.status]
         require_range_transition(predecessor, state.status, rule.owner)
-        if state.generation < previous_generation or state.generation > previous_generation + 1:
-            raise ValueError("checkpoint lease generations are not contiguous")
-        if state.generation > previous_generation and state.status != "ready":
-            raise ValueError("checkpoint generation changed outside a ready transition")
+        expected_generation = (
+            previous_generation + 1
+            if predecessor == "resetting" and state.status == "ready"
+            else previous_generation
+        )
+        if state.generation != expected_generation:
+            raise ValueError("checkpoint lease generation does not match reset history")
+        stamp = _time(state.updated_at)
+        if previous_time is not None and stamp < previous_time:
+            raise ValueError("checkpoint transition timestamps are not monotonic")
+        expected_range, expected_nodes = _deterministic_handles(template, spec, state.generation)
+        if state.status in {"requested", "provisioning", "destroyed"}:
+            if state.range_handle is not None or state.node_handles:
+                raise ValueError("checkpoint transition carries forbidden provider handles")
+        elif state.status in {"ready", "in-use", "resetting"}:
+            if state.range_handle != expected_range or state.node_handles != expected_nodes:
+                raise ValueError("checkpoint transition has invalid deterministic handles")
+        elif (state.range_handle is None) != (not state.node_handles):
+            raise ValueError("checkpoint transition has partial provider handles")
+        elif state.range_handle is not None and (
+            state.range_handle != expected_range or state.node_handles != expected_nodes
+        ):
+            raise ValueError("checkpoint transition has invalid deterministic handles")
         predecessor = state.status
         previous_revision = state.revision
         previous_generation = state.generation
+        previous_time = stamp
 
 
-def _validate_checkpoint_result(value: Any) -> None:
-    if not isinstance(value, dict):
-        raise ValueError("checkpoint operation result must be a contract object")
-    if "output_id" in value:
-        RangeOutputV1.from_dict(value)
-    elif "status" in value:
-        RangeLeaseStateV1.from_dict(value)
+def _deterministic_handles(
+    template: RangeTemplateV1, spec: RangeSpecV1, generation: int,
+) -> tuple[ProviderHandleV1, tuple[NodeHandleV1, ...]]:
+    root = canonical_sha256({
+        "range_id": spec.range_id, "spec_sha256": spec.digest, "generation": generation,
+    })
+    return (
+        ProviderHandleV1("range", f"fake-range:{root[:32]}"),
+        tuple(NodeHandleV1(
+            node.node_id,
+            ProviderHandleV1("node", f"fake-node:{canonical_sha256({'root': root, 'node': node.node_id})[:32]}"),
+        ) for node in template.nodes),
+    )
+
+
+def _operation_envelope(operation_id: str, kind: str, request: dict[str, Any]) -> dict[str, Any]:
+    _identifier(operation_id, "operation_id")
+    if kind not in _OPERATION_KINDS:
+        raise ValueError("unknown range operation kind")
+    return {
+        "schema_version": SCHEMA_VERSION, "operation_id": operation_id,
+        "kind": kind, "request": request,
+    }
+
+
+def _decode_operation_envelope(value: Any) -> tuple[dict[str, Any], Any]:
+    value = _strict(
+        value, "checkpoint operation request",
+        {"schema_version", "operation_id", "kind", "request"},
+    )
+    _version(value["schema_version"])
+    operation_id = _identifier(value["operation_id"], "checkpoint request operation_id")
+    kind = value["kind"]
+    if kind not in _OPERATION_KINDS:
+        raise ValueError("checkpoint operation kind is unsupported")
+    request = value["request"]
+    if kind == "provision":
+        request = _strict(request, "provision request", {"template", "spec"})
+        decoded = (RangeTemplateV1.from_dict(request["template"]), RangeSpecV1.from_dict(request["spec"]))
+        canonical = {"template": decoded[0].to_dict(), "spec": decoded[1].to_dict()}
+    elif kind == "execute":
+        decoded = RangeWorkRequestV1.from_dict(request)
+        if decoded.operation_id != operation_id:
+            raise ValueError("execute request operation identity is inconsistent")
+        canonical = decoded.to_dict()
     else:
-        raise ValueError("checkpoint operation result has an unknown contract shape")
+        request = _strict(request, "lifecycle request", {"range_id", "reason"})
+        _identifier(request["range_id"], "lifecycle range_id")
+        if request["reason"] is not None:
+            _text(request["reason"], "lifecycle reason", 256)
+        decoded = request
+        canonical = dict(request)
+    envelope = _operation_envelope(operation_id, kind, canonical)
+    if envelope != value:
+        raise ValueError("checkpoint operation request is not canonical")
+    return envelope, decoded
 
 
 class DeterministicFakeRangeAdapter:
@@ -941,8 +1023,8 @@ class DeterministicFakeRangeAdapter:
         _identifier(operation_id, "operation_id")
         if type(template) is not RangeTemplateV1 or type(spec) is not RangeSpecV1:
             raise ValueError("provision requires exact v1 template and spec contracts")
-        request = {"kind": "provision", "template": template.to_dict(), "spec": spec.to_dict()}
-        replay = self._operation_replay(operation_id, request, RangeLeaseStateV1.from_dict)
+        request = {"template": template.to_dict(), "spec": spec.to_dict()}
+        replay = self._operation_replay(operation_id, "provision", request, RangeLeaseStateV1.from_dict)
         if replay is not None:
             return replay
         try:
@@ -968,7 +1050,7 @@ class DeterministicFakeRangeAdapter:
                         record, "expired", "clock", terminal_reason="lifetime elapsed",
                     )
                     result = record.state
-                    self._operation_success(operation_id, request, result)
+                    self._operation_success(operation_id, "provision", request, result)
                     return result
                 self._maybe_fail(record, "provisioning")
                 self._transition(record, "provisioning", "adapter")
@@ -979,16 +1061,16 @@ class DeterministicFakeRangeAdapter:
                     node_handles=node_handles,
                 )
                 result = record.state
-            self._operation_success(operation_id, request, result)
+            self._operation_success(operation_id, "provision", request, result)
             return result
         except RangeError as exc:
-            self._operation_error(operation_id, request, exc)
+            self._operation_error(operation_id, "provision", request, exc)
             raise
 
     def execute(self, request: RangeWorkRequestV1) -> RangeOutputV1:
         if type(request) is not RangeWorkRequestV1:
             raise ValueError("execute requires an exact RangeWorkRequestV1")
-        replay = self._operation_replay(request.operation_id, request.to_dict(), RangeOutputV1.from_dict)
+        replay = self._operation_replay(request.operation_id, "execute", request.to_dict(), RangeOutputV1.from_dict)
         if replay is not None:
             return replay
         try:
@@ -1032,10 +1114,10 @@ class DeterministicFakeRangeAdapter:
             record.outputs[output.output_id] = output
             record.evidence[output.output_id] = output
             record.work_count += 1
-            self._operation_success(request.operation_id, request.to_dict(), output)
+            self._operation_success(request.operation_id, "execute", request.to_dict(), output)
             return output
         except RangeError as exc:
-            self._operation_error(request.operation_id, request.to_dict(), exc)
+            self._operation_error(request.operation_id, "execute", request.to_dict(), exc)
             raise
 
     def reset(self, operation_id: str, range_id: str) -> RangeLeaseStateV1:
@@ -1057,8 +1139,8 @@ class DeterministicFakeRangeAdapter:
     ) -> RangeLeaseStateV1:
         _identifier(operation_id, "operation_id")
         _identifier(range_id, "range_id")
-        request = {"kind": kind, "range_id": range_id, "reason": reason}
-        replay = self._operation_replay(operation_id, request, RangeLeaseStateV1.from_dict)
+        request = {"range_id": range_id, "reason": reason}
+        replay = self._operation_replay(operation_id, kind, request, RangeLeaseStateV1.from_dict)
         if replay is not None:
             return replay
         try:
@@ -1084,7 +1166,7 @@ class DeterministicFakeRangeAdapter:
             elif kind in {"destroy", "cancel"}:
                 if record.state.status == "destroyed":
                     result = record.state
-                    self._operation_success(operation_id, request, result)
+                    self._operation_success(operation_id, kind, request, result)
                     return result
                 self._maybe_fail(record, "destroyed")
                 self._transition(
@@ -1096,7 +1178,7 @@ class DeterministicFakeRangeAdapter:
             elif kind == "expire":
                 if record.state.status == "expired":
                     result = record.state
-                    self._operation_success(operation_id, request, result)
+                    self._operation_success(operation_id, kind, request, result)
                     return result
                 if _time(self._now) < _time(record.spec.expires_at):
                     raise RangeStateError("range lifetime has not expired")
@@ -1111,10 +1193,10 @@ class DeterministicFakeRangeAdapter:
             else:  # pragma: no cover - private callers use the fixed methods above
                 raise ValueError("unknown lifecycle operation")
             result = record.state
-            self._operation_success(operation_id, request, result)
+            self._operation_success(operation_id, kind, request, result)
             return result
         except RangeError as exc:
-            self._operation_error(operation_id, request, exc)
+            self._operation_error(operation_id, kind, request, exc)
             raise
 
     def _authorize_work(self, record: _RangeRecord, request: RangeWorkRequestV1) -> None:
@@ -1200,17 +1282,7 @@ class DeterministicFakeRangeAdapter:
     def _handles(
         self, record: _RangeRecord, generation: int,
     ) -> tuple[ProviderHandleV1, tuple[NodeHandleV1, ...]]:
-        root = canonical_sha256({
-            "range_id": record.spec.range_id,
-            "spec_sha256": record.spec.digest,
-            "generation": generation,
-        })
-        range_handle = ProviderHandleV1("range", f"fake-range:{root[:32]}")
-        nodes = tuple(NodeHandleV1(
-            node.node_id,
-            ProviderHandleV1("node", f"fake-node:{canonical_sha256({'root': root, 'node': node.node_id})[:32]}"),
-        ) for node in record.template.nodes)
-        return range_handle, nodes
+        return _deterministic_handles(record.template, record.spec, generation)
 
     def _record(self, range_id: str) -> _RangeRecord:
         _identifier(range_id, "range_id")
@@ -1219,9 +1291,9 @@ class DeterministicFakeRangeAdapter:
         except KeyError as exc:
             raise RangeAccessError("unknown range identity") from exc
 
-    def _operation_replay(self, operation_id: str, request: Any, decoder):
-        _identifier(operation_id, "operation_id")
-        digest = canonical_sha256(request)
+    def _operation_replay(self, operation_id: str, kind: str, request: dict[str, Any], decoder):
+        envelope = _operation_envelope(operation_id, kind, request)
+        digest = canonical_sha256(envelope)
         prior = self._operations.get(operation_id)
         if prior is None:
             return None
@@ -1232,16 +1304,24 @@ class DeterministicFakeRangeAdapter:
             raise _ERRORS[error["type"]](error["message"])
         return decoder(prior["result"])
 
-    def _operation_success(self, operation_id: str, request: Any, result: RangeContract) -> None:
+    def _operation_success(
+        self, operation_id: str, kind: str, request: dict[str, Any], result: RangeContract,
+    ) -> None:
+        envelope = _operation_envelope(operation_id, kind, request)
         self._operations[operation_id] = {
-            "request_sha256": canonical_sha256(request),
+            "request": envelope,
+            "request_sha256": canonical_sha256(envelope),
             "result": result.to_dict(),
             "error": None,
         }
 
-    def _operation_error(self, operation_id: str, request: Any, error: RangeError) -> None:
+    def _operation_error(
+        self, operation_id: str, kind: str, request: dict[str, Any], error: RangeError,
+    ) -> None:
+        envelope = _operation_envelope(operation_id, kind, request)
         self._operations[operation_id] = {
-            "request_sha256": canonical_sha256(request),
+            "request": envelope,
+            "request_sha256": canonical_sha256(envelope),
             "result": None,
             "error": {"type": type(error).__name__, "message": str(error)},
         }
@@ -1270,9 +1350,16 @@ class DeterministicFakeRangeAdapter:
 
     @classmethod
     def from_checkpoint(cls, raw: str | bytes) -> Self:
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8", "strict")
+            except UnicodeDecodeError as exc:
+                raise ValueError("range checkpoint must be valid UTF-8 JSON") from exc
+        if type(raw) is not str:
+            raise ValueError("range checkpoint must be UTF-8 JSON text or bytes")
         try:
-            value = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            value = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        except json.JSONDecodeError as exc:
             raise ValueError("range checkpoint must be valid UTF-8 JSON") from exc
         value = _strict(
             value, "range checkpoint",
@@ -1286,10 +1373,18 @@ class DeterministicFakeRangeAdapter:
         if not isinstance(value["operations"], dict) or not isinstance(value["ranges"], dict):
             raise ValueError("checkpoint maps are invalid")
         adapter._operations = {}
+        operation_requests: dict[str, tuple[dict[str, Any], Any]] = {}
         for operation_id, item in value["operations"].items():
             _identifier(operation_id, "checkpoint operation ID")
-            item = _strict(item, "checkpoint operation", {"request_sha256", "result", "error"})
-            _digest(item["request_sha256"], "checkpoint request digest")
+            item = _strict(
+                item, "checkpoint operation", {"request", "request_sha256", "result", "error"},
+            )
+            envelope, decoded_request = _decode_operation_envelope(item["request"])
+            if envelope["operation_id"] != operation_id:
+                raise ValueError("checkpoint operation map identity is inconsistent")
+            digest = _digest(item["request_sha256"], "checkpoint request digest")
+            if digest != canonical_sha256(envelope):
+                raise ValueError("checkpoint operation request digest is inconsistent")
             if item["error"] is not None:
                 if item["result"] is not None:
                     raise ValueError("checkpoint failed operation also carries a result")
@@ -1298,7 +1393,11 @@ class DeterministicFakeRangeAdapter:
                     raise ValueError("checkpoint error type is unsupported")
                 _text(error["message"], "checkpoint error message", 512)
             else:
-                _validate_checkpoint_result(item["result"])
+                if envelope["kind"] == "execute":
+                    RangeOutputV1.from_dict(item["result"])
+                else:
+                    RangeLeaseStateV1.from_dict(item["result"])
+            operation_requests[operation_id] = (envelope, decoded_request)
             adapter._operations[operation_id] = item
         for range_id, item in value["ranges"].items():
             _identifier(range_id, "checkpoint range ID")
@@ -1319,7 +1418,11 @@ class DeterministicFakeRangeAdapter:
                 raise ValueError("checkpoint template identity is inconsistent")
             if not history or history[-1] != state:
                 raise ValueError("checkpoint state does not match transition history")
-            _validate_history(history, range_id, spec.digest)
+            _validate_history(history, template, spec)
+            if len(template.nodes) > spec.resources.max_nodes:
+                raise ValueError("checkpoint template exceeds the range resource ceiling")
+            if any(_time(entry.updated_at) > _time(adapter._now) for entry in history):
+                raise ValueError("checkpoint transition occurs after the checkpoint clock")
             for name in ("scratch", "outputs", "evidence"):
                 if not isinstance(item[name], dict):
                     raise ValueError(f"checkpoint {name} must be an object")
@@ -1338,22 +1441,109 @@ class DeterministicFakeRangeAdapter:
             if any(key != value.scratch_id or value.range_id != range_id
                    for key, value in scratch.items()):
                 raise ValueError("checkpoint scratch identity is inconsistent")
-            if not set(outputs) <= set(evidence):
-                raise ValueError("checkpoint current outputs are absent from evidence history")
-            if state.status in {"ready", "in-use", "resetting"} and (
-                state.range_handle is None
-                or {item.node_id for item in state.node_handles}
-                != {item.node_id for item in template.nodes}
-            ):
-                raise ValueError("checkpoint ready lease handles are incomplete")
+            if set(outputs) != {
+                key for key, output in evidence.items()
+                if output.generation == state.generation and state.status not in {"destroyed", "expired"}
+            } or any(outputs[key] != evidence[key] for key in outputs):
+                raise ValueError("checkpoint current outputs do not match current evidence")
             if state.status in {"destroyed", "expired"} and (scratch or outputs):
                 raise ValueError("checkpoint closed range retains lease-local data")
             work_count = _integer(item["work_count"], "checkpoint work_count", 0, 1_000_000)
-            if work_count != len(evidence):
+            if work_count != len(evidence) or work_count > spec.resources.max_work_items:
                 raise ValueError("checkpoint work count does not match evidence history")
+            node_ids = {node.node_id for node in template.nodes}
+            input_digests = {entry.sha256 for entry in spec.inputs}
+            if any(
+                output.node_id not in node_ids or output.generation > state.generation
+                or not set(output.input_sha256) <= input_digests
+                or output.size > spec.resources.max_output_bytes
+                for output in evidence.values()
+            ):
+                raise ValueError("checkpoint evidence exceeds its declared range")
+            if len({output.operation_id for output in evidence.values()}) != len(evidence):
+                raise ValueError("checkpoint evidence operation identities are not unique")
+            scratch_by_operation = {entry.operation_id: entry for entry in scratch.values()}
+            output_by_operation = {entry.operation_id: entry for entry in outputs.values()}
+            if len(scratch_by_operation) != len(scratch) or set(scratch_by_operation) != set(output_by_operation):
+                raise ValueError("checkpoint scratch and current outputs do not pair by operation")
+            for operation_id, entry in scratch_by_operation.items():
+                output = output_by_operation[operation_id]
+                if (
+                    entry.node_id not in node_ids or entry.generation != state.generation
+                    or output.generation != state.generation or entry.node_id != output.node_id
+                    or entry.sha256 != output.sha256 or entry.size != output.size
+                    or entry.size > spec.resources.max_scratch_bytes
+                    or entry.scratch_id != f"scratch-{canonical_sha256({'operation_id': operation_id})[:24]}"
+                    or output.output_id != f"output-{canonical_sha256({'operation_id': operation_id})[:24]}"
+                ):
+                    raise ValueError("checkpoint scratch/output pair is inconsistent")
             adapter._ranges[range_id] = _RangeRecord(
                 template, spec, state, history, scratch, outputs, evidence, work_count,
             )
+        successful_execute_ids: set[str] = set()
+        for operation_id, item in adapter._operations.items():
+            envelope, decoded_request = operation_requests[operation_id]
+            if item["error"] is not None:
+                continue
+            kind = envelope["kind"]
+            if kind == "execute":
+                request = decoded_request
+                result = RangeOutputV1.from_dict(item["result"])
+                record = adapter._ranges.get(request.range_id)
+                if record is None or result.operation_id != operation_id or result.range_id != request.range_id:
+                    raise ValueError("checkpoint execute result is outside its request range")
+                evidence = record.evidence.get(result.output_id)
+                inputs = {entry.input_id: entry for entry in record.spec.inputs}
+                _expected_range, expected_nodes = _deterministic_handles(
+                    record.template, record.spec, result.generation,
+                )
+                handles = {entry.node_id: entry.handle for entry in expected_nodes}
+                if not set(request.input_ids) <= set(inputs):
+                    raise ValueError("checkpoint execute request references an undeclared input")
+                payload = canonical_json({
+                    "action": request.action, "range_id": request.range_id,
+                    "node_id": request.node_id, "generation": result.generation,
+                    "inputs": [inputs[key].sha256 for key in request.input_ids],
+                    "topology": record.template.to_dict(),
+                }).encode("utf-8")
+                payload_sha256 = hashlib.sha256(payload).hexdigest()
+                if (
+                    evidence != result or request.node_id != result.node_id
+                    or request.output_name != result.logical_path
+                    or request.node_handle != handles.get(request.node_id)
+                    or tuple(inputs[key].sha256 for key in request.input_ids) != result.input_sha256
+                    or result.output_id != f"output-{canonical_sha256({'operation_id': operation_id})[:24]}"
+                    or result.sha256 != payload_sha256 or result.size != len(payload)
+                    or result.media_type != "application/json" or result.verified is not True
+                    or not any(
+                        state.status == "in-use" and state.generation == result.generation
+                        for state in record.history
+                    )
+                ):
+                    raise ValueError("checkpoint execute result is not bound to its request")
+                successful_execute_ids.add(operation_id)
+            else:
+                result = RangeLeaseStateV1.from_dict(item["result"])
+                if kind == "provision":
+                    template, spec = decoded_request
+                    record = adapter._ranges.get(spec.range_id)
+                    if record is None or record.template != template or record.spec != spec:
+                        raise ValueError("checkpoint provision result is not bound to its request")
+                else:
+                    record = adapter._ranges.get(decoded_request["range_id"])
+                if record is None or result not in record.history:
+                    raise ValueError("checkpoint lifecycle result is absent from range history")
+                expected_status = {
+                    "reset": "ready", "destroy": "destroyed", "cancel": "destroyed",
+                    "expire": "expired",
+                }.get(kind)
+                if expected_status is not None and result.status != expected_status:
+                    raise ValueError("checkpoint lifecycle result contradicts its operation kind")
+        evidence_operation_ids = {
+            output.operation_id for record in adapter._ranges.values() for output in record.evidence.values()
+        }
+        if evidence_operation_ids != successful_execute_ids:
+            raise ValueError("checkpoint evidence is not backed by successful execute operations")
         # Round-tripping through the canonical encoder also rejects unserializable values.
         canonical_json(value)
         return adapter

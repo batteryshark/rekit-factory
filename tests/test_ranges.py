@@ -29,7 +29,7 @@ from rekit_factory.ranges import (
     RangeWorkIntentV1,
     RangeWorkRequestV1,
     benign_two_node_fixture,
-    canonical_json,
+    canonical_json, canonical_sha256,
     require_range_transition,
 )
 
@@ -558,3 +558,85 @@ def test_fake_enforces_scratch_output_and_work_item_ceilings():
     normal_ready = normal.reset("reset-one", normal_spec.range_id)
     with pytest.raises(RangeStateError, match="work-item ceiling"):
         normal.execute(_work(normal_ready, operation_id="extra-work"))
+
+
+def test_checkpoint_operation_requests_are_persisted_and_bound_to_results():
+    template, spec = benign_two_node_fixture()
+    adapter = DeterministicFakeRangeAdapter(now=spec.requested_at)
+    ready = adapter.provision("provision-bound", template, spec)
+    output = adapter.execute(_work(ready, operation_id="work-bound"))
+    checkpoint = json.loads(adapter.checkpoint())
+    operation = checkpoint["operations"]["work-bound"]
+    assert operation["request"]["kind"] == "execute"
+    assert operation["request"]["operation_id"] == "work-bound"
+
+    forged = json.loads(adapter.checkpoint())
+    for record in (
+        forged["operations"]["work-bound"]["result"],
+        forged["ranges"][spec.range_id]["outputs"][output.output_id],
+        forged["ranges"][spec.range_id]["evidence"][output.output_id],
+    ):
+        record["logical_path"] = "output/forged.json"
+    with pytest.raises(ValueError, match="not bound to its request"):
+        DeterministicFakeRangeAdapter.from_checkpoint(json.dumps(forged))
+
+    forged = json.loads(adapter.checkpoint())
+    envelope = forged["operations"]["work-bound"]["request"]
+    envelope["request"]["range_id"] = "range-other"
+    forged["operations"]["work-bound"]["request_sha256"] = canonical_sha256(envelope)
+    with pytest.raises(ValueError, match="outside its request range"):
+        DeterministicFakeRangeAdapter.from_checkpoint(json.dumps(forged))
+
+
+def test_checkpoint_rejects_generation_handle_and_artifact_forgery():
+    template, spec = benign_two_node_fixture()
+    adapter = DeterministicFakeRangeAdapter(now=spec.requested_at)
+    ready = adapter.provision("provision-forgery", template, spec)
+    output = adapter.execute(_work(ready, operation_id="work-forgery"))
+    adapter.reset("reset-forgery", spec.range_id)
+
+    forged = json.loads(adapter.checkpoint())
+    record = forged["ranges"][spec.range_id]
+    record["state"]["generation"] = 1
+    record["history"][-1]["generation"] = 1
+    with pytest.raises(ValueError, match="generation does not match reset history"):
+        DeterministicFakeRangeAdapter.from_checkpoint(json.dumps(forged))
+
+    forged = json.loads(adapter.checkpoint())
+    record = forged["ranges"][spec.range_id]
+    record["state"]["range_handle"]["opaque_id"] = "fake-range:forged"
+    record["history"][-1]["range_handle"]["opaque_id"] = "fake-range:forged"
+    with pytest.raises(ValueError, match="invalid deterministic handles"):
+        DeterministicFakeRangeAdapter.from_checkpoint(json.dumps(forged))
+
+    active = DeterministicFakeRangeAdapter(now=spec.requested_at)
+    ready = active.provision("provision-artifact", template, spec)
+    output = active.execute(_work(ready, operation_id="work-artifact"))
+    forged = json.loads(active.checkpoint())
+    record = forged["ranges"][spec.range_id]
+    for value in (
+        forged["operations"]["work-artifact"]["result"],
+        record["scratch"][next(iter(record["scratch"]))],
+        record["outputs"][output.output_id], record["evidence"][output.output_id],
+    ):
+        value["sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="not bound to its request"):
+        DeterministicFakeRangeAdapter.from_checkpoint(json.dumps(forged))
+
+
+def test_checkpoint_requires_utf8_unique_keys_and_nonempty_credential_refs():
+    template, spec = benign_two_node_fixture()
+    adapter = DeterministicFakeRangeAdapter(now=spec.requested_at)
+    adapter.provision("provision-json", template, spec)
+    checkpoint = adapter.checkpoint()
+    with pytest.raises(ValueError, match="valid UTF-8 JSON"):
+        DeterministicFakeRangeAdapter.from_checkpoint(checkpoint.encode("utf-16"))
+    duplicate = checkpoint.replace(
+        '"schema_version":1', '"schema_version":1,"schema_version":1', 1,
+    )
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        DeterministicFakeRangeAdapter.from_checkpoint(duplicate)
+    with pytest.raises(ValueError, match="credential: references"):
+        RangeScopeV1("scope", 1, ("credential_use",), (), ("credential:",), ())
+    with pytest.raises(ValueError, match="credential: references"):
+        RangeWorkIntentV1(credential_refs=("credential:",))
