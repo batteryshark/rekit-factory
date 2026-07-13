@@ -27,6 +27,7 @@ MAX_BODY = 1_000_000
 UI_ASSETS = {
     "mission-control.css": "text/css; charset=utf-8",
     "mission-attention.js": "text/javascript; charset=utf-8",
+    "mission-outcomes.js": "text/javascript; charset=utf-8",
     "mission-control.js": "text/javascript; charset=utf-8",
 }
 

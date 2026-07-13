@@ -541,7 +541,9 @@ class ControlPlaneTests(unittest.TestCase):
                     page = response.read()
                     self.assertIn(b"Mission Control", page)
                     self.assertIn(b'/ui/mission-control.css', page)
+                    self.assertIn(b'/ui/mission-outcomes.js', page)
                     self.assertIn(b'/ui/mission-control.js', page)
+                    self.assertIn(b'data-tab="outcomes"', page)
                     self.assertIn(b'data-tab="reports"', page)
                     self.assertIn(b'data-tab="usage"', page)
                     self.assertIn(b'id="strategySelect"', page)
@@ -563,6 +565,13 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b"cacheReadTokens", script)
                     self.assertIn(b"retriesPerWorker", script)
                     self.assertIn(b"costUnits", script)
+                with urlopen(base + "/ui/mission-outcomes.js", timeout=5) as response:
+                    self.assertEqual(
+                        "text/javascript; charset=utf-8", response.headers["Content-Type"]
+                    )
+                    outcomes = response.read()
+                    self.assertIn(b"factory-outcomes/semantic-sha256/v1", outcomes)
+                    self.assertIn(b"createSemanticTracker", outcomes)
                     self.assertIn(b"maxWorkers", script)
                     self.assertIn(b"restartService", script)
                 config = self._request(base + "/api/config")

@@ -64,7 +64,7 @@ const MissionObservability = (() => {
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
 
-const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0};
+const state = {fleet: [], config: null, filter: "all", query: "", selected: null, snapshot: null, evidence: [], stream: null, restarting: false, attention: MissionAttention.createTracker(), attentionReturnFocus: null, viewGeneration: 0, outcomes: {tracker: MissionOutcomes.createSemanticTracker(), projection: null, integrity: "missing", filters: {query: "", type: "all", state: "all", owner: "all", terminal: "all"}}};
 const $ = id => document.getElementById(id);
 const numeric = value => Number.isFinite(Number(value)) ? Number(value) : 0;
 const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({
@@ -206,6 +206,20 @@ function openAttentionInbox() {
   });
 }
 
+function activateDetailTab(tab, {focus = false} = {}) {
+  if (!tab) return false;
+  const tablist = tab.closest('[role="tablist"]');
+  tablist.querySelectorAll('[role="tab"]').forEach(item => {
+    const active = item === tab;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-selected", String(active));
+    item.tabIndex = active ? 0 : -1;
+  });
+  document.querySelectorAll("#view-detail .tabpane").forEach(item => item.classList.toggle("active", item.id === `tab-${tab.dataset.tab}`));
+  if (focus) tab.focus({preventScroll: true});
+  return true;
+}
+
 function activate(element) {
   const restart = element.closest("#restartService, [data-restart-service]");
   if (restart) { restartService(); return true; }
@@ -231,6 +245,16 @@ function activate(element) {
   }
   const knowledgeCopy = element.closest("[data-knowledge-copy]");
   if (knowledgeCopy) { copyText(knowledgeCopy.dataset.knowledgeCopy, "Content hash copied."); return true; }
+  const outcomeTab = element.closest("[data-outcome-tab]");
+  if (outcomeTab) return activateDetailTab($(`tab-button-${outcomeTab.dataset.outcomeTab}`), {focus: true});
+  const outcomeParent = element.closest("[data-outcome-parent]");
+  if (outcomeParent) {
+    state.outcomes.filters.query = outcomeParent.dataset.outcomeParent;
+    $("outcomeSearch").value = state.outcomes.filters.query;
+    renderOutcomeProjection();
+    $("outcomeSearch").focus({preventScroll: true});
+    return true;
+  }
   if (element.closest("#copyMemoryContext")) { copyMemoryContext(); return true; }
   const evidenceAction = element.closest("[data-evidence-action]");
   if (evidenceAction) { updateEvidence(evidenceAction.dataset.evidenceId, evidenceAction.dataset.evidenceAction); return true; }
@@ -247,16 +271,7 @@ function activate(element) {
     return true;
   }
   const tab = element.closest("[data-tab]");
-  if (tab) {
-    document.querySelectorAll(".tab").forEach(item => {
-      const active = item === tab;
-      item.classList.toggle("active", active);
-      item.setAttribute("aria-selected", String(active));
-      item.tabIndex = active ? 0 : -1;
-    });
-    document.querySelectorAll(".tabpane").forEach(item => item.classList.toggle("active", item.id === `tab-${tab.dataset.tab}`));
-    return true;
-  }
+  if (tab) return activateDetailTab(tab);
   return false;
 }
 
@@ -275,6 +290,29 @@ document.addEventListener("keydown", event => {
     else index = (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
     event.preventDefault(); tabs[index].focus(); activate(tabs[index]);
   }
+  if (event.key === "/" && $("tab-outcomes").classList.contains("active") && !event.target.matches("input, textarea, select")) {
+    event.preventDefault(); $("outcomeSearch").focus();
+  }
+});
+
+document.addEventListener("input", event => {
+  if (event.target.id !== "outcomeSearch") return;
+  state.outcomes.filters.query = event.target.value;
+  renderOutcomeProjection();
+});
+
+document.addEventListener("change", event => {
+  const names = {outcomeType: "type", outcomeState: "state", outcomeOwner: "owner", outcomeTerminal: "terminal"};
+  const name = names[event.target.id];
+  if (!name) return;
+  state.outcomes.filters[name] = event.target.value;
+  renderOutcomeProjection();
+});
+
+document.addEventListener("reset", event => {
+  if (event.target.id !== "outcomeFilters") return;
+  state.outcomes.filters = {query: "", type: "all", state: "all", owner: "all", terminal: "all"};
+  requestAnimationFrame(() => renderOutcomeProjection());
 });
 
 function statusRank(status) {
@@ -374,6 +412,10 @@ async function resolveDecision(runId, questionId, answer) {
 
 async function openRun(runId) {
   try {
+    state.outcomes.tracker.reset();
+    state.outcomes.projection = null;
+    state.outcomes.integrity = "missing";
+    state.outcomes.filters = {query: "", type: "all", state: "all", owner: "all", terminal: "all"};
     state.selected = runId;
     const [snapshot, reportPayload, evidence, dossierPayload] = await Promise.all([
       api(`/api/runs/${encodeURIComponent(runId)}`),
@@ -560,6 +602,79 @@ function renderDossiers(snapshot) {
   }).join("") : `<div class="knowledge-empty"><b>No proof dossiers published</b>A dossier appears only after every required file is materialized and its anchored bundle verifies.</div>`;
 }
 
+const OUTCOME_TYPES = {
+  run: ["RUN", "◆"], worker: ["WORKER", "◉"], "work-item": ["WORK", "▤"],
+  hypothesis: ["HYPOTHESIS", "◇"], finding: ["FINDING", "◈"],
+  validation: ["VALIDATION", "✓"], "proof-bundle": ["PROOF", "⬡"],
+  "operator-decision": ["DECISION", "!"],
+};
+
+const outcomeFacetTerminal = facet => facet?.terminal && facet.state !== "not-applicable";
+const outcomeRaw = facet => facet && facet.rawState !== null
+  && ["string", "number", "boolean"].includes(typeof facet.rawState)
+  && String(facet.rawState) !== String(facet.state)
+  ? `<span class="outcome-raw">raw ${esc(facet.rawState)}</span>` : "";
+
+function outcomeOption(value, current, label = value) {
+  return `<option value="${esc(value)}" ${value === current ? "selected" : ""}>${esc(label)}</option>`;
+}
+
+function outcomeCard(entity, index) {
+  const [label, icon] = OUTCOME_TYPES[entity.entityType] || [String(entity.entityType || "ENTITY").toUpperCase(), "·"];
+  const facets = MissionOutcomes.FACETS.map(name => [name, entity.facets?.[name]]);
+  const unknown = facets.some(([, facet]) => facet && (!facet.known || facet.state === "unknown"));
+  const diagnostics = entity.diagnostics || [];
+  const parent = entity.parent;
+  const link = MissionOutcomes.canonicalLink(entity);
+  return `<article class="outcome-card type-${esc(entity.entityType)} ${unknown || diagnostics.length ? "degraded" : ""}" style="--outcome-order:${Math.min(index, 12)}">
+    <header class="outcome-card-head"><div class="outcome-type-mark" aria-hidden="true"><i></i><span>${icon}</span></div><div class="outcome-identity"><span>${esc(label)}</span><h3>${esc(entity.entityId)}</h3>${parent ? `<button type="button" data-outcome-parent="${esc(parent.entityId)}" title="Filter to canonical parent"><small>↳ ${esc(parent.entityType)} / ${esc(parent.entityId)}</small></button>` : `<small>root entity</small>`}</div>${unknown || diagnostics.length ? `<span class="outcome-degraded-badge">degraded</span>` : ""}</header>
+    <div class="outcome-facets">${facets.map(([name, facet]) => {
+      if (!facet) return `<div class="outcome-facet unknown"><span>${esc(name)}</span><b>missing</b><small>owner unavailable</small></div>`;
+      const classes = [facet.known ? "known" : "unknown", facet.state === "not-applicable" ? "na" : "", outcomeFacetTerminal(facet) ? "terminal" : ""].filter(Boolean).join(" ");
+      return `<div class="outcome-facet ${classes}"><span>${esc(name)}${outcomeFacetTerminal(facet) ? `<i title="Canonical raw state is terminal">◆</i>` : ""}</span><b>${esc(facet.state)}</b>${outcomeRaw(facet)}<small>${esc(facet.owner)}</small></div>`;
+    }).join("")}</div>
+    ${(diagnostics.length || link) ? `<footer class="outcome-card-foot">${diagnostics.length ? `<span><b>${diagnostics.length}</b> diagnostic${diagnostics.length === 1 ? "" : "s"}</span>` : `<span>canonical projection</span>`}${link ? `<button class="btn" type="button" data-outcome-tab="${esc(link.tab)}">${esc(link.label)} →</button>` : ""}</footer>` : ""}
+  </article>`;
+}
+
+function renderOutcomeProjection() {
+  const projection = state.outcomes.projection;
+  const view = MissionOutcomes.projectionView(projection, state.outcomes.filters);
+  const counts = view.counts;
+  $("outcomeCount").textContent = counts.total;
+  $("outcomeType").innerHTML = outcomeOption("all", state.outcomes.filters.type, `All types · ${counts.total}`)
+    + view.options.types.map(type => outcomeOption(type, state.outcomes.filters.type, `${type} · ${counts.types[type]}`)).join("");
+  $("outcomeState").innerHTML = outcomeOption("all", state.outcomes.filters.state, "All states")
+    + view.options.states.map(value => outcomeOption(value, state.outcomes.filters.state)).join("");
+  $("outcomeOwner").innerHTML = outcomeOption("all", state.outcomes.filters.owner, "All owners")
+    + view.options.owners.map(value => outcomeOption(value, state.outcomes.filters.owner)).join("");
+  $("outcomeSummary").innerHTML = `<div><b>${counts.total}</b><span>entities</span></div><div><b>${counts.shown}</b><span>shown</span></div><div><b>${counts.terminal}</b><span>terminal</span></div><div class="${counts.unknown ? "warn" : ""}"><b>${counts.unknown}</b><span>unknown</span></div><div class="${counts.degraded ? "warn" : ""}"><b>${counts.degraded}</b><span>degraded</span></div>`;
+  const diagnostics = Array.isArray(projection?.diagnostics) ? projection.diagnostics : [];
+  let integrity = "";
+  if (state.outcomes.integrity === "missing") integrity = `<div class="outcome-alert neutral"><b>Outcome projection unavailable</b><span>This older snapshot has no canonical outcome surface.</span></div>`;
+  else if (state.outcomes.integrity === "legacy") integrity = `<div class="outcome-alert warn"><b>Legacy projection</b><span>No semanticSha256 was supplied; the projection remains visible without semantic update dedupe.</span></div>`;
+  else if (state.outcomes.integrity === "mismatch") integrity = `<div class="outcome-alert bad"><b>Semantic integrity mismatch</b><span>The claimed outcome identity did not match the canonical client-side digest.</span></div>`;
+  else if (state.outcomes.integrity === "unavailable") integrity = `<div class="outcome-alert warn"><b>Digest verification unavailable</b><span>The browser cannot verify SHA-256; canonical facets are shown with a bounded warning.</span></div>`;
+  else if (projection?.degraded) integrity = `<div class="outcome-alert warn"><b>Canonical projection is degraded</b><span>${diagnostics.length} diagnostic${diagnostics.length === 1 ? "" : "s"}; unknown and dangling states are preserved without inference.</span></div>`;
+  else integrity = `<div class="outcome-alert good"><b>Semantic projection verified</b><span>${esc(projection?.semanticSha256?.slice(0, 12) || "")}</span></div>`;
+  $("outcomeIntegrity").innerHTML = integrity;
+  const diagnosticHTML = diagnostics.length ? `<details class="outcome-diagnostics"><summary>${diagnostics.length} projection diagnostic${diagnostics.length === 1 ? "" : "s"}</summary><div>${diagnostics.map(item => `<article><b>${esc(item.code || "diagnostic")}</b><span>${esc(item.entityType || "projection")} / ${esc(item.entityId || "—")}${item.facet ? ` · ${esc(item.facet)}` : ""}</span><p>${esc(item.message || "Canonical projection reported a degraded state.")}</p></article>`).join("")}</div></details>` : "";
+  $("outcomeResults").innerHTML = diagnosticHTML + (view.entities.length
+    ? `<div class="outcome-grid">${view.entities.map(outcomeCard).join("")}</div>`
+    : `<div class="empty compact"><b>${counts.total ? "No outcomes match these filters" : "No canonical outcomes yet"}</b>${counts.total ? "Change type, state, owner, terminal, or search filters." : "The workspace stays empty until the run snapshot projects canonical entities."}</div>`);
+}
+
+async function renderOutcomes(snapshot) {
+  $("outcomeResults").setAttribute("aria-busy", "true");
+  const decision = await state.outcomes.tracker.accept(snapshot?.outcomeProjection);
+  if (decision.action === "stale") return;
+  $("outcomeResults").setAttribute("aria-busy", "false");
+  if (decision.action === "retain") return;
+  state.outcomes.projection = decision.projection;
+  state.outcomes.integrity = decision.integrity;
+  renderOutcomeProjection();
+}
+
 function renderDetail() {
   const snapshot = state.snapshot, run = snapshot.run, meta = snapshot.meta;
   const events = snapshot.events || [], artifacts = snapshot.artifacts || [], questions = snapshot.pendingQuestions || [];
@@ -575,6 +690,7 @@ function renderDetail() {
   renderMemory(snapshot);
   renderKnowledge(snapshot);
   renderDossiers(snapshot);
+  renderOutcomes(snapshot);
   $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
   renderEvidence();
   $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;
