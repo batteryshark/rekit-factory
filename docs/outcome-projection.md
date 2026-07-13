@@ -199,6 +199,23 @@ It is never parsed as an outcome transition. The full rebuild and selective incr
 derive the same report entity from the same canonical work-item result and remove it together
 when the result stops being report-shaped or its work item is removed.
 
+## Canonical investigation JSON export
+
+The terminal `reports/investigation.json` export carries the complete `outcomeProjection`,
+including `schemaVersion`, `vocabularyVersion`, `semanticCanonicalBase64`, and
+`semanticSha256`. Its SQLite inputs are captured in one read transaction after the terminal
+run transition and terminal event are committed; project memory remains the separately fsynced
+source described by the projection's consistency metadata. For the same completed source state,
+the export projection is byte-for-byte equal to the canonical run snapshot projection.
+
+Each item in the export's `workers` array is a canonical report consumer: `identity`, `facets`,
+and `diagnostics` come from the matching report entity. The nested `report` contains only the
+rendered summary, observations, and next actions. Model-authored `status_update` prose is moved
+to `workerNote`; the former ambiguous worker `status` field is not exported. Consumers must not
+parse `workerNote` or report prose to infer completion, disposition, validation, acceptance, or
+publication. A note that says “validated”, “solved”, or “accepted” leaves those canonical facets
+unchanged.
+
 The generic/SSE snapshot deliberately uses the cheap `dossier_list` publication projection.
 Every listed dossier therefore has `publication.state: published`, owned by the dossier
 publisher, regardless of its current verification result. Publication never becomes
@@ -251,6 +268,29 @@ This bounds stale-client recovery without treating an event ID as semantic ident
 a foreign cursor to skip current-run events. The old-stream identity and request-generation
 guards remain authoritative when delayed responses race a replacement stream.
 
+## Canonical notification candidate policy
+
+`rekit_factory.notification_policy.notification_candidates` is a pure old-to-new projection
+policy. Both observations must be intact `factory-outcomes/v1` projections: the policy checks
+the schema and vocabulary, recomputes `semanticSha256`, and verifies the exact
+`semanticCanonicalBase64` carrier before inspecting canonical facets. Initial hydration,
+semantic equality, and watermark-only movement emit no candidates.
+
+The v1 policy recognizes only three consequential thresholds: a newly waiting
+`operator-decision`, a finding newly reaching `validation: reproduced`, and a finding newly
+reaching `acceptance: accepted`. Candidate messages are fixed text. Payloads contain only the
+policy/schema versions, a hashed transition dedupe key, severity, safe opaque run/entity IDs,
+and canonical entity type. They never copy target paths, prompts, evidence, report summaries,
+worker notes, or diagnostics. Unsafe identifiers, unknown facets, and any degraded old or new
+projection fail closed with no candidate. A decision already resolved in the new observation
+does not become a waiting alert.
+
+This policy does not enqueue or deliver anything. Re-evaluating the same crossing yields the
+same dedupe key; replacing a projection with itself yields no candidate. Durable admission,
+transactional outbox state, retry, acknowledgement, supersession, batching, quiet hours,
+channels, and deep links remain W-0030 work and are not claimed by this slice.
+
 The in-memory incremental reference is not a production cache, durable accumulator, or SSE
-source. Reports now consume this canonical vocabulary; exports and notifications continue using
-their existing paths until a separate production design adopts the proven parity boundary.
+source. Reports and investigation exports now consume the canonical vocabulary, and the pure
+notification policy consumes verified projection transitions. Production notification delivery
+remains deferred to W-0030.

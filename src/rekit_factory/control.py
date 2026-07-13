@@ -393,8 +393,6 @@ class InvestigationController:
             coverage = ledger.coverage(paths.run_id)
             if termination.verdict == "complete":
                 DossierPublisher(paths, ledger, self.rekit).publish_ready()
-                report_path = _render_report(ledger, paths, meta)
-                ledger.add_report(paths.run_id, "json", report_path)
                 unsuccessful = coverage["failed"] + coverage["blocked"]
                 final_status = "failed" if unsuccessful else "completed"
                 ledger.finish_run(
@@ -411,6 +409,11 @@ class InvestigationController:
                     (termination.message if not unsuccessful
                      else f"Coverage drained with {unsuccessful} unsuccessful item(s)"),
                 )
+                # Render only after the terminal transition is committed so the export's
+                # canonical outcome projection describes the completed investigation rather
+                # than the immediately preceding running state.
+                report_path = _render_report(ledger, paths, meta)
+                ledger.add_report(paths.run_id, "json", report_path)
                 _write_status(paths, final_status)
             else:
                 ledger.set_run_status(paths.run_id, "blocked", error=termination.message)
@@ -2308,24 +2311,89 @@ def _tool_context(ledger: FactoryLedger, run_id: str, max_chars: int = 30_000,
 
 def _render_report(ledger: FactoryLedger, paths: RunPaths,
                    meta: dict[str, Any]) -> Path:
-    rows = ledger.conn.execute(
-        "select title, result_json, status from work_items "
-        "where run_id=? and operation='model-worker' order by created_at",
-        (paths.run_id,),
-    ).fetchall()
+    # Project memory is an independently fsynced source, just as it is for the canonical
+    # snapshot. SQLite-backed inputs are then captured under one read transaction.
+    project_memory = _project_memory_log(paths).replay()
+    memory_projection = project_memory.deterministic_dict()
+    if ledger.conn.in_transaction:
+        raise RuntimeError("investigation export requires a clean ledger connection")
+    ledger.conn.execute("begin")
+    try:
+        run = ledger.get_run(paths.run_id)
+        workers = ledger.workers(paths.run_id)
+        rows = ledger.conn.execute(
+            "select * from work_items where run_id=? order by priority desc, created_at",
+            (paths.run_id,),
+        ).fetchall()
+        work_items = []
+        for row in rows:
+            item = dict(row)
+            for source, target in (
+                ("payload_json", "payload"),
+                ("depends_on_json", "dependsOn"),
+                ("result_json", "result"),
+            ):
+                raw = item.pop(source)
+                item[target] = json.loads(raw) if raw else None
+            work_items.append(item)
+        dossiers = dossier_list(ledger, paths.run_id)
+        pending_questions = ledger.pending_questions(paths.run_id)
+        event_watermark_row = ledger.conn.execute(
+            "select coalesce(max(rowid), 0) as watermark "
+            "from factory_events where run_id=?", (paths.run_id,),
+        ).fetchone()
+        coverage = ledger.coverage(paths.run_id)
+    finally:
+        ledger.conn.rollback()
+
+    projection = project_outcomes(
+        run=dict(run) if run is not None else None,
+        workers=workers,
+        work_items=work_items,
+        memory=memory_projection,
+        dossiers=dossiers,
+        pending_questions=pending_questions,
+        source_watermarks={
+            "factoryEventRowid": int(event_watermark_row["watermark"]),
+            "memorySequence": project_memory.last_seq,
+        },
+    )
+    outcome_entities = {
+        (entity["entityType"], entity["entityId"]): entity
+        for entity in projection["entities"]
+    }
     reports = []
-    for row in rows:
+    for item in work_items:
+        if item.get("operation") != "model-worker" or not isinstance(item.get("result"), dict):
+            continue
+        outcome = outcome_entities.get(("report", str(item["id"])))
+        if outcome is None:
+            continue
+        result = item["result"]
         reports.append({
-            "worker": row["title"],
-            "status": row["status"],
-            "report": json.loads(row["result_json"]) if row["result_json"] else None,
+            "worker": item["title"],
+            "identity": {
+                "entityType": outcome["entityType"],
+                "entityId": outcome["entityId"],
+                "parent": outcome["parent"],
+            },
+            "facets": outcome["facets"],
+            "diagnostics": outcome["diagnostics"],
+            "report": {
+                "summary": result.get("summary"),
+                "observations": result.get("observations") or [],
+                "nextActions": result.get("next_actions") or result.get("nextActions") or [],
+            },
+            # Model prose remains useful context but has no outcome-transition authority.
+            "workerNote": result.get("status_update") or result.get("statusUpdate"),
         })
     payload = {
         "runId": paths.run_id,
         "target": meta["target"],
         "goal": meta["goal"],
         "workers": reports,
-        "coverage": ledger.coverage(paths.run_id),
+        "coverage": coverage,
+        "outcomeProjection": projection,
         "generatedAt": utcnow(),
     }
     report_path = paths.reports_dir / "investigation.json"

@@ -69,6 +69,16 @@ class FakeBackend:
         ), {"inputTokens": 10, "outputTokens": 5}
 
 
+class OutcomeClaimingBackend(FakeBackend):
+    async def analyze(self, *, role, **kwargs):
+        return WorkerReport(
+            summary="A model-authored investigation summary",
+            observations=["one observation"],
+            next_actions=["one next action"],
+            status_update="Validated, solved, and accepted by the operator.",
+        ), {"inputTokens": 3, "outputTokens": 4}
+
+
 class DeferredBackend(FakeBackend):
     def __init__(self, *, tool_id="fixture-scan"):
         super().__init__()
@@ -210,6 +220,52 @@ class ControlPlaneTests(unittest.TestCase):
             for path in run_dir.rglob("*"):
                 if path.is_file():
                     self.assertNotIn(b"never-persist-this-key", path.read_bytes())
+
+    def test_investigation_export_is_the_canonical_terminal_outcome_projection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs",
+                rekit=FakeRekit(),
+                workers=OutcomeClaimingBackend(),
+            )
+            completed = controller.run(RunRequest(
+                target=target,
+                goal="Prove export outcome semantics",
+                worker_roles=("analyst",),
+            ))
+
+            exported = json.loads(
+                (Path(completed["run"]["run_dir"]) / "reports" / "investigation.json")
+                .read_text(encoding="utf-8")
+            )
+            projection = exported["outcomeProjection"]
+            self.assertEqual(1, projection["schemaVersion"])
+            self.assertEqual("factory-outcomes/v1", projection["vocabularyVersion"])
+            self.assertRegex(projection["semanticSha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(completed["outcomeProjection"], projection)
+
+            run_outcome = next(
+                entity for entity in projection["entities"]
+                if entity["entityType"] == "run"
+            )
+            self.assertEqual("terminal", run_outcome["facets"]["execution"]["state"])
+            self.assertEqual("completed", run_outcome["facets"]["completion"]["state"])
+            self.assertEqual("successful", run_outcome["facets"]["disposition"]["state"])
+
+            self.assertEqual(1, len(exported["workers"]))
+            report = exported["workers"][0]
+            self.assertNotIn("status", report)
+            self.assertEqual("report", report["identity"]["entityType"])
+            self.assertEqual("work-item", report["identity"]["parent"]["entityType"])
+            self.assertEqual("rendered", report["facets"]["publication"]["state"])
+            self.assertEqual("not-applicable", report["facets"]["validation"]["state"])
+            self.assertEqual("not-applicable", report["facets"]["acceptance"]["state"])
+            self.assertEqual(
+                "Validated, solved, and accepted by the operator.", report["workerNote"]
+            )
+            self.assertNotIn("status_update", report["report"])
+            self.assertNotIn("statusUpdate", report["report"])
 
     def test_tool_evidence_projects_redacted_output_and_never_captures_cli_screenshots(self):
         with tempfile.TemporaryDirectory() as tmp:

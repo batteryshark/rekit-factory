@@ -93,6 +93,27 @@ materialized range history or exact evidence record, and evidence must resolve b
 successful execute request with matching node, handle, inputs, path, generation, and bytes. Exact
 retries after restart return or re-raise the recorded outcome without duplicating a lease.
 
+## Cleanup supervision
+
+`rekit_factory.range_supervisor` adds a provider-neutral reconciliation boundary above an
+adapter's independently durable lifecycle. It registers only a range identity and exact
+expiry time, plus an optional bounded cleanup reason; it has no provider credential,
+connection, host-path, provisioning, or execution fields.
+
+Every expiration or destruction effect uses a write-ahead ordering. The supervisor first
+atomically persists the pending operation kind, attempt, and stable operation ID, then calls
+the adapter, and only then persists an audit acknowledgement. A restart in the ambiguous
+window replays that exact operation ID. A new attempt ID is allocated only after a
+retryable adapter failure has itself been durably recorded. Non-retryable failures enter an
+inspectable blocked state rather than spinning or silently changing intent.
+
+The small POSIX state store rejects symlink roots and state files, non-regular or oversized
+state, invalid UTF-8, duplicate JSON keys, unknown fields, and inconsistent range identity.
+Writes use a mode-0600 temporary file, file `fsync`, atomic replacement, and directory
+`fsync`; a failed replacement retains the last good checkpoint. This storage makes the
+supervisor's intent durable. It does not substitute for adapter-side durable idempotency or
+prove that a provider performed a real expiration, reset, destruction, or secure disposal.
+
 ## Explicit nonclaims
 
 Passing either deterministic adapter lifecycle proves only deterministic contract
