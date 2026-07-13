@@ -36,12 +36,20 @@ local text or canonical-Base64 equality only to preserve DOM state, while contin
 their bounded warning. Run-open and SSE request generations prevent late network or hash
 responses from replacing a newer run snapshot.
 
-## Rendered audit still required
+## Rendered audit completed
 
-A live rendered comparison remains an integration gate because this branch does not create
-fake run data or mutate canonical outcome history merely to stage screenshots. Review a real
-populated run at desktop, narrow/mobile, and reduced-motion settings against the mockup,
-checking two-second type scanning, tab overflow, long canonical IDs, large histories, focus
-retention during watermark-only SSE updates, and contrast in degraded/unknown cards. That
-audit should use the actual loopback service and canonical snapshot, not a synthetic browser
-fixture.
+The integrated loopback service was reviewed against the canonical mockup at the normal desktop
+viewport and at 560×900 using real completed and failed README investigations. Both views showed
+an exact-byte **Semantic projection verified** state. The completed run rendered distinct run,
+work-item, and worker cards with execution, completion, and disposition visibly separate:
+`completed` never substituted for `successful`, and validation, acceptance, and publication
+remained independently not-applicable.
+
+The desktop layout retained the e7 density, layered framing, type signals, count band, controls,
+and two-column cards. At 560px the detail rail stacked, the tab strip used intentional horizontal
+overflow, controls collapsed, and outcome content remained legible without flattening the visual
+hierarchy. Search narrowed three cards to one, kept focus on `outcomeSearch`, and updated the
+bounded live announcement to “Showing 1 of 3 canonical outcomes”; reset restored all cards. The
+browser console had no warnings or errors. The environment did not expose reduced-motion media
+emulation, so that policy remains verified by the packaged global rule and deterministic source
+assertion rather than an emulated screenshot.

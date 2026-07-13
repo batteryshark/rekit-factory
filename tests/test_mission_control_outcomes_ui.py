@@ -94,5 +94,7 @@ def test_outcomes_source_comparison_keeps_mockup_as_visual_authority():
     ):
         assert live_extension in style
     assert "e7-mission-control-v3.html" in audit
-    assert "Rendered audit still required" in audit
-    assert "desktop, narrow/mobile, and reduced-motion" in audit
+    assert "Rendered audit completed" in audit
+    assert "normal desktop" in audit
+    assert "560×900" in audit
+    assert "reduced-motion" in audit
