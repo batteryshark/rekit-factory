@@ -483,7 +483,8 @@ def _run_dirs(storage_root: Path) -> list[Path]:
     if not storage_root.is_dir():
         return []
     return sorted(
-        (path.parent for path in storage_root.glob("projects/*/runs/*/run.json")),
+        (path.parent for path in storage_root.glob("projects/*/runs/*/run.json")
+         if _run_meta(path.parent).get("creationComplete") is not False),
         key=lambda path: path.name,
         reverse=True,
     )

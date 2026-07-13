@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 import shutil
-import tempfile
 import zipfile
-from typing import Any
+from typing import Any, Callable
 
 from muster import RunPaths
 
@@ -28,6 +28,13 @@ from rekit_factory.store import FactoryLedger
 
 class DossierNotReady(ValueError):
     pass
+
+
+class DossierPublicationInterrupted(RuntimeError):
+    """Deterministic process-crash stand-in used at filesystem publication boundaries."""
+
+
+DossierFaultInjector = Callable[[str], None]
 
 
 _DOSSIER_ARTIFACT_KINDS = {
@@ -111,10 +118,16 @@ def verify_published_dossier(run_dir: Path, dossier: dict[str, Any]):
 
 
 class DossierPublisher:
-    def __init__(self, paths: RunPaths, ledger: FactoryLedger, rekit: Any):
+    def __init__(self, paths: RunPaths, ledger: FactoryLedger, rekit: Any, *,
+                 fault_injector: DossierFaultInjector | None = None):
         self.paths, self.ledger, self.rekit = paths, ledger, rekit
         self.memory_log = ProjectMemoryLog(paths.run_dir.parents[1])
         self.evidence = EvidenceStore(paths.run_dir / "evidence")
+        self._fault_injector = fault_injector
+
+    def _checkpoint(self, boundary: str) -> None:
+        if self._fault_injector is not None:
+            self._fault_injector(boundary)
 
     def publish_ready(self) -> list[dict[str, Any]]:
         memory = self.memory_log.replay()
@@ -136,20 +149,34 @@ class DossierPublisher:
         root = self.paths.run_dir / "dossiers"
         root.mkdir(parents=True, exist_ok=True)
         final = root / sealed.manifest_sha256
-        if not final.is_dir():
-            staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=root))
+        staging = root / f".staging-{sealed.manifest_sha256}"
+        if final.exists() and not final.is_dir():
+            raise DossierNotReady("content-addressed dossier path is not a directory")
+        if not final.exists():
+            # A prior process may have stopped anywhere before the final rename.  This
+            # staging name is scoped to the content identity, so removing it cannot
+            # disturb a different dossier or shadow a valid final directory.
+            if staging.exists():
+                if not staging.is_dir():
+                    raise DossierNotReady("content-addressed dossier staging path is unsafe")
+                shutil.rmtree(staging)
+            staging.mkdir()
+            interrupted = False
             try:
                 for artifact in manifest.artifacts:
                     if isinstance(artifact, IncludedArtifact):
                         destination = staging / artifact.path
                         destination.parent.mkdir(parents=True, exist_ok=True)
-                        destination.write_bytes(included_bytes[artifact.citation_id])
-                (staging / "manifest.json").write_text(
-                    canonical_manifest_json(manifest), encoding="utf-8"
+                        _durable_write(destination, included_bytes[artifact.citation_id])
+                        self._checkpoint(f"included-artifact:{artifact.path}")
+                _durable_write(
+                    staging / "manifest.json", canonical_manifest_json(manifest).encode("utf-8"),
                 )
-                (staging / "proof.json").write_text(
-                    canonical_bundle_json(sealed), encoding="utf-8"
+                self._checkpoint("manifest")
+                _durable_write(
+                    staging / "proof.json", canonical_bundle_json(sealed).encode("utf-8"),
                 )
+                self._checkpoint("proof")
                 verification = verify_bundle(
                     staging / "proof.json", expected_scope_digest=manifest.scope.digest,
                     expected_scope_revision=manifest.scope.revision,
@@ -157,24 +184,31 @@ class DossierPublisher:
                 )
                 if not verification.valid or not verification.trust_anchor_verified:
                     raise DossierNotReady("staged dossier did not pass anchored verification")
-                (staging / "report.md").write_text(
-                    render_markdown(manifest, verification), encoding="utf-8"
+                self._checkpoint("staged-verification")
+                _durable_write(
+                    staging / "report.md", render_markdown(manifest, verification).encode("utf-8"),
                 )
-                (staging / "report.html").write_text(
-                    render_html(manifest, verification), encoding="utf-8"
+                self._checkpoint("markdown-report")
+                _durable_write(
+                    staging / "report.html", render_html(manifest, verification).encode("utf-8"),
                 )
+                self._checkpoint("html-report")
                 _write_deterministic_zip(staging, staging / "dossier.zip")
+                self._checkpoint("zip")
+                _verify_materialized_dossier(staging, manifest, sealed.manifest_sha256)
+                _fsync_directory(staging)
                 os.replace(staging, final)
+                _fsync_directory(root)
+                self._checkpoint("final-rename")
+            except DossierPublicationInterrupted:
+                interrupted = True
+                raise
             finally:
-                if staging.exists():
+                if staging.exists() and not interrupted:
                     shutil.rmtree(staging)
-        verification = verify_bundle(
-            final / "proof.json", expected_scope_digest=manifest.scope.digest,
-            expected_scope_revision=manifest.scope.revision,
-            expected_finding_state_sha256=manifest.finding_state_sha256,
+        verification = _verify_materialized_dossier(
+            final, manifest, sealed.manifest_sha256,
         )
-        if not verification.valid or not verification.trust_anchor_verified:
-            raise DossierNotReady("materialized dossier is not currently valid")
         records = [
             _record(final / "proof.json", "proof-bundle", "proof.json", "application/json"),
             _record(final / "manifest.json", "proof-manifest", "manifest.json", "application/json"),
@@ -188,6 +222,7 @@ class DossierPublisher:
             "findingStateSha256": manifest.finding_state_sha256,
             "verdict": manifest.validation_verdict, "findingStatus": manifest.finding_status,
         }
+        self._checkpoint("before-sql-publication")
         self.ledger.publish_dossier(
             self.paths.run_id, finding_id=finding_id,
             manifest_sha256=sealed.manifest_sha256, records=records, metadata=metadata,
@@ -626,9 +661,82 @@ def _event_time(path: Path, sequence: int) -> str:
 
 def _write_deterministic_zip(root: Path, destination: Path) -> None:
     paths = sorted(path for path in root.rglob("*") if path.is_file() and path != destination)
-    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    _durable_write(destination, _deterministic_zip_bytes(root, paths))
+
+
+def _deterministic_zip_bytes(root: Path, paths: list[Path]) -> bytes:
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in paths:
             info = zipfile.ZipInfo(path.relative_to(root).as_posix(), (1980, 1, 1, 0, 0, 0))
             info.external_attr = 0o100644 << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, path.read_bytes())
+    return output.getvalue()
+
+
+def _durable_write(path: Path, data: bytes) -> None:
+    """Write one dossier member durably before its publication checkpoint."""
+    with path.open("wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _verify_materialized_dossier(root: Path, manifest: ProofManifest,
+                                 manifest_sha256: str):
+    """Fail closed unless every canonical final-directory member is byte exact."""
+    try:
+        verification = verify_bundle(
+            root / "proof.json", expected_scope_digest=manifest.scope.digest,
+            expected_scope_revision=manifest.scope.revision,
+            expected_finding_state_sha256=manifest.finding_state_sha256,
+        )
+        if not verification.valid or not verification.trust_anchor_verified:
+            raise DossierNotReady("materialized dossier is not currently valid")
+        if verification.manifest_sha256 != manifest_sha256:
+            raise DossierNotReady("materialized dossier has a conflicting content identity")
+        expected = {
+            "manifest.json": canonical_manifest_json(manifest).encode("utf-8"),
+            "proof.json": canonical_bundle_json(seal_manifest(manifest)).encode("utf-8"),
+            "report.md": render_markdown(manifest, verification).encode("utf-8"),
+            "report.html": render_html(manifest, verification).encode("utf-8"),
+        }
+        for name, data in expected.items():
+            if (root / name).read_bytes() != data:
+                raise DossierNotReady(f"materialized dossier {name} is not canonical")
+        expected_members = sorted([
+            *expected,
+            *(artifact.path for artifact in manifest.artifacts
+              if isinstance(artifact, IncludedArtifact)),
+        ])
+        disk_members = sorted(
+            path.relative_to(root).as_posix() for path in root.rglob("*")
+            if path.is_file() and path.name != "dossier.zip"
+        )
+        if disk_members != expected_members:
+            raise DossierNotReady("materialized dossier file set is not canonical")
+        if ((root / "dossier.zip").read_bytes()
+                != _deterministic_zip_bytes(root, [root / name for name in expected_members])):
+            raise DossierNotReady("materialized dossier ZIP bytes are not canonical")
+        with zipfile.ZipFile(root / "dossier.zip") as archive:
+            names = archive.namelist()
+            if names != disk_members or len(names) != len(set(names)):
+                raise DossierNotReady("materialized dossier ZIP member set is not canonical")
+            for name in names:
+                if archive.read(name) != (root / name).read_bytes():
+                    raise DossierNotReady("materialized dossier ZIP content is not canonical")
+    except DossierNotReady:
+        raise
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise DossierNotReady("materialized dossier is incomplete or malformed") from exc
+    return verification

@@ -20,6 +20,7 @@ from rekit_factory.remote import (
 from rekit_factory.scope import (
     ActionAuthority, author_scope, hash_path,
 )
+from rekit_factory.store import FactoryLedger
 from rekit_factory.tool_routing import (
     RemoteWorkerBinding, ToolRoute, ToolWorkerRouter, WorkerRequirements,
 )
@@ -131,6 +132,49 @@ class FakeBackend:
 
 
 class ToolRoutingTests(unittest.TestCase):
+    def test_restart_reconciles_captured_tool_evidence_without_reinvoking_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "fixture.txt"
+            target.write_text("fixture", encoding="utf-8")
+            target_hash = hash_path(target)
+            transport = FakeTransport("analysis-worker")
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    transport, {target_hash: "input/staged/fixture.txt"},
+                ),),
+            )
+            run_dir = controller.create(RunRequest(
+                target, "scan", tools=("scan",), worker_roles=("analyst",),
+            ))
+            original = FactoryLedger.complete_tool_evidence_publication
+            crashed = False
+
+            def crash_once(ledger, *args, **kwargs):
+                nonlocal crashed
+                if not crashed:
+                    crashed = True
+                    raise SystemExit("publication boundary crash")
+                return original(ledger, *args, **kwargs)
+
+            with patch.object(FactoryLedger, "complete_tool_evidence_publication", crash_once):
+                with self.assertRaisesRegex(SystemExit, "publication boundary crash"):
+                    asyncio.run(controller.drive(run_dir))
+            self.assertEqual(1, len(transport.requests))
+
+            resumed = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+                remote_tool_workers=(RemoteWorkerBinding(
+                    transport, {target_hash: "input/staged/fixture.txt"},
+                ),),
+            )
+            snapshot = asyncio.run(resumed.drive(run_dir))
+            self.assertEqual(1, len(transport.requests))
+            tool = next(item for item in snapshot["workItems"]
+                        if item["operation"] == "rekit-tool")
+            self.assertEqual("done", tool["status"])
+            self.assertEqual(2, len(snapshot["artifacts"]))
+
     def test_cli_rejects_non_string_staged_target_values(self):
         args = parser().parse_args(["serve", "--remote-worker-env", "LABWORKER"])
         environment = {

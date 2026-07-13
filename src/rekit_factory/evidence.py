@@ -487,6 +487,44 @@ class EvidenceStore:
             ).fetchone()
         return self._record(row) if row else None
 
+    def tool_record(self, *, run_id: str, invocation_id: str,
+                    work_item_id: str) -> EvidenceRecord | None:
+        """Return the canonical tool-output capture for an authorized invocation."""
+        matches = []
+        with self._connect() as connection:
+            rows = connection.execute(
+                "select * from evidence_artifacts where run_id=? and kind='tool-output' "
+                "order by created_at, artifact_id", (run_id,),
+            ).fetchall()
+        for row in rows:
+            provenance = json.loads(row["provenance_json"])
+            if (provenance.get("invocation_id") == invocation_id
+                    and provenance.get("work_item_id") == work_item_id):
+                matches.append(row)
+        if len(matches) > 1:
+            raise ValueError("conflicting evidence rows for authorized invocation")
+        return self._record(matches[0]) if matches else None
+
+    def reconcile_capture_audit(self, artifact_id: str) -> AuditEvent:
+        """Verify canonical bytes and idempotently restore a missing capture audit."""
+        record = self._required(artifact_id)
+        if not self.verify(artifact_id):
+            raise ValueError("canonical evidence bytes are missing or conflicting")
+        with self._connect() as connection:
+            row = connection.execute(
+                "select * from evidence_audit where run_id=? and artifact_id=? "
+                "and action=? order by sequence limit 1",
+                (record.run_id, artifact_id, AuditAction.CAPTURED.value),
+            ).fetchone()
+        if row is not None:
+            return self._event(row)
+        return self._audit(
+            record.run_id, AuditAction.CAPTURED, artifact_id, "material retained",
+            {"rawSha256": record.raw_sha256,
+             "displaySha256": record.display_sha256, "kind": record.kind},
+            record.provenance.captured_at,
+        )
+
     def list_records(self, run_id: str) -> tuple[EvidenceRecord, ...]:
         with self._connect() as connection:
             rows = connection.execute(

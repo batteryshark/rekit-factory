@@ -4,6 +4,7 @@ from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +19,8 @@ from muster import resolve_run_dir, stable_key, utcnow
 from rekit_factory.control import InvestigationController, RunRequest, _project_memory_log
 from rekit_factory.api import FactoryServer
 from rekit_factory.dossiers import (
-    DossierNotReady, DossierPublisher, dossier_list, verify_published_dossier,
+    DossierNotReady, DossierPublicationInterrupted, DossierPublisher, dossier_list,
+    verify_published_dossier,
 )
 from rekit_factory.evidence import EvidenceStore, Provenance
 from rekit_factory.findings import (
@@ -396,6 +398,101 @@ def test_dossier_publication_crash_rolls_back_visibility_and_retries_exactly(
             (paths.run_id,),
         ).fetchone()[0] == 1
     assert {path.name: path.read_bytes() for path in root.iterdir() if path.is_file()} == sealed_bytes
+
+
+_FILESYSTEM_PUBLICATION_BOUNDARIES = (
+    "included-artifact", "manifest", "proof", "staged-verification",
+    "markdown-report", "html-report", "zip", "final-rename", "before-sql-publication",
+)
+
+
+@pytest.mark.parametrize("failure_boundary", _FILESYSTEM_PUBLICATION_BOUNDARIES)
+def test_dossier_filesystem_crash_reconciles_without_partial_sql_visibility(
+    tmp_path, failure_boundary,
+):
+    _controller, paths, dossier, _snapshot, _unrelated, rekit = _published_fixture(tmp_path)
+    final = paths.run_dir / "dossiers" / dossier["manifestSha256"]
+    sealed_bytes = {
+        path.relative_to(final).as_posix(): path.read_bytes()
+        for path in final.rglob("*") if path.is_file()
+    }
+    with FactoryLedger(paths.db_path) as ledger:
+        with ledger.conn:
+            ledger.conn.execute(
+                "delete from artifacts where run_id=? and origin='proof-dossier'",
+                (paths.run_id,),
+            )
+            ledger.conn.execute(
+                "delete from factory_events where run_id=? and kind='dossier.published'",
+                (paths.run_id,),
+            )
+        shutil.rmtree(final)
+        seen = []
+
+        def interrupt(boundary):
+            seen.append(boundary)
+            if (boundary == failure_boundary
+                    or (failure_boundary == "included-artifact"
+                        and boundary.startswith("included-artifact:"))):
+                raise DossierPublicationInterrupted(f"injected crash after {boundary}")
+
+        with pytest.raises(DossierPublicationInterrupted, match="injected crash"):
+            DossierPublisher(
+                paths, ledger, rekit, fault_injector=interrupt,
+            ).publish("f-fixture")
+        assert any(
+            boundary == failure_boundary
+            or (failure_boundary == "included-artifact"
+                and boundary.startswith("included-artifact:"))
+            for boundary in seen
+        )
+        assert dossier_list(ledger, paths.run_id, run_dir=paths.run_dir) == []
+        assert ledger.conn.execute(
+            "select count(*) from artifacts where run_id=? and origin='proof-dossier'",
+            (paths.run_id,),
+        ).fetchone()[0] == 0
+        assert ledger.conn.execute(
+            "select count(*) from factory_events where run_id=? and kind='dossier.published'",
+            (paths.run_id,),
+        ).fetchone()[0] == 0
+
+        recovered = DossierPublisher(paths, ledger, rekit).publish("f-fixture")
+        assert recovered["manifestSha256"] == dossier["manifestSha256"]
+        assert ledger.conn.execute(
+            "select count(*) from artifacts where run_id=? and origin='proof-dossier'",
+            (paths.run_id,),
+        ).fetchone()[0] == 5
+        assert ledger.conn.execute(
+            "select count(*) from factory_events where run_id=? and kind='dossier.published'",
+            (paths.run_id,),
+        ).fetchone()[0] == 1
+    assert not any(path.name.startswith(".staging-") for path in final.parent.iterdir())
+    assert {
+        path.relative_to(final).as_posix(): path.read_bytes()
+        for path in final.rglob("*") if path.is_file()
+    } == sealed_bytes
+
+
+def test_unpublished_conflicting_final_directory_fails_closed_without_overwrite(tmp_path):
+    _controller, paths, dossier, _snapshot, _unrelated, rekit = _published_fixture(tmp_path)
+    final = paths.run_dir / "dossiers" / dossier["manifestSha256"]
+    report = final / "report.md"
+    with FactoryLedger(paths.db_path) as ledger:
+        with ledger.conn:
+            ledger.conn.execute(
+                "delete from artifacts where run_id=? and origin='proof-dossier'",
+                (paths.run_id,),
+            )
+            ledger.conn.execute(
+                "delete from factory_events where run_id=? and kind='dossier.published'",
+                (paths.run_id,),
+            )
+        report.write_bytes(report.read_bytes() + b"\nconflicting bytes\n")
+        conflicting = report.read_bytes()
+        with pytest.raises(DossierNotReady, match="report.md is not canonical"):
+            DossierPublisher(paths, ledger, rekit).publish("f-fixture")
+        assert report.read_bytes() == conflicting
+        assert dossier_list(ledger, paths.run_id, run_dir=paths.run_dir) == []
 
 
 def test_resealed_dossier_cannot_replace_the_published_content_identity(tmp_path):

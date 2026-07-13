@@ -14,7 +14,13 @@ from urllib.request import Request, urlopen
 
 from rekit_factory.api import FactoryServer, _event_batch
 from rekit_factory.campaign_lifecycle import ARCHIVE_AUTHORITY, CampaignLifecycleStore
-from rekit_factory.control import InvestigationController, RunRequest
+from rekit_factory.control import (
+    TERMINAL_PUBLICATION_BOUNDARIES,
+    InvestigationController,
+    RunRequest,
+    TerminalPublicationConflict,
+    reconcile_terminal_publications,
+)
 from rekit_factory.dossiers import dossier_list as canonical_dossier_list
 from rekit_factory.evidence import EvidenceStore, Provenance, hash_target
 from rekit_factory.models import (
@@ -279,6 +285,129 @@ class ControlPlaneTests(unittest.TestCase):
             )
             self.assertNotIn("status_update", report["report"])
             self.assertNotIn("statusUpdate", report["report"])
+
+    def test_terminal_publication_reconciles_after_every_actual_commit_boundary(self):
+        for boundary in TERMINAL_PUBLICATION_BOUNDARIES:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                target = self._fixture(tmp)
+
+                def interrupt(observed, *, selected=boundary):
+                    if observed == selected:
+                        raise RuntimeError(f"injected terminal crash after {selected}")
+
+                storage = Path(tmp) / "runs"
+                controller = InvestigationController(
+                    storage_root=storage, rekit=FakeRekit(), workers=FakeBackend(),
+                    terminal_fault_injector=interrupt,
+                )
+                with self.assertRaisesRegex(RuntimeError, boundary):
+                    controller.run(RunRequest(
+                        target=target, goal="Exercise terminal recovery",
+                        worker_roles=("analyst",),
+                    ))
+                run_dir = next(storage.glob("projects/*/runs/*"))
+
+                first = reconcile_terminal_publications(run_dir)
+                second = reconcile_terminal_publications(run_dir)
+                self.assertEqual(first, second)
+                with FactoryLedger(run_dir / "run.db") as ledger:
+                    events = [event for event in ledger.events(first["runId"])
+                              if event["kind"].startswith("run.")
+                              and event["kind"] not in {"run.created", "run.started"}]
+                    report_rows = ledger.conn.execute(
+                        "select * from reports where run_id=? and format='json'",
+                        (first["runId"],),
+                    ).fetchall()
+                self.assertEqual(1, len(events))
+                self.assertEqual("run.completed", events[0]["kind"])
+                self.assertEqual(1, len(report_rows))
+                self.assertEqual(
+                    "completed",
+                    json.loads((run_dir / "run.json").read_text())["status"],
+                )
+
+    def test_terminal_rebuild_restores_deleted_or_corrupt_derived_material(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+            )
+            completed = controller.run(RunRequest(
+                target=target, goal="Exercise deterministic terminal rebuild",
+                worker_roles=("analyst",),
+            ))
+            run_dir = Path(completed["run"]["run_dir"])
+            report_path = run_dir / "reports" / "investigation.json"
+            original = json.loads(report_path.read_text())
+            original_semantic_sha = original["outcomeProjection"]["semanticSha256"]
+            original_generated_at = original["generatedAt"]
+            original_dossiers = completed["dossiers"]
+
+            report_path.write_text("{corrupt", encoding="utf-8")
+            meta = json.loads((run_dir / "run.json").read_text())
+            meta["status"] = "running"
+            (run_dir / "run.json").write_text(json.dumps(meta), encoding="utf-8")
+            with FactoryLedger(run_dir / "run.db") as ledger:
+                ledger.conn.execute(
+                    "delete from reports where run_id=?", (completed["run"]["id"],),
+                )
+                ledger.conn.execute(
+                    "update runs set coverage_json='null', summary_json='not-json' where id=?",
+                    (completed["run"]["id"],),
+                )
+                ledger.conn.commit()
+
+            repaired = reconcile_terminal_publications(run_dir)
+            rebuilt = json.loads(report_path.read_text())
+            snapshot = controller.snapshot(run_dir)
+            self.assertEqual(original_semantic_sha, repaired["outcomeSemanticSha256"])
+            self.assertEqual(original_semantic_sha,
+                             rebuilt["outcomeProjection"]["semanticSha256"])
+            self.assertEqual(original_generated_at, rebuilt["generatedAt"])
+            self.assertEqual(original_dossiers, snapshot["dossiers"])
+            self.assertEqual("completed", snapshot["meta"]["status"])
+            self.assertIsInstance(json.loads(snapshot["run"]["coverage_json"]), dict)
+            self.assertIsInstance(json.loads(snapshot["run"]["summary_json"]), dict)
+
+            # Deleting only the registry preserves and re-registers verified report bytes.
+            preserved = report_path.read_bytes()
+            with FactoryLedger(run_dir / "run.db") as ledger:
+                ledger.conn.execute(
+                    "delete from reports where run_id=?", (completed["run"]["id"],),
+                )
+                ledger.conn.commit()
+            reconcile_terminal_publications(run_dir)
+            self.assertEqual(preserved, report_path.read_bytes())
+
+    def test_terminal_reconcile_fails_closed_on_export_or_reason_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = self._fixture(tmp)
+            controller = InvestigationController(
+                storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
+            )
+            completed = controller.run(RunRequest(
+                target=target, goal="Exercise terminal conflict diagnostics",
+                worker_roles=("analyst",),
+            ))
+            run_dir = Path(completed["run"]["run_dir"])
+            report_path = run_dir / "reports" / "investigation.json"
+            conflicting = json.loads(report_path.read_text())
+            conflicting["goal"] = "noncanonical replacement"
+            report_path.write_text(json.dumps(conflicting), encoding="utf-8")
+            with self.assertRaisesRegex(TerminalPublicationConflict, "contradicts"):
+                reconcile_terminal_publications(run_dir)
+
+            # The conflict above must not mutate canonical state; now prove a contradictory
+            # terminal reason is independently rejected.
+            with FactoryLedger(run_dir / "run.db") as ledger:
+                ledger.conn.execute(
+                    "update factory_events set message='different terminal reason' "
+                    "where run_id=? and kind='run.completed'",
+                    (completed["run"]["id"],),
+                )
+                ledger.conn.commit()
+            with self.assertRaisesRegex(TerminalPublicationConflict, "terminal event"):
+                reconcile_terminal_publications(run_dir)
 
     def test_snapshot_reads_archive_only_from_atomic_project_lifecycle_authority(self):
         with tempfile.TemporaryDirectory() as tmp:

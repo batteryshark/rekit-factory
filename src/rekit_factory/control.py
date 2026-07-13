@@ -11,7 +11,7 @@ from pathlib import Path
 import platform
 import re
 from types import SimpleNamespace
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from muster import (
     AsyncWorkDispatcher,
@@ -111,6 +111,21 @@ MAX_KNOWLEDGE_BODY = 12_000
 MAX_PROFILE_ERROR_NAME = 96
 MAX_ERROR_CONCURRENCY = 999_999
 
+TERMINAL_PUBLICATION_BOUNDARIES = (
+    "terminal-run-commit",
+    "terminal-event",
+    "report-atomic-replace",
+    "report-row-insert",
+    "run-status-mirror-replace",
+)
+
+
+class TerminalPublicationConflict(RuntimeError):
+    """A valid-looking derived terminal record contradicts canonical run state."""
+
+
+TerminalFaultInjector = Callable[[str], None]
+
 
 def enforce_model_profile_concurrency(profile: ModelProfile, requested: int) -> None:
     """Reject worker fan-out above ``profile`` without disclosing private config."""
@@ -189,9 +204,13 @@ class InvestigationController:
                  workers: WorkerBackend | dict[str, WorkerBackend],
                  remote_tool_workers: tuple[RemoteWorkerBinding, ...] = (),
                  knowledge_roots: Iterable[KnowledgeRoot | str | Path] = (),
-                 safety_policies: SafetyPolicyCatalog | None = None):
+                 safety_policies: SafetyPolicyCatalog | None = None,
+                 terminal_fault_injector: TerminalFaultInjector | None = None,
+                 creation_fault_injector: Callable[[str], None] | None = None):
         self.storage_root = Path(storage_root).expanduser().resolve()
         self.rekit = rekit
+        self.terminal_fault_injector = terminal_fault_injector
+        self.creation_fault_injector = creation_fault_injector
         configured_knowledge = tuple(knowledge_roots)
         self.knowledge = KnowledgeCatalog(configured_knowledge) if configured_knowledge else None
         if isinstance(workers, dict):
@@ -214,6 +233,10 @@ class InvestigationController:
         self.tool_router = ToolWorkerRouter(
             LocalRekitWorker(rekit), remote_tool_workers,
         )
+
+    def _creation_checkpoint(self, boundary: str) -> None:
+        if self.creation_fault_injector is not None:
+            self.creation_fault_injector(boundary)
 
     @property
     def workers(self) -> WorkerBackend:
@@ -262,6 +285,8 @@ class InvestigationController:
         scope_path = paths.run_dir / "scope.json"
         if scope_path.is_file():
             scope = AuthorizedScope.from_dict(json.loads(scope_path.read_text(encoding="utf-8")))
+        elif "scope" in meta:
+            raise ValueError("durable run scope authority is missing")
         validate_policy_authority(
             policy, requested_tool_ids=tool_ids, manifests=manifests,
             ceilings=plan.ceilings, scope=scope,
@@ -276,7 +301,8 @@ class InvestigationController:
                 policy=policy, scope=scope,
             )
 
-    def create(self, request: RunRequest) -> Path:
+    def create(self, request: RunRequest, *,
+               _reconcile_run_dir: str | Path | None = None) -> Path:
         request = request.validate()
         policy = self.safety_policies.resolve(request.safety_policy_id)
         worker_backend = self._worker_backend_with_concurrency(
@@ -353,9 +379,14 @@ class InvestigationController:
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
         project_id, project_meta = compute_project_id(request.target)
-        run_id, run_hash = compute_run_id(project_id, request.target, config_hash)
-        paths = new_run_paths(self.storage_root, project_id, run_id, run_hash)
-        _ensure_project_campaign(paths, project_id)
+        if _reconcile_run_dir is None:
+            run_id, run_hash = compute_run_id(project_id, request.target, config_hash)
+            paths = new_run_paths(self.storage_root, project_id, run_id, run_hash)
+        else:
+            paths = resolve_run_dir(_reconcile_run_dir)
+            if paths.storage_root != self.storage_root or paths.project_id != project_id:
+                raise ValueError("run creation reconciliation target does not match its path")
+            run_id = paths.run_id
 
         meta = {
             "version": 1,
@@ -379,25 +410,58 @@ class InvestigationController:
             "project": project_meta,
             "status": "queued",
             "createdAt": utcnow(),
+            "creationComplete": False,
         }
-        atomic_write(paths.run_json, json.dumps(meta, indent=2, sort_keys=True) + "\n")
-        atomic_write(
-            paths.run_dir / "scope.json",
-            json.dumps(scope.to_dict(), indent=2, sort_keys=True) + "\n",
-        )
+        if paths.run_json.is_file():
+            existing_meta = _read_meta(paths)
+            _validate_creation_authority(existing_meta, meta)
+            meta["createdAt"] = existing_meta["createdAt"]
+            meta["status"] = existing_meta.get("status", "queued")
+            meta["creationComplete"] = bool(existing_meta.get("creationComplete", True))
+            if "updatedAt" in existing_meta:
+                meta["updatedAt"] = existing_meta["updatedAt"]
+        else:
+            atomic_write(paths.run_json, json.dumps(meta, indent=2, sort_keys=True) + "\n")
+        self._creation_checkpoint("run-authority")
+
+        scope_path = paths.run_dir / "scope.json"
+        scope_document = scope.to_dict()
+        if scope_path.is_file():
+            if json.loads(scope_path.read_text(encoding="utf-8")) != scope_document:
+                raise ValueError("persisted run scope conflicts with deterministic creation")
+        else:
+            atomic_write(
+                scope_path, json.dumps(scope_document, indent=2, sort_keys=True) + "\n",
+            )
+        self._creation_checkpoint("scope-authority")
+        _ensure_project_campaign(paths, project_id)
+        self._creation_checkpoint("campaign-authority")
 
         with FactoryLedger(paths.db_path) as ledger:
-            ledger.create_run(
-                run_id=run_id,
-                project_id=project_id,
-                target_path=str(request.target),
-                target_root=str(request.target),
-                storage_root=str(self.storage_root),
-                run_dir=str(paths.run_dir),
-                config_json=config_json,
-                max_iterations=100,
+            existing_run = ledger.get_run(run_id)
+            if existing_run is None:
+                ledger.create_run(
+                    run_id=run_id,
+                    project_id=project_id,
+                    target_path=str(request.target),
+                    target_root=str(request.target),
+                    storage_root=str(self.storage_root),
+                    run_dir=str(paths.run_dir),
+                    config_json=config_json,
+                    max_iterations=100,
+                )
+            else:
+                _validate_creation_run_row(
+                    existing_run, project_id=project_id, target=str(request.target),
+                    storage_root=str(self.storage_root), run_dir=str(paths.run_dir),
+                    config_json=config_json,
+                )
+            self._creation_checkpoint("run-row")
+            ledger.event_log_once(
+                run_id, f"run-created:{run_id}", "run.created",
+                "Investigation queued", payload=public_config,
             )
-            ledger.event_log(run_id, "run.created", "Investigation queued", payload=public_config)
+            self._creation_checkpoint("run-created-event")
             _project_memory_log(paths).append(MemoryAction(
                 "goal_set",
                 {
@@ -408,6 +472,7 @@ class InvestigationController:
                 },
                 action_id=f"run-goal:{run_id}",
             ))
+            self._creation_checkpoint("project-memory")
             tool_items = []
             for tool_id in request.tools:
                 manifest = self.rekit.manifest(tool_id)
@@ -424,14 +489,25 @@ class InvestigationController:
                              **route_payload, **_manifest_work_payload(manifest)},
                     state_label="queued",
                 ))
+                self._creation_checkpoint(f"tool-work:{tool_id}")
             item_ids: dict[str, str] = {}
             for planned in plan.work:
                 dependencies = tool_items + [item_ids[value] for value in planned.depends_on]
                 item_ids[planned.id] = self._enqueue_planned_worker(
                     ledger, run_id, str(request.target), worker_backend.profile.name,
                     request.model_tools, plan, planned, dependencies,
+                    creation_checkpoint=self._creation_checkpoint,
                 )
+        complete_meta = _read_meta(paths)
+        _validate_creation_authority(complete_meta, meta)
+        complete_meta["creationComplete"] = True
+        atomic_write(paths.run_json, json.dumps(complete_meta, indent=2, sort_keys=True) + "\n")
+        self._creation_checkpoint("creation-complete")
         return paths.run_dir
+
+    def reconcile_run_creation(self, run_dir: str | Path, request: RunRequest) -> Path:
+        """Idempotently finish one interrupted creation using the exact original authority."""
+        return self.create(request, _reconcile_run_dir=run_dir)
 
     def run(self, request: RunRequest) -> dict[str, Any]:
         run_dir = self.create(request)
@@ -505,22 +581,22 @@ class InvestigationController:
                     error=(f"{unsuccessful} terminal work item(s) were unsuccessful"
                            if unsuccessful else None),
                 )
-                ledger.event_log(
-                    paths.run_id,
-                    f"run.{final_status}",
-                    (termination.message if not unsuccessful
-                     else f"Coverage drained with {unsuccessful} unsuccessful item(s)"),
+                _inject_terminal_fault(self.terminal_fault_injector, "terminal-run-commit")
+                reconcile_terminal_publications(
+                    paths.run_dir, ledger=ledger,
+                    fault_injector=self.terminal_fault_injector,
                 )
-                # Render only after the terminal transition is committed so the export's
-                # canonical outcome projection describes the completed investigation rather
-                # than the immediately preceding running state.
-                report_path = _render_report(ledger, paths, meta)
-                ledger.add_report(paths.run_id, "json", report_path)
-                _write_status(paths, final_status)
             else:
-                ledger.set_run_status(paths.run_id, "blocked", error=termination.message)
-                ledger.event_log(paths.run_id, "run.blocked", termination.message)
-                _write_status(paths, "blocked")
+                ledger.finish_run(
+                    paths.run_id, "blocked", coverage=coverage,
+                    summary={"workers": len(ledger.workers(paths.run_id))},
+                    error=termination.message,
+                )
+                _inject_terminal_fault(self.terminal_fault_injector, "terminal-run-commit")
+                reconcile_terminal_publications(
+                    paths.run_dir, ledger=ledger,
+                    fault_injector=self.terminal_fault_injector,
+                )
             return self._snapshot_open(ledger, paths)
 
     def answer(self, run_dir: str | Path, question_id: str, answer: str,
@@ -883,6 +959,102 @@ class InvestigationController:
                 lease_id=lease.lease_id,
                 expected_manifest_digest=payload["manifestDigest"],
             )
+            staged = ledger.evidence_publication(call_id)
+            if staged is not None and staged["status"] == "staged":
+                expected_authority = {
+                    "approvalId": (qid if manifest.requires_permission and answer == "allow" else None),
+                    "declaredActions": [action.value for action in manifest.actions],
+                    "invocationId": invocation.invocation_id,
+                    "leaseId": lease.lease_id,
+                    "manifestDigest": payload["manifestDigest"],
+                    "scope": scope.to_dict(),
+                    "targetSha256": target_grant.content_sha256,
+                    "toolId": tool_id,
+                    "workerId": route.capabilities.worker_id,
+                }
+                if any(staged["authority"].get(key) != value
+                       for key, value in expected_authority.items()):
+                    raise ValueError("staged evidence publication authority conflicts with retry")
+                recovery_store = EvidenceStore(ctx.deps.paths.run_dir / "evidence")
+                recovered = recovery_store.tool_record(
+                    run_id=ctx.state.run_id, invocation_id=call_id,
+                    work_item_id=item["id"],
+                )
+                if recovered is not None:
+                    if (recovered.original_sha256 != staged["result_sha256"]
+                            or recovered.original_size != staged["result_size"]):
+                        raise ValueError("canonical evidence conflicts with staged tool result")
+                    recovery_store.reconcile_capture_audit(recovered.artifact_id)
+                    recovered_related = []
+                    recovered_events = [{
+                        "kind": "evidence.captured", "message": "material retained",
+                        "payload": {"artifactId": recovered.artifact_id,
+                                    "rawSha256": recovered.raw_sha256,
+                                    "displaySha256": recovered.display_sha256,
+                                    "kind": recovered.kind},
+                    }]
+                    remote_records = [record for record in recovery_store.list_records(
+                        ctx.state.run_id
+                    ) if record.kind == "remote-artifact"
+                        and record.provenance.invocation_id == call_id
+                        and record.provenance.work_item_id == item["id"]]
+                    for declared in staged["authority"].get("remoteArtifacts", []):
+                        candidates = [record for record in remote_records
+                                      if record.original_sha256 == declared["sha256"]]
+                        if len(candidates) != 1:
+                            raise ValueError("required remote evidence is missing or conflicting")
+                        remote_record = candidates[0]
+                        recovery_store.reconcile_capture_audit(remote_record.artifact_id)
+                        remote_path = recovery_store.root / remote_record.display_path
+                        recovered_related.append({
+                            "kind": "remote-artifact", "path": remote_path,
+                            "logicalPath": f"remote-artifact/{declared['path']}",
+                            "sha256": remote_record.display_sha256,
+                            "sizeBytes": remote_record.display_size,
+                            "mediaType": remote_record.media_type,
+                            "metadata": {"toolId": tool_id,
+                                         "declaredPath": declared["path"],
+                                         "declaredSha256": declared["sha256"],
+                                         "declaredSize": declared["size"],
+                                         "evidenceArtifactId": remote_record.artifact_id,
+                                         "provenance": asdict(remote_record.provenance)},
+                        })
+                        recovered_events.append({
+                            "kind": "evidence.captured", "message": "material retained",
+                            "payload": {"artifactId": remote_record.artifact_id,
+                                        "rawSha256": remote_record.raw_sha256,
+                                        "displaySha256": remote_record.display_sha256,
+                                        "kind": remote_record.kind},
+                        })
+                    recovered_path = recovery_store.root / recovered.display_path
+                    ledger.complete_tool_evidence_publication(
+                        staged["reconciliation_key"],
+                        evidence_artifact_id=recovered.artifact_id,
+                        evidence_original_sha256=recovered.original_sha256,
+                        evidence_path=recovered_path, evidence_size=recovered.display_size,
+                        evidence_metadata={
+                            "toolId": tool_id, "exitCode": staged["exit_code"],
+                            "evidenceArtifactId": recovered.artifact_id,
+                            "originalSha256": recovered.original_sha256,
+                            "rawSha256": recovered.raw_sha256,
+                            "displaySha256": recovered.display_sha256,
+                            "redacted": recovered.redacted, "truncated": recovered.truncated,
+                            "retentionClass": recovered.retention_class.value,
+                            "capturePolicy": recovered.capture_policy,
+                            "effectiveManifestDigest": payload["manifestDigest"],
+                            "verifiedManifestDigest": staged["authority"]["manifestDigest"],
+                            "declaredActions": [action.value for action in manifest.actions],
+                            "credentialUse": manifest.credential_use,
+                            "provenance": asdict(recovered.provenance),
+                            "toolWorkerId": route.capabilities.worker_id,
+                            "remote": route.remote,
+                            "remoteArtifacts": staged["authority"].get("remoteArtifacts", []),
+                        }, worker_id=payload.get("workerId"),
+                        related_evidence=recovered_related,
+                        evidence_events=recovered_events,
+                    )
+                    self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
+                    return
             result = await asyncio.to_thread(route.transport.invoke, invocation)
             terminal_result = True
             _validate_invocation_result(invocation, result, route.capabilities.worker_id)
@@ -976,11 +1148,27 @@ class InvestigationController:
             return
         captured_at = utcnow()
         evidence = EvidenceStore(ctx.deps.paths.run_dir / "evidence")
+        result_bytes = render_tool_output(
+            f"{route.capabilities.worker_id}:{tool_id}",
+            result.exit_code, result.stdout, result.stderr,
+        )
+        reconciliation_key = ledger.stage_tool_evidence_publication(
+            call_id, result_bytes=result_bytes, exit_code=result.exit_code,
+            authority={
+                "approvalId": (qid if manifest.requires_permission and answer == "allow" else None),
+                "declaredActions": [action.value for action in manifest.actions],
+                "invocationId": invocation.invocation_id,
+                "leaseId": lease.lease_id,
+                "manifestDigest": result.manifest_digest,
+                "scope": scope.to_dict(),
+                "targetSha256": target_grant.content_sha256,
+                "toolId": tool_id,
+                "workerId": route.capabilities.worker_id,
+                "remoteArtifacts": [artifact.to_dict() for artifact in result.artifacts],
+            },
+        )
         outcome = evidence.capture_tool_output(
-            render_tool_output(
-                f"{route.capabilities.worker_id}:{tool_id}",
-                result.exit_code, result.stdout, result.stderr
-            ),
+            result_bytes,
             Provenance(
                 run_id=ctx.state.run_id,
                 source=f"rekit:{tool_id}",
@@ -1002,31 +1190,19 @@ class InvestigationController:
             retention_class=RetentionClass.RUN,
             expires_at=default_expiry(RetentionClass.RUN),
         )
-        for event in outcome.events:
-            ledger.event_log(
-                ctx.state.run_id,
-                f"evidence.{event.action.value}",
-                event.reason,
-                worker_id=payload.get("workerId"),
-                payload={"artifactId": event.artifact_id, **event.payload},
-            )
         evidence_record = outcome.record
         if evidence_record is None:
             raise RuntimeError("required tool proof was withheld by evidence policy")
         if evidence_record.state is EvidenceState.QUARANTINED:
             raise RuntimeError("required tool proof was quarantined by evidence policy")
+        evidence.reconcile_capture_audit(evidence_record.artifact_id)
         output_path = evidence.root / evidence_record.display_path
-        status = "done" if result.exit_code == 0 else "failed"
-        ledger.finish_tool_call(
-            call_id, status=status, output_path=str(output_path), exit_code=result.exit_code
-        )
-        ledger.add_artifact(
-            run_id=ctx.state.run_id,
-            kind="tool-output",
-            path=output_path,
-            logical_path=f"tool-output/{output_path.name}",
-            origin=f"rekit:{tool_id}",
-            metadata={
+        related_evidence = []
+        projected_events = [{
+            "kind": f"evidence.{event.action.value}", "message": event.reason,
+            "payload": {"artifactId": event.artifact_id, **event.payload},
+        } for event in outcome.events]
+        primary_metadata = {
                 "toolId": tool_id,
                 "exitCode": result.exit_code,
                 "evidenceArtifactId": evidence_record.artifact_id,
@@ -1045,8 +1221,7 @@ class InvestigationController:
                 "toolWorkerId": route.capabilities.worker_id,
                 "remote": route.remote,
                 "remoteArtifacts": [artifact.to_dict() for artifact in result.artifacts],
-            },
-        )
+            }
         for artifact, data in artifact_bytes:
             remote_outcome = evidence.ingest_remote_artifact(
                 data,
@@ -1071,35 +1246,31 @@ class InvestigationController:
             remote_record = remote_outcome.record
             if remote_record is None or remote_record.state is EvidenceState.QUARANTINED:
                 raise RuntimeError("required remote artifact was not retained")
+            evidence.reconcile_capture_audit(remote_record.artifact_id)
             remote_path = evidence.root / remote_record.display_path
-            ledger.add_artifact(
-                run_id=ctx.state.run_id, kind="remote-artifact", path=remote_path,
-                logical_path=f"remote-artifact/{artifact.path}",
-                origin=f"rekit:{tool_id}",
-                metadata={"toolId": tool_id, "declaredPath": artifact.path,
+            related_evidence.append({
+                "kind": "remote-artifact", "path": remote_path,
+                "logicalPath": f"remote-artifact/{artifact.path}",
+                "sha256": remote_record.display_sha256,
+                "sizeBytes": remote_record.display_size,
+                "mediaType": remote_record.media_type,
+                "metadata": {"toolId": tool_id, "declaredPath": artifact.path,
                           "declaredSha256": artifact.sha256, "declaredSize": artifact.size,
                           "evidenceArtifactId": remote_record.artifact_id,
                           "provenance": asdict(remote_record.provenance)},
-            )
-        if result.exit_code == 0:
-            ledger.resolve(
-                item["id"],
-                result={"toolId": tool_id, "output": str(output_path),
-                        "manifestDigest": result.manifest_digest},
-                evidence=str(output_path),
-                state_label="completed",
-            )
-            ledger.event_log(ctx.state.run_id, "tool.completed", f"{tool_id} completed")
-        else:
-            ledger.set_work_status(
-                item["id"], "failed",
-                error=f"{tool_id} exited {result.exit_code}",
-                evidence=str(output_path),
-                state_label="failed",
-            )
-            ledger.event_log(
-                ctx.state.run_id, "tool.failed", f"{tool_id} exited {result.exit_code}"
-            )
+            })
+            projected_events.extend({
+                "kind": f"evidence.{event.action.value}", "message": event.reason,
+                "payload": {"artifactId": event.artifact_id, **event.payload},
+            } for event in remote_outcome.events)
+        ledger.complete_tool_evidence_publication(
+            reconciliation_key,
+            evidence_artifact_id=evidence_record.artifact_id,
+            evidence_original_sha256=evidence_record.original_sha256,
+            evidence_path=output_path, evidence_size=evidence_record.display_size,
+            evidence_metadata=primary_metadata, worker_id=payload.get("workerId"),
+            related_evidence=related_evidence, evidence_events=projected_events,
+        )
         self._resume_model_worker_if_ready(ledger, ctx.state.run_id, payload)
 
     async def _knowledge_handler(self, ctx, item: dict[str, Any]) -> None:
@@ -1802,11 +1973,14 @@ class InvestigationController:
     def _enqueue_planned_worker(self, ledger: FactoryLedger, run_id: str, target: str,
                                 model_profile: str, model_tools: tuple[str, ...] | list[str],
                                 plan: InvestigationPlan, planned: PlannedWork,
-                                depends_on: list[str]) -> str:
+                                depends_on: list[str], *,
+                                creation_checkpoint: Callable[[str], None] | None = None) -> str:
         worker_id = ledger.add_planned_worker(
             run_id, planned.id, planned.role, model_profile
         )
-        return ledger.enqueue(
+        if creation_checkpoint is not None:
+            creation_checkpoint(f"worker-row:{planned.id}")
+        work_item_id = ledger.enqueue(
             run_id=run_id, key=planned.dedupe_key, target=target,
             operation="model-worker", category="worker",
             title=f"{planned.role} worker", priority=100,
@@ -1827,6 +2001,9 @@ class InvestigationController:
             },
             state_label="queued",
         )
+        if creation_checkpoint is not None:
+            creation_checkpoint(f"worker-work:{planned.id}")
+        return work_item_id
 
     def _record_inconclusive_reproduction(self, paths: RunPaths, payload: dict[str, Any],
                                           model_profile: str, observation: str,
@@ -2000,6 +2177,49 @@ class InvestigationController:
 
 def _read_meta(paths: RunPaths) -> dict[str, Any]:
     return json.loads(paths.run_json.read_text(encoding="utf-8"))
+
+
+_CREATION_AUTHORITY_FIELDS = (
+    "version", "runId", "projectId", "target", "goal", "tools", "modelTools",
+    "workerRoles", "concurrency", "modelProfile", "strategyPlan", "scope",
+    "toolRoutes", "knowledgeRoots", "toolAuthorities", "safetyPolicy",
+    "strategyMetadata", "project",
+)
+
+
+def _validate_creation_authority(existing: dict[str, Any], expected: dict[str, Any]) -> None:
+    """Fail closed when a deterministic run identity points at different authority."""
+    if not isinstance(existing, dict) or not isinstance(existing.get("createdAt"), str):
+        raise ValueError("persisted run authority is malformed")
+    normalized_expected = json.loads(json.dumps(expected, sort_keys=True))
+    mismatched = [
+        field for field in _CREATION_AUTHORITY_FIELDS
+        if existing.get(field) != normalized_expected.get(field)
+    ]
+    if mismatched:
+        raise ValueError(
+            "persisted run authority conflicts with deterministic creation: "
+            + ", ".join(mismatched)
+        )
+
+
+def _validate_creation_run_row(row: Any, *, project_id: str, target: str,
+                               storage_root: str, run_dir: str,
+                               config_json: str) -> None:
+    expected = {
+        "project_id": project_id,
+        "target_path": target,
+        "target_root": target,
+        "storage_root": storage_root,
+        "run_dir": run_dir,
+        "config_json": config_json,
+    }
+    mismatched = [field for field, value in expected.items() if row[field] != value]
+    if mismatched:
+        raise ValueError(
+            "persisted run row conflicts with deterministic creation: "
+            + ", ".join(mismatched)
+        )
 
 
 def _project_memory_log(paths: RunPaths) -> ProjectMemoryLog:
@@ -2444,8 +2664,166 @@ def _tool_context(ledger: FactoryLedger, run_id: str, max_chars: int = 30_000,
     return "\n\n".join(chunks)
 
 
-def _render_report(ledger: FactoryLedger, paths: RunPaths,
-                   meta: dict[str, Any]) -> Path:
+def _inject_terminal_fault(
+    fault_injector: TerminalFaultInjector | None, boundary: str,
+) -> None:
+    if boundary not in TERMINAL_PUBLICATION_BOUNDARIES:
+        raise ValueError(f"unknown terminal publication boundary {boundary!r}")
+    if fault_injector is not None:
+        fault_injector(boundary)
+
+
+def _terminal_event_message(run: dict[str, Any]) -> str:
+    status = str(run["status"])
+    error = run.get("error")
+    if error:
+        return f"Investigation {status}: {error}"
+    return f"Investigation {status}"
+
+
+def _canonical_json_bytes(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def reconcile_terminal_publications(
+    run_dir: str | Path, *, ledger: FactoryLedger | None = None,
+    fault_injector: TerminalFaultInjector | None = None,
+) -> dict[str, Any]:
+    """Converge every derived publication for one canonically terminal run.
+
+    The SQLite run row and work-item states are authoritative. A report whose current
+    bytes match a registry hash is a previously verified terminal snapshot and is
+    preserved. Valid-looking but unverified contradictory exports and terminal events
+    fail closed instead of being silently blessed.
+    """
+    paths = resolve_run_dir(run_dir)
+    owned_ledger = ledger is None
+    active = ledger or FactoryLedger(paths.db_path)
+    try:
+        row = active.get_run(paths.run_id)
+        if row is None:
+            raise KeyError(paths.run_id)
+        run = dict(row)
+        status = str(run["status"])
+        if status not in {"completed", "failed", "blocked", "canceled", "cancelled"}:
+            raise ValueError(f"run {paths.run_id} is not terminal: {status}")
+        if not run.get("completed_at"):
+            raise TerminalPublicationConflict("terminal run has no canonical completion time")
+
+        # Coverage and summary columns are rebuildable mirrors of durable work/worker rows.
+        coverage = active.coverage(paths.run_id)
+        summary = {"workers": len(active.workers(paths.run_id))}
+        active.conn.execute(
+            "update runs set coverage_json=?, summary_json=? where id=?",
+            (json.dumps(coverage, sort_keys=True), json.dumps(summary, sort_keys=True),
+             paths.run_id),
+        )
+        active.conn.commit()
+        run = dict(active.get_run(paths.run_id))
+
+        expected_kind = f"run.{status}"
+        expected_message = _terminal_event_message(run)
+        terminal_events = active.conn.execute(
+            "select * from factory_events where run_id=? and kind in "
+            "('run.completed','run.failed','run.blocked','run.canceled','run.cancelled') "
+            "order by rowid", (paths.run_id,),
+        ).fetchall()
+        contradictory = [event for event in terminal_events
+                         if event["kind"] != expected_kind
+                         or event["message"] != expected_message]
+        if contradictory:
+            raise TerminalPublicationConflict(
+                "terminal event contradicts canonical run status or reason"
+            )
+        if len(terminal_events) > 1:
+            raise TerminalPublicationConflict("duplicate terminal events require operator review")
+        if not terminal_events:
+            event_id = "event-terminal-" + hashlib.sha256(
+                f"{paths.run_id}\0{expected_kind}\0{expected_message}".encode("utf-8")
+            ).hexdigest()[:20]
+            active.conn.execute(
+                "insert into factory_events "
+                "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                "values (?,?,?,?,?,?,?)",
+                (event_id, paths.run_id, None, expected_kind, expected_message,
+                 json.dumps({"completedAt": run["completed_at"]}, sort_keys=True),
+                 run["completed_at"]),
+            )
+            active.conn.commit()
+        _inject_terminal_fault(fault_injector, "terminal-event")
+
+        meta = _read_meta(paths)
+        report_path = paths.reports_dir / "investigation.json"
+        report_rows = active.conn.execute(
+            "select * from reports where run_id=? and format='json' order by created_at, id",
+            (paths.run_id,),
+        ).fetchall()
+        report_bytes = report_path.read_bytes() if report_path.is_file() else None
+        report_sha = hashlib.sha256(report_bytes).hexdigest() if report_bytes is not None else None
+        verified_rows = [item for item in report_rows
+                         if Path(item["path"]) == report_path and item["sha256"] == report_sha]
+        existing_payload: dict[str, Any] | None = None
+        if report_bytes is not None:
+            try:
+                parsed = json.loads(report_bytes)
+                existing_payload = parsed if isinstance(parsed, dict) else None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                existing_payload = None
+
+        expected_payload = _render_report_payload(
+            active, paths, meta, generated_at=str(run["completed_at"]),
+        )
+        expected_bytes = _canonical_json_bytes(expected_payload)
+        if (existing_payload is not None and not verified_rows
+                and report_bytes != expected_bytes):
+            raise TerminalPublicationConflict(
+                "valid terminal export is not verified and contradicts canonical state"
+            )
+        if verified_rows:
+            if existing_payload is None or existing_payload.get("runId") != paths.run_id:
+                raise TerminalPublicationConflict("verified terminal export has invalid identity")
+            canonical_bytes = report_bytes
+        else:
+            canonical_bytes = expected_bytes
+            atomic_write(report_path, canonical_bytes.decode("utf-8"))
+        canonical_sha = hashlib.sha256(canonical_bytes).hexdigest()
+        _inject_terminal_fault(fault_injector, "report-atomic-replace")
+
+        canonical_report_id = "rep-terminal-" + hashlib.sha256(
+            f"{paths.run_id}\0json\0{canonical_sha}".encode("utf-8")
+        ).hexdigest()[:20]
+        with active.conn:
+            active.conn.execute(
+                "delete from reports where run_id=? and format='json'",
+                (paths.run_id,),
+            )
+            active.conn.execute(
+                "insert into reports (id,run_id,format,path,sha256,created_at) "
+                "values (?,?,?,?,?,?)",
+                (canonical_report_id, paths.run_id, "json", str(report_path),
+                 canonical_sha, run["completed_at"]),
+            )
+        _inject_terminal_fault(fault_injector, "report-row-insert")
+
+        meta["status"] = status
+        meta["updatedAt"] = run["updated_at"]
+        atomic_write(paths.run_json, json.dumps(meta, indent=2, sort_keys=True) + "\n")
+        _inject_terminal_fault(fault_injector, "run-status-mirror-replace")
+        return {
+            "runId": paths.run_id,
+            "status": status,
+            "reportPath": str(report_path),
+            "reportSha256": canonical_sha,
+            "outcomeSemanticSha256": json.loads(canonical_bytes)["outcomeProjection"]
+            ["semanticSha256"],
+        }
+    finally:
+        if owned_ledger:
+            active.close()
+
+
+def _render_report_payload(ledger: FactoryLedger, paths: RunPaths,
+                           meta: dict[str, Any], *, generated_at: str) -> dict[str, Any]:
     # Project memory and campaign lifecycle are independently fsynced sources, just as they are
     # for the canonical snapshot. SQLite-backed inputs are then captured under one transaction;
     # no cross-store atomic revision is claimed.
@@ -2529,7 +2907,7 @@ def _render_report(ledger: FactoryLedger, paths: RunPaths,
             # Model prose remains useful context but has no outcome-transition authority.
             "workerNote": result.get("status_update") or result.get("statusUpdate"),
         })
-    payload = {
+    return {
         "runId": paths.run_id,
         "target": meta["target"],
         "goal": meta["goal"],
@@ -2537,8 +2915,16 @@ def _render_report(ledger: FactoryLedger, paths: RunPaths,
         "coverage": coverage,
         "campaignLifecycle": lifecycle_source,
         "outcomeProjection": projection,
-        "generatedAt": utcnow(),
+        "generatedAt": generated_at,
     }
+
+
+def _render_report(ledger: FactoryLedger, paths: RunPaths,
+                   meta: dict[str, Any]) -> Path:
+    run = ledger.get_run(paths.run_id)
+    generated_at = (run["completed_at"] if run is not None and run["completed_at"]
+                    else utcnow())
+    payload = _render_report_payload(ledger, paths, meta, generated_at=generated_at)
     report_path = paths.reports_dir / "investigation.json"
     atomic_write(report_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return report_path

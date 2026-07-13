@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from muster import Ledger, new_id, utcnow
 
@@ -45,6 +46,13 @@ create table if not exists factory_events (
 );
 create index if not exists idx_factory_events_run on factory_events(run_id, created_at);
 
+create table if not exists factory_event_dedupe (
+    run_id       text not null,
+    dedupe_key   text not null,
+    event_id     text not null unique,
+    primary key (run_id, dedupe_key)
+);
+
 create table if not exists factory_model_calls (
     id             text primary key,
     run_id         text not null,
@@ -83,6 +91,25 @@ create table if not exists factory_tool_calls (
     completed_at   text
 );
 create index if not exists idx_factory_tool_calls_run on factory_tool_calls(run_id);
+
+create table if not exists factory_evidence_publications (
+    reconciliation_key text primary key,
+    run_id             text not null,
+    tool_call_id       text not null unique,
+    work_item_id       text not null,
+    result_sha256      text not null,
+    result_size        integer not null,
+    exit_code          integer not null,
+    expected_evidence_artifact_id text not null,
+    authority_json     text not null,
+    evidence_artifact_id text,
+    ledger_artifact_id text,
+    status             text not null default 'staged',
+    created_at         text not null,
+    completed_at       text
+);
+create index if not exists idx_factory_evidence_publications_run
+    on factory_evidence_publications(run_id, status);
 
 create table if not exists factory_permissions (
     question_id    text primary key,
@@ -207,6 +234,38 @@ class FactoryLedger(Ledger):
         self.conn.commit()
         return event_id
 
+    def event_log_once(self, run_id: str, dedupe_key: str, kind: str, message: str, *,
+                       worker_id: str | None = None,
+                       payload: dict[str, Any] | None = None) -> str:
+        """Append one event for a stable semantic key, including after crash/retry."""
+        existing = self.conn.execute(
+            "select event_id from factory_event_dedupe where run_id=? and dedupe_key=?",
+            (run_id, dedupe_key),
+        ).fetchone()
+        if existing is not None:
+            return existing["event_id"]
+        event_id = new_id("event")
+        now = utcnow()
+        with self.conn:
+            claimed = self.conn.execute(
+                "insert or ignore into factory_event_dedupe "
+                "(run_id,dedupe_key,event_id) values (?,?,?)",
+                (run_id, dedupe_key, event_id),
+            )
+            if claimed.rowcount == 0:
+                return self.conn.execute(
+                    "select event_id from factory_event_dedupe "
+                    "where run_id=? and dedupe_key=?", (run_id, dedupe_key),
+                ).fetchone()["event_id"]
+            self.conn.execute(
+                "insert into factory_events "
+                "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                "values (?,?,?,?,?,?,?)",
+                (event_id, run_id, worker_id, kind, message,
+                 json.dumps(payload or {}, sort_keys=True), now),
+            )
+        return event_id
+
     def record_model_call(self, run_id: str, worker_id: str, *, provider: str,
                           model: str, purpose: str, usage: dict[str, Any]) -> str:
         call_id = new_id("model")
@@ -261,6 +320,22 @@ class FactoryLedger(Ledger):
     def start_tool_call(self, run_id: str, work_item_id: str, tool_id: str,
                         safety_tier: int, *, manifest_digest: str,
                         declared_actions: tuple[str, ...], credential_use: bool) -> str:
+        existing = self.conn.execute(
+            "select * from factory_tool_calls where run_id=? and work_item_id=? "
+            "and status='running' order by created_at desc limit 1",
+            (run_id, work_item_id),
+        ).fetchone()
+        if existing is not None:
+            exact = (
+                existing["tool_id"] == tool_id
+                and existing["safety_tier"] == safety_tier
+                and existing["manifest_digest"] == manifest_digest
+                and json.loads(existing["declared_actions_json"]) == list(declared_actions)
+                and bool(existing["credential_use"]) == credential_use
+            )
+            if not exact:
+                raise ValueError("running tool call authority conflicts with retry")
+            return existing["id"]
         call_id = new_id("tool")
         self.conn.execute(
             "insert into factory_tool_calls "
@@ -281,6 +356,190 @@ class FactoryLedger(Ledger):
             (status, output_path, exit_code, utcnow(), call_id),
         )
         self.conn.commit()
+
+    def stage_tool_evidence_publication(
+            self, call_id: str, *, result_bytes: bytes, exit_code: int,
+            authority: dict[str, Any]) -> str:
+        """Persist the exact authorized result identity before evidence capture."""
+        call = self.conn.execute(
+            "select * from factory_tool_calls where id=?", (call_id,),
+        ).fetchone()
+        if call is None:
+            raise KeyError(call_id)
+        canonical_authority = json.dumps(authority, sort_keys=True, separators=(",", ":"))
+        result_sha256 = hashlib.sha256(result_bytes).hexdigest()
+        expected_evidence_artifact_id = "artifact-" + hashlib.sha256(
+            b"tool-output\0" + result_bytes
+        ).hexdigest()
+        binding = {
+            "authority": json.loads(canonical_authority), "exitCode": exit_code,
+            "evidenceArtifactId": expected_evidence_artifact_id,
+            "resultSha256": result_sha256, "resultSize": len(result_bytes),
+            "runId": call["run_id"], "toolCallId": call_id,
+            "workItemId": call["work_item_id"],
+        }
+        reconciliation_key = hashlib.sha256(json.dumps(
+            binding, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        existing = self.conn.execute(
+            "select * from factory_evidence_publications where tool_call_id=?", (call_id,),
+        ).fetchone()
+        if existing is not None:
+            exact = (
+                existing["reconciliation_key"] == reconciliation_key
+                and existing["result_sha256"] == result_sha256
+                and existing["result_size"] == len(result_bytes)
+                and existing["exit_code"] == exit_code
+                and existing["expected_evidence_artifact_id"] == expected_evidence_artifact_id
+                and existing["authority_json"] == canonical_authority
+            )
+            if not exact:
+                raise ValueError("conflicting result or authority for tool publication")
+            return reconciliation_key
+        self.conn.execute(
+            "insert into factory_evidence_publications "
+            "(reconciliation_key,run_id,tool_call_id,work_item_id,result_sha256,"
+            "result_size,exit_code,expected_evidence_artifact_id,authority_json,created_at) "
+            "values (?,?,?,?,?,?,?,?,?,?)",
+            (reconciliation_key, call["run_id"], call_id, call["work_item_id"],
+             result_sha256, len(result_bytes), exit_code, expected_evidence_artifact_id,
+             canonical_authority, utcnow()),
+        )
+        self.conn.commit()
+        return reconciliation_key
+
+    def evidence_publication(self, call_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "select * from factory_evidence_publications where tool_call_id=?", (call_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["authority"] = json.loads(result.pop("authority_json"))
+        return result
+
+    def complete_tool_evidence_publication(
+            self, reconciliation_key: str, *, evidence_artifact_id: str,
+            evidence_original_sha256: str, evidence_path: str | Path,
+            evidence_size: int, evidence_metadata: dict[str, Any],
+            worker_id: str | None = None,
+            related_evidence: list[dict[str, Any]] | None = None,
+            evidence_events: list[dict[str, Any]] | None = None,
+            failure_injector: Callable[[str], None] | None = None) -> str:
+        """Atomically expose evidence, its events, and the Muster tool completion."""
+        publication = self.conn.execute(
+            "select * from factory_evidence_publications where reconciliation_key=?",
+            (reconciliation_key,),
+        ).fetchone()
+        if publication is None:
+            raise KeyError(reconciliation_key)
+        if evidence_original_sha256 != publication["result_sha256"]:
+            raise ValueError("evidence bytes conflict with staged tool result")
+        if evidence_artifact_id != publication["expected_evidence_artifact_id"]:
+            raise ValueError("evidence identity conflicts with staged tool result")
+        existing_artifact = publication["ledger_artifact_id"]
+        if publication["status"] == "complete":
+            if publication["evidence_artifact_id"] != evidence_artifact_id:
+                raise ValueError("conflicting evidence identity for completed publication")
+            return existing_artifact
+        call = self.conn.execute(
+            "select * from factory_tool_calls where id=?", (publication["tool_call_id"],),
+        ).fetchone()
+        if call is None or call["run_id"] != publication["run_id"] \
+                or call["work_item_id"] != publication["work_item_id"]:
+            raise ValueError("tool invocation authority no longer matches publication")
+        now = utcnow()
+        artifact_id = "art-evidence-" + reconciliation_key
+        terminal_event_id = "event-tool-" + reconciliation_key
+        output_path = str(evidence_path)
+        success = publication["exit_code"] == 0
+        with self.conn:
+            self.conn.execute(
+                "insert into artifacts "
+                "(id,run_id,kind,path,logical_path,sha256,size_bytes,media_type,language,"
+                "origin,metadata_json,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (artifact_id, publication["run_id"], "tool-output", output_path,
+                 f"tool-output/{Path(output_path).name}",
+                 evidence_metadata.get("displaySha256", evidence_original_sha256),
+                 evidence_size, "text/plain; charset=utf-8", None,
+                 f"rekit:{call['tool_id']}", json.dumps({
+                     **evidence_metadata, "reconciliationKey": reconciliation_key,
+                 }, sort_keys=True), now),
+            )
+            for index, related in enumerate(related_evidence or ()):
+                self.conn.execute(
+                    "insert into artifacts "
+                    "(id,run_id,kind,path,logical_path,sha256,size_bytes,media_type,language,"
+                    "origin,metadata_json,created_at) values (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"art-evidence-{reconciliation_key}-{index}", publication["run_id"],
+                     related["kind"], str(related["path"]), related["logicalPath"],
+                     related["sha256"], related["sizeBytes"], related.get("mediaType"),
+                     None, f"rekit:{call['tool_id']}",
+                     json.dumps({**related["metadata"],
+                                 "reconciliationKey": reconciliation_key}, sort_keys=True), now),
+                )
+            if failure_injector:
+                failure_injector("artifacts")
+            projected_events = evidence_events or [{
+                "kind": "evidence.captured", "message": "Tool result evidence reconciled",
+                "payload": {"artifactId": evidence_artifact_id},
+            }]
+            for index, event in enumerate(projected_events):
+                self.conn.execute(
+                    "insert into factory_events "
+                    "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                    "values (?,?,?,?,?,?,?)",
+                    (f"event-evidence-{reconciliation_key}-{index}", publication["run_id"],
+                     worker_id, event["kind"], event["message"],
+                     json.dumps({**event.get("payload", {}),
+                                 "reconciliationKey": reconciliation_key}, sort_keys=True), now),
+                )
+            if failure_injector:
+                failure_injector("events")
+            self.conn.execute(
+                "update factory_tool_calls set status=?,output_path=?,exit_code=?,completed_at=? "
+                "where id=?",
+                ("done" if success else "failed", output_path,
+                 publication["exit_code"], now, publication["tool_call_id"]),
+            )
+            if failure_injector:
+                failure_injector("tool-completion")
+            if success:
+                self.conn.execute(
+                    "update work_items set status='done',state_label='completed',updated_at=?,"
+                    "terminal_at=?,result_json=?,error=null,evidence=? where id=? and run_id=?",
+                    (now, now, json.dumps({"toolId": call["tool_id"], "output": output_path,
+                                          "manifestDigest": call["manifest_digest"]}),
+                     output_path, publication["work_item_id"], publication["run_id"]),
+                )
+            else:
+                self.conn.execute(
+                    "update work_items set status='failed',state_label='failed',updated_at=?,"
+                    "terminal_at=?,result_json=null,error=?,evidence=? where id=? and run_id=?",
+                    (now, now, f"{call['tool_id']} exited {publication['exit_code']}",
+                     output_path, publication["work_item_id"], publication["run_id"]),
+                )
+            if failure_injector:
+                failure_injector("work-resolution")
+            self.conn.execute(
+                "insert into factory_events "
+                "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                "values (?,?,?,?,?,?,?)",
+                (terminal_event_id, publication["run_id"], worker_id,
+                 "tool.completed" if success else "tool.failed",
+                 (f"{call['tool_id']} completed" if success else
+                  f"{call['tool_id']} exited {publication['exit_code']}"),
+                 json.dumps({"reconciliationKey": reconciliation_key}, sort_keys=True), now),
+            )
+            if failure_injector:
+                failure_injector("terminal-event")
+            self.conn.execute(
+                "update factory_evidence_publications set status='complete',"
+                "evidence_artifact_id=?,ledger_artifact_id=?,completed_at=? "
+                "where reconciliation_key=?",
+                (evidence_artifact_id, artifact_id, now, reconciliation_key),
+            )
+        return artifact_id
 
     def link_permission(self, qid: str, run_id: str, work_item_id: str, tool_id: str,
                         manifest_digest: str) -> None:
