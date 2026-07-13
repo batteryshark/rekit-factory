@@ -42,10 +42,13 @@ class Rekit:
 
 class WideningBackend(Backend):
     def __init__(self, *, action: str, endpoint: str | None = None,
-                 credentials: bool = False):
+                 credentials: bool = False, account_ref: str | None = None,
+                 tool_id: str = "scan"):
         self.action = action
         self.endpoint = endpoint
         self.credentials = credentials
+        self.account_ref = account_ref
+        self.tool_id = tool_id
         self.turns = 0
         self.denied = None
 
@@ -55,9 +58,11 @@ class WideningBackend(Backend):
             return WorkerTurn(
                 report=None, usage={}, messages_json="[]",
                 deferred_calls=(DeferredModelToolCall(
-                    call_id="call-widen", tool_id="scan", tool_name="rekit__scan",
+                    call_id="call-widen", tool_id=self.tool_id,
+                    tool_name=f"rekit__{self.tool_id}",
                     requested_action=self.action, endpoint=self.endpoint,
-                    account_ref=("account:fixture" if self.credentials else None),
+                    account_ref=(self.account_ref or
+                                 ("account:fixture" if self.credentials else None)),
                     uses_credentials=self.credentials,
                 ),),
             )
@@ -70,14 +75,27 @@ class WideningBackend(Backend):
         )
 
 
-def scope(target: Path, *, actions, endpoint=None, credential_use=False):
+class DriftBackend(WideningBackend):
+    def __init__(self, rekit, changed_manifest):
+        super().__init__(action=ActionAuthority.READ_LOCAL_TARGET.value)
+        self.rekit = rekit
+        self.changed_manifest = changed_manifest
+
+    async def analyze(self, **kwargs):
+        if self.turns == 0:
+            self.rekit.value = self.changed_manifest
+        return await super().analyze(**kwargs)
+
+
+def scope(target: Path, *, actions, endpoint=None, credential_use=False,
+          account_intent=False):
     envelope = ScopeEnvelope(
         scope_id="scope-authority", revision=1,
         valid_from="2026-07-01T00:00:00Z", valid_until="2026-08-01T00:00:00Z",
         targets=(TargetGrant.from_path(target),), actions=actions,
         endpoints=((endpoint,) if endpoint else ()),
         network_mode=(NetworkMode.EXACT_ENDPOINTS if endpoint else NetworkMode.NONE),
-        account_refs=(("account:fixture",) if credential_use else ()),
+        account_refs=(("account:fixture",) if credential_use or account_intent else ()),
         credential_use=credential_use,
         prohibited_actions=tuple(action for action in ActionAuthority if action not in actions),
     )
@@ -105,6 +123,12 @@ def test_registry_contract_is_versioned_hashed_and_contains_no_source_path(tmp_p
     assert len(manifest.effective_manifest_digest) == 64
     assert "private/catalog" not in repr(manifest.public_authority())
     assert "private/catalog" not in manifest.effective_manifest_digest
+    changed = json.loads(json.dumps(entry))
+    changed["entry"]["args"].append({"name": "--drift", "type": "flag"})
+    (root / "registry.json").write_text(json.dumps({"scan": changed}), encoding="utf-8")
+    changed_manifest = RekitClient(root, source="private").manifest("scan")
+    assert changed_manifest.source_manifest_digest != manifest.source_manifest_digest
+    assert changed_manifest.effective_manifest_digest != manifest.effective_manifest_digest
 
 
 def test_risky_legacy_and_contradictory_high_impact_declarations_fail_closed(tmp_path):
@@ -227,3 +251,74 @@ def test_catalog_change_after_creation_fails_closed_on_pinned_digest(tmp_path):
     result = __import__("asyncio").run(controller.drive(run_dir))
     tool = next(item for item in result["workItems"] if item["operation"] == "rekit-tool")
     assert tool["result"]["reasonCode"] == "manifest.digest_changed"
+
+
+def test_deferred_model_call_uses_run_bound_contract_and_rejects_catalog_drift(tmp_path):
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"fixture")
+    first = ToolManifest(
+        id="scan", name="Scan", description="fixture", safety_tier=0,
+        executes_input="no", network="none", version="1",
+        actions=(ActionAuthority.READ_LOCAL_TARGET,),
+        source_manifest_digest="1" * 64,
+    )
+    changed = ToolManifest(
+        id="scan", name="Scan", description="fixture", safety_tier=0,
+        executes_input="no", network="none", version="1",
+        actions=(ActionAuthority.READ_LOCAL_TARGET,),
+        source_manifest_digest="2" * 64,
+    )
+    rekit = Rekit(first)
+    backend = DriftBackend(rekit, changed)
+    controller = InvestigationController(
+        storage_root=tmp_path / "runs", rekit=rekit, workers=backend,
+    )
+    result = controller.run(RunRequest(
+        target, "scan", model_tools=("scan",), worker_roles=("analyst",),
+        scope=scope(target, actions=(ActionAuthority.READ_LOCAL_TARGET,)),
+    ))
+    tool = next(item for item in result["workItems"]
+                if item["operation"] == "model-rekit-tool")
+    assert tool["payload"]["manifestDigest"] == first.effective_manifest_digest
+    assert tool["result"]["reasonCode"] == "manifest.digest_changed"
+    assert backend.denied is True
+
+
+@pytest.mark.parametrize("account_action", (
+    ActionAuthority.REGISTER_ACCOUNT,
+    ActionAuthority.SUBMIT_CHALLENGE,
+))
+def test_account_operations_require_declared_action_and_exact_account_intent(
+        tmp_path, account_action):
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"fixture")
+    actions = (ActionAuthority.READ_LOCAL_TARGET, account_action)
+    manifest = ToolManifest(
+        id="submit", name="Submit", description="fixture", safety_tier=0,
+        executes_input="no", network="none", actions=actions,
+    )
+    missing = InvestigationController(
+        storage_root=tmp_path / "missing", rekit=Rekit(manifest), workers=Backend(),
+    )
+    with pytest.raises(PermissionError):
+        missing.create(RunRequest(
+            target, "submit", model_tools=("submit",),
+            scope=scope(target, actions=(ActionAuthority.READ_LOCAL_TARGET,)),
+        ))
+
+    backend = WideningBackend(
+        action=account_action.value, account_ref="account:fixture",
+        tool_id="submit",
+    )
+    controller = InvestigationController(
+        storage_root=tmp_path / "accepted", rekit=Rekit(manifest), workers=backend,
+    )
+    result = controller.run(RunRequest(
+        target, "submit", model_tools=("submit",), worker_roles=("analyst",),
+        scope=scope(target, actions=actions, account_intent=True),
+    ))
+    assert backend.denied is False
+    call = next(item for item in result["workItems"]
+                if item["operation"] == "model-rekit-tool")
+    assert call["state_label"] == "completed"
+    assert call["payload"]["accountRef"] == "account:fixture"

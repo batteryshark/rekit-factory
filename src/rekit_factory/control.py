@@ -451,9 +451,12 @@ class InvestigationController:
             decision = _manifest_denial(scope, item["target"], payload, "manifest.endpoint_not_declared")
         elif payload.get("usesCredentials") and not manifest.credential_use:
             decision = _manifest_denial(scope, item["target"], payload, "manifest.credentials_not_declared")
-        elif payload.get("accountRef") and not manifest.credential_use:
+        elif (payload.get("accountRef") and not manifest.credential_use
+              and not set(manifest.actions).intersection(_ACCOUNT_INTENT_ACTIONS)):
             decision = _manifest_denial(scope, item["target"], payload, "manifest.account_not_declared")
-        elif manifest.credential_use and not payload.get("accountRef"):
+        elif (manifest.credential_use
+              or set(manifest.actions).intersection(_ACCOUNT_INTENT_ACTIONS)) \
+                and not payload.get("accountRef"):
             decision = _manifest_denial(scope, item["target"], payload, "manifest.account_intent_required")
         if requested_action and decision is None:
             try:
@@ -737,10 +740,15 @@ class InvestigationController:
                 purpose=role,
                 usage=turn.usage,
             )
+            # The run configuration is the authority source of truth. Worker payloads
+            # carry a projection for auditability, but cannot replace or widen it.
+            pinned_authorities = _run_tool_authorities(
+                ledger, ctx.state.run_id, payload.get("availableTools", [])
+            )
             pending_calls = [
                 {"callId": call.call_id, "toolId": call.tool_id,
                  "toolName": call.tool_name,
-                 **_manifest_work_payload(self.rekit.manifest(call.tool_id)),
+                 **_pinned_manifest_work_payload(pinned_authorities, call.tool_id),
                  "endpoint": call.endpoint,
                  "accountRef": _account_intent_ref(call.account_ref),
                  "usesCredentials": call.uses_credentials,
@@ -770,7 +778,7 @@ class InvestigationController:
                             "workerId": worker_id,
                             "workerItemId": item["id"],
                             "safetyTier": manifest.safety_tier,
-                            **_manifest_work_payload(manifest),
+                            **_pinned_manifest_work_payload(pinned_authorities, call.tool_id),
                             "endpoint": call.endpoint,
                             "accountRef": _account_intent_ref(call.account_ref),
                             "usesCredentials": call.uses_credentials,
@@ -1030,7 +1038,9 @@ class InvestigationController:
                             "Return the outcome only through hypothesis_updates with cited observations."
                         ),
                         "modelProfile": model_profile, "availableTools": list(model_tools),
-                        "toolAuthorities": _tool_authorities(self.rekit, model_tools),
+                        "toolAuthorities": _run_tool_authorities(
+                            ledger, run_id, model_tools
+                        ),
                         "planId": plan_id, "dedupeKey": stable_key(plan_id),
                         "costUnits": test.cost_units, "origin": "hypothesis-test",
                         "evidenceIds": [],
@@ -1173,7 +1183,7 @@ class InvestigationController:
                 "goal": goal,
                 "modelProfile": model_profile,
                 "availableTools": list(model_tools),
-                "toolAuthorities": _tool_authorities(self.rekit, model_tools),
+                "toolAuthorities": _run_tool_authorities(ledger, run_id, model_tools),
                 "planId": plan_id,
                 "dedupeKey": stable_key(plan_id),
                 "costUnits": 10,
@@ -1207,7 +1217,7 @@ class InvestigationController:
                 "workerId": worker_id, "role": planned.role,
                 "goal": f"{plan.goal}\nAssigned objective: {planned.objective}",
                 "modelProfile": model_profile, "availableTools": list(model_tools),
-                "toolAuthorities": _tool_authorities(self.rekit, model_tools),
+                "toolAuthorities": _run_tool_authorities(ledger, run_id, model_tools),
                 "planId": planned.id, "dedupeKey": planned.dedupe_key,
                 "costUnits": planned.cost_units, "origin": planned.origin,
                 "evidenceIds": list(planned.evidence_ids),
@@ -1373,6 +1383,15 @@ def _manifest_actions(manifest: Any) -> tuple[ActionAuthority, ...]:
     return actions
 
 
+_ACCOUNT_INTENT_ACTIONS = {
+    ActionAuthority.REGISTER_ACCOUNT,
+    ActionAuthority.ENROLL_CHALLENGE,
+    ActionAuthority.CREATE_CREDENTIAL,
+    ActionAuthority.SUBMIT_CHALLENGE,
+    ActionAuthority.THIRD_PARTY_MESSAGE,
+}
+
+
 def _manifest_work_payload(manifest: Any) -> dict[str, Any]:
     return {
         "manifestDigest": manifest.effective_manifest_digest,
@@ -1382,8 +1401,39 @@ def _manifest_work_payload(manifest: Any) -> dict[str, Any]:
     }
 
 
+def _pinned_manifest_work_payload(authorities: dict[str, Any], tool_id: str) -> dict[str, Any]:
+    contract = authorities.get(tool_id)
+    if not isinstance(contract, dict) or not isinstance(contract.get("digest"), str):
+        raise ValueError(f"run has no pinned authority contract for tool {tool_id!r}")
+    actions = contract.get("actions")
+    if not isinstance(actions, list) or not actions:
+        raise ValueError(f"run has invalid pinned actions for tool {tool_id!r}")
+    return {
+        "manifestDigest": contract["digest"],
+        "declaredActions": list(actions),
+        "declaredCredentialUse": contract.get("credentialUse") is True,
+        "authorityVersion": contract.get("version"),
+    }
+
+
 def _tool_authorities(rekit: RekitAdapter, tool_ids: Any) -> dict[str, Any]:
     return {tool_id: rekit.manifest(tool_id).public_authority() for tool_id in tool_ids}
+
+
+def _run_tool_authorities(ledger: FactoryLedger, run_id: str,
+                          tool_ids: Any) -> dict[str, Any]:
+    run = ledger.get_run(run_id)
+    config = json.loads(run["config_json"])
+    authorities = config.get("toolAuthorities")
+    if not isinstance(authorities, dict):
+        raise ValueError("run has no pinned tool authority contracts")
+    selected: dict[str, Any] = {}
+    for tool_id in tool_ids:
+        contract = authorities.get(tool_id)
+        if not isinstance(contract, dict) or not contract.get("digest"):
+            raise ValueError(f"run has no pinned authority contract for tool {tool_id!r}")
+        selected[tool_id] = contract
+    return selected
 
 
 def _manifest_denial(scope: AuthorizedScope, target: str, payload: dict[str, Any],
@@ -1436,8 +1486,12 @@ def _require_scope_for_creation(scope: AuthorizedScope, target: TargetGrant,
                 scope,
                 ScopeRequest(
                     action=action, target=target, endpoint=endpoint,
-                    account_ref=(scope.envelope.account_refs[0]
-                                 if manifest.credential_use and scope.envelope.account_refs else None),
+                    account_ref=(
+                        scope.envelope.account_refs[0]
+                        if (manifest.credential_use
+                            or set(manifest.actions).intersection(_ACCOUNT_INTENT_ACTIONS))
+                        and scope.envelope.account_refs else None
+                    ),
                     uses_credentials=manifest.credential_use,
                 ),
                 now=now,

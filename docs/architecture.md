@@ -40,13 +40,20 @@ validates the declaration at catalog load, requires the engagement scope to cove
 declared action and credential floor before exposing a tool, and rechecks the exact
 runtime endpoint/account/action intent at dispatch. A model may narrow which declared
 operation it requests but cannot add an endpoint, credential use, or action absent from
-the manifest.
+the manifest. In authority version 1, `credential_use: true` is a mandatory invocation
+floor: each dispatch needs an exact opaque account reference and approved credential-use
+scope. `false` forbids runtime credential/account intent unless the declared action
+itself requires exact account intent. Optional credential modes need separate manifest
+variants or a future authority version, never model-selected widening.
 
 The safe effective manifest contains the tool identity/version, safety facts, authority
-version/actions/credential flag, and a canonical SHA-256 digest. It contains no catalog
-path or credential value. Factory pins that digest in run configuration and durable work,
-rejects catalog changes between creation and dispatch, and cites the digest in permission,
-tool-call, and evidence/proof metadata. Static offline legacy manifests narrow to
+version/actions/credential flag, a digest of the complete canonical source registry
+entry (including dispatcher arguments and worker requirements), and a canonical
+effective SHA-256 digest. It contains no catalog path or credential value. Factory pins
+that contract in run configuration and uses the run-bound digest for deferred model
+calls and follow-on workers; it never silently rebinds them to a current catalog. It
+rejects catalog changes between creation and dispatch and cites the effective digest in
+permission, tool-call, and evidence/proof metadata. Static offline legacy manifests narrow to
 `read_local_target`; risky legacy or contradictory declarations are unavailable pending
 review.
 

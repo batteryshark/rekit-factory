@@ -30,6 +30,7 @@ class ToolManifest:
     authority_version: int = AUTHORITY_VERSION
     actions: tuple[ActionAuthority, ...] = ()
     credential_use: bool = False
+    source_manifest_digest: str = ""
     effective_manifest_digest: str = ""
     legacy_authority: bool = False
 
@@ -61,6 +62,10 @@ class ToolManifest:
             raise ValueError("network_access contradicts non-external safety mode")
         object.__setattr__(self, "actions", actions)
         object.__setattr__(self, "legacy_authority", legacy)
+        source_digest = self.source_manifest_digest or _synthetic_source_digest(
+            self, actions, legacy
+        )
+        object.__setattr__(self, "source_manifest_digest", source_digest)
         expected = _effective_digest(self, actions, legacy)
         if self.effective_manifest_digest and self.effective_manifest_digest != expected:
             raise ValueError("effective manifest digest does not match authority contract")
@@ -72,6 +77,7 @@ class ToolManifest:
             "actions": [action.value for action in self.actions],
             "credentialUse": self.credential_use,
             "legacy": self.legacy_authority,
+            "sourceManifestDigest": self.source_manifest_digest,
             "digest": self.effective_manifest_digest,
         }
 
@@ -134,6 +140,7 @@ class RekitClient:
             authority_version=authority["version"],
             actions=tuple(ActionAuthority(action) for action in authority["actions"]),
             credential_use=authority["credential_use"],
+            source_manifest_digest=_source_manifest_digest(tool_id, item),
             legacy_authority=legacy,
         )
 
@@ -268,6 +275,7 @@ def _effective_digest(manifest: ToolManifest, actions: tuple[ActionAuthority, ..
         "schemaVersion": AUTHORITY_VERSION,
         "toolId": manifest.id,
         "toolVersion": manifest.version,
+        "sourceManifestDigest": manifest.source_manifest_digest,
         "safety": {"tier": manifest.safety_tier, "executesInput": manifest.executes_input,
                    "network": manifest.network},
         "authority": {"version": manifest.authority_version,
@@ -276,3 +284,29 @@ def _effective_digest(manifest: ToolManifest, actions: tuple[ActionAuthority, ..
     }
     raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _source_manifest_digest(tool_id: str, item: dict[str, Any]) -> str:
+    raw = json.dumps(
+        {"toolId": tool_id, "manifest": item},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _synthetic_source_digest(manifest: ToolManifest,
+                             actions: tuple[ActionAuthority, ...], legacy: bool) -> str:
+    """Stable identity for adapters that construct a manifest without a registry entry."""
+    item = {
+        "name": manifest.name,
+        "description": manifest.description,
+        "version": manifest.version,
+        "safety": {"tier": manifest.safety_tier,
+                   "executes_input": manifest.executes_input,
+                   "network": manifest.network},
+        "authority": {"version": manifest.authority_version,
+                      "actions": [action.value for action in actions],
+                      "credential_use": manifest.credential_use},
+        "legacy": legacy,
+    }
+    return _source_manifest_digest(manifest.id, item)
