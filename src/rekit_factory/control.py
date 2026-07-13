@@ -27,6 +27,7 @@ from muster import (
 
 from rekit_factory.models import (
     ModelActivity,
+    ModelProfile,
     ModelTool,
     ModelToolResult,
     WorkerBackend,
@@ -92,6 +93,26 @@ MAX_KNOWLEDGE_QUERY = 512
 MAX_KNOWLEDGE_RATIONALE = 1_000
 MAX_KNOWLEDGE_RESULTS = 4
 MAX_KNOWLEDGE_BODY = 12_000
+MAX_PROFILE_ERROR_NAME = 96
+MAX_ERROR_CONCURRENCY = 999_999
+
+
+def enforce_model_profile_concurrency(profile: ModelProfile, requested: int) -> None:
+    """Reject worker fan-out above ``profile`` without disclosing private config."""
+    if requested <= profile.concurrency_limit:
+        return
+    clean_name = " ".join(profile.name.split())
+    if len(clean_name) > MAX_PROFILE_ERROR_NAME:
+        suffix = hashlib.sha256(clean_name.encode("utf-8")).hexdigest()[:12]
+        clean_name = f"{clean_name[:MAX_PROFILE_ERROR_NAME]}...#{suffix}"
+    requested_label = (
+        str(requested) if requested <= MAX_ERROR_CONCURRENCY
+        else f">{MAX_ERROR_CONCURRENCY}"
+    )
+    raise ValueError(
+        f"requested concurrency {requested_label} exceeds model profile "
+        f"{clean_name!r} ceiling {profile.concurrency_limit}"
+    )
 
 
 @dataclass(frozen=True)
@@ -172,9 +193,27 @@ class InvestigationController:
         except KeyError as exc:
             raise ValueError(f"unknown model profile {name!r}") from exc
 
+    def _worker_backend_with_concurrency(
+        self, profile_name: str | None, requested: int,
+    ) -> WorkerBackend:
+        backend = self.worker_backend(profile_name)
+        enforce_model_profile_concurrency(backend.profile, requested)
+        return backend
+
+    def validate_run_concurrency(self, run_dir: str | Path) -> None:
+        """Recheck a durable plan against the currently configured named profile."""
+        paths = resolve_run_dir(run_dir)
+        meta = _read_meta(paths)
+        plan = _plan_from_meta(meta)
+        self._worker_backend_with_concurrency(
+            _model_profile_name(meta), plan.ceilings.concurrency,
+        )
+
     def create(self, request: RunRequest) -> Path:
         request = request.validate()
-        worker_backend = self.worker_backend(request.model_profile)
+        worker_backend = self._worker_backend_with_concurrency(
+            request.model_profile, request.concurrency,
+        )
         manifests = [self.rekit.manifest(tool_id)
                      for tool_id in (*request.tools, *request.model_tools)]
         manifest_contracts = {
@@ -303,6 +342,7 @@ class InvestigationController:
         target = Path(meta["target"])
         plan = _plan_from_meta(meta)
         concurrency = plan.ceilings.concurrency
+        self._worker_backend_with_concurrency(_model_profile_name(meta), concurrency)
 
         with FactoryLedger(paths.db_path) as ledger:
             ledger.requeue_stale_leases(paths.run_id)
@@ -2172,6 +2212,19 @@ def _plan_from_meta(meta: dict[str, Any]) -> InvestigationPlan:
         ceilings=ceilings,
     )
     return plan_investigation(meta["goal"], legacy, ceilings=ceilings)
+
+
+def _model_profile_name(meta: dict[str, Any]) -> str | None:
+    """Return the durable profile identity while preserving pre-profile run compatibility."""
+    profile = meta.get("modelProfile")
+    if profile is None:
+        return None
+    if isinstance(profile, str) and profile.strip():
+        return profile
+    if isinstance(profile, dict) and isinstance(profile.get("name"), str) \
+            and profile["name"].strip():
+        return profile["name"]
+    raise ValueError("run has an invalid model profile identity")
 
 
 def _adaptive_work(ledger: FactoryLedger, run_id: str) -> list[PlannedWork]:

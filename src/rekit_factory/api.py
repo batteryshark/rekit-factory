@@ -52,6 +52,9 @@ class DriveSupervisor:
             current = self._active.get(run_id)
             if current is not None and not current.done():
                 return False
+            # Surface policy failures to HTTP/CLI callers before accepting background work.
+            # ``drive`` repeats this check at the execution boundary to close the race.
+            self.controller.validate_run_concurrency(run_dir)
             future = asyncio.run_coroutine_threadsafe(self.controller.drive(run_dir), self.loop)
             self._active[run_id] = future
             future.add_done_callback(lambda _future: self._forget(run_id, _future))
