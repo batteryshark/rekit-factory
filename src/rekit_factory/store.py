@@ -13,6 +13,18 @@ from muster import Ledger, new_id, utcnow
 _UNSET = object()
 
 
+def _worker_semantic_key(*, run_id: str, work_item_id: str, worker_id: str,
+                         report_sha256: str, usage_json: str, provider: str,
+                         model: str, purpose: str) -> str:
+    binding = json.dumps({
+        "model": model, "provider": provider, "purpose": purpose,
+        "reportSha256": report_sha256, "runId": run_id,
+        "usage": json.loads(usage_json), "workerId": worker_id,
+        "workItemId": work_item_id,
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(binding.encode("utf-8")).hexdigest()
+
+
 FACTORY_SCHEMA = """
 create table if not exists factory_workers (
     id             text primary key,
@@ -74,6 +86,24 @@ create table if not exists factory_worker_sessions (
 );
 create index if not exists idx_factory_worker_sessions_run
     on factory_worker_sessions(run_id);
+
+create table if not exists factory_worker_semantic_commits (
+    commit_key      text primary key,
+    run_id          text not null,
+    work_item_id    text not null unique,
+    worker_id       text not null,
+    report_sha256   text not null,
+    report_json     text not null,
+    usage_json      text not null,
+    provider        text not null,
+    model           text not null,
+    purpose         text not null,
+    status          text not null default 'staged',
+    created_at      text not null,
+    completed_at    text
+);
+create index if not exists idx_factory_worker_semantic_commits_run
+    on factory_worker_semantic_commits(run_id, status);
 
 create table if not exists factory_tool_calls (
     id             text primary key,
@@ -316,6 +346,168 @@ class FactoryLedger(Ledger):
             item["pendingCalls"] = json.loads(item.pop("pending_calls_json"))
             result.append(item)
         return result
+
+    def stage_worker_semantic_commit(
+            self, run_id: str, work_item_id: str, worker_id: str, *,
+            report: dict[str, Any], usage: dict[str, Any], provider: str,
+            model: str, purpose: str) -> str:
+        """Durably bind one returned model report before cross-store projection."""
+        work = self.get_work_item(work_item_id)
+        worker = self.conn.execute(
+            "select * from factory_workers where id=?", (worker_id,),
+        ).fetchone()
+        if work is None or work["run_id"] != run_id or worker is None \
+                or worker["run_id"] != run_id:
+            raise ValueError("worker semantic authority does not match run/work identity")
+        work_payload = json.loads(work["payload_json"])
+        if work_payload.get("workerId") != worker_id:
+            raise ValueError("worker semantic authority conflicts with work payload")
+        report_json = json.dumps(report, sort_keys=True, separators=(",", ":"))
+        usage_json = json.dumps(usage, sort_keys=True, separators=(",", ":"))
+        report_sha256 = hashlib.sha256(report_json.encode("utf-8")).hexdigest()
+        commit_key = _worker_semantic_key(
+            run_id=run_id, work_item_id=work_item_id, worker_id=worker_id,
+            report_sha256=report_sha256, usage_json=usage_json,
+            provider=provider, model=model, purpose=purpose,
+        )
+        existing = self.conn.execute(
+            "select * from factory_worker_semantic_commits where work_item_id=?",
+            (work_item_id,),
+        ).fetchone()
+        if existing is not None:
+            exact = (
+                existing["commit_key"] == commit_key
+                and existing["worker_id"] == worker_id
+                and existing["report_json"] == report_json
+                and existing["usage_json"] == usage_json
+                and existing["provider"] == provider
+                and existing["model"] == model
+                and existing["purpose"] == purpose
+            )
+            if not exact:
+                raise ValueError("worker semantic commit conflicts with staged report")
+            return commit_key
+        self.conn.execute(
+            "insert into factory_worker_semantic_commits "
+            "(commit_key,run_id,work_item_id,worker_id,report_sha256,report_json,"
+            "usage_json,provider,model,purpose,created_at) values (?,?,?,?,?,?,?,?,?,?,?)",
+            (commit_key, run_id, work_item_id, worker_id, report_sha256, report_json,
+             usage_json, provider, model, purpose, utcnow()),
+        )
+        self.conn.commit()
+        return commit_key
+
+    def worker_semantic_commit(self, work_item_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "select * from factory_worker_semantic_commits where work_item_id=?",
+            (work_item_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        actual_report_sha256 = hashlib.sha256(
+            result["report_json"].encode("utf-8")
+        ).hexdigest()
+        actual_key = _worker_semantic_key(
+            run_id=result["run_id"], work_item_id=result["work_item_id"],
+            worker_id=result["worker_id"], report_sha256=actual_report_sha256,
+            usage_json=result["usage_json"], provider=result["provider"],
+            model=result["model"], purpose=result["purpose"],
+        )
+        if actual_report_sha256 != result["report_sha256"] \
+                or actual_key != result["commit_key"]:
+            raise ValueError("staged worker semantic commit failed integrity verification")
+        result["report"] = json.loads(result.pop("report_json"))
+        result["usage"] = json.loads(result.pop("usage_json"))
+        return result
+
+    def complete_worker_semantic_commit(
+            self, commit_key: str, *, completion_payload: dict[str, Any],
+            activity_events: list[dict[str, Any]],
+            failure_injector: Callable[[str], None] | None = None) -> None:
+        """Atomically expose report, usage, events, and worker/work completion."""
+        staged = self.conn.execute(
+            "select * from factory_worker_semantic_commits where commit_key=?",
+            (commit_key,),
+        ).fetchone()
+        if staged is None:
+            raise KeyError(commit_key)
+        actual_report_sha256 = hashlib.sha256(
+            staged["report_json"].encode("utf-8")
+        ).hexdigest()
+        actual_key = _worker_semantic_key(
+            run_id=staged["run_id"], work_item_id=staged["work_item_id"],
+            worker_id=staged["worker_id"], report_sha256=actual_report_sha256,
+            usage_json=staged["usage_json"], provider=staged["provider"],
+            model=staged["model"], purpose=staged["purpose"],
+        )
+        if actual_report_sha256 != staged["report_sha256"] or actual_key != commit_key:
+            raise ValueError("staged worker semantic commit failed integrity verification")
+        if staged["status"] == "complete":
+            return
+        report = json.loads(staged["report_json"])
+        work = self.get_work_item(staged["work_item_id"])
+        worker = self.conn.execute(
+            "select * from factory_workers where id=?", (staged["worker_id"],),
+        ).fetchone()
+        if work is None or worker is None or work["run_id"] != staged["run_id"] \
+                or worker["run_id"] != staged["run_id"]:
+            raise ValueError("staged worker semantic authority no longer matches")
+        now = utcnow()
+        model_call_id = "model-semantic-" + commit_key
+        completed_event_id = "event-worker-" + commit_key
+        with self.conn:
+            self.conn.execute(
+                "insert into factory_model_calls "
+                "(id,run_id,worker_id,provider,model,purpose,usage_json,created_at) "
+                "values (?,?,?,?,?,?,?,?)",
+                (model_call_id, staged["run_id"], staged["worker_id"],
+                 staged["provider"], staged["model"], staged["purpose"],
+                 staged["usage_json"], staged["created_at"]),
+            )
+            if failure_injector:
+                failure_injector("model-call")
+            self.conn.execute(
+                "update work_items set status='done',state_label='completed',updated_at=?,"
+                "terminal_at=?,result_json=?,error=null,evidence=? where id=? and run_id=?",
+                (now, now, staged["report_json"],
+                 "Bounded model review over target snapshot and ledgered tool output",
+                 staged["work_item_id"], staged["run_id"]),
+            )
+            if failure_injector:
+                failure_injector("report-projection")
+            self.conn.execute(
+                "update factory_workers set status='done',current_step=?,error=null,"
+                "updated_at=?,completed_at=coalesce(completed_at,?) where id=? and run_id=?",
+                (report["status_update"], now, now, staged["worker_id"], staged["run_id"]),
+            )
+            if failure_injector:
+                failure_injector("worker-completion")
+            self.conn.execute(
+                "insert into factory_events "
+                "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                "values (?,?,?,?,?,?,?)",
+                (completed_event_id, staged["run_id"], staged["worker_id"],
+                 "worker.completed", report["status_update"],
+                 json.dumps(completion_payload, sort_keys=True), now),
+            )
+            for index, event in enumerate(activity_events):
+                self.conn.execute(
+                    "insert into factory_events "
+                    "(id,run_id,worker_id,kind,message,payload_json,created_at) "
+                    "values (?,?,?,?,?,?,?)",
+                    (f"event-worker-{commit_key}-{index}", staged["run_id"],
+                     staged["worker_id"], event["kind"], event["message"],
+                     json.dumps(event.get("payload", {}), sort_keys=True), now),
+                )
+            if failure_injector:
+                failure_injector("semantic-events")
+            self.conn.execute(
+                "update factory_worker_semantic_commits set status='complete',completed_at=? "
+                "where commit_key=?", (now, commit_key),
+            )
+            if failure_injector:
+                failure_injector("commit-marker")
 
     def start_tool_call(self, run_id: str, work_item_id: str, tool_id: str,
                         safety_tier: int, *, manifest_digest: str,

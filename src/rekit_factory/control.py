@@ -31,6 +31,7 @@ from rekit_factory.models import (
     ModelTool,
     ModelToolResult,
     WorkerBackend,
+    WorkerReport,
     WorkerTurn,
 )
 from rekit_factory.evidence import (
@@ -126,6 +127,19 @@ class TerminalPublicationConflict(RuntimeError):
 
 TerminalFaultInjector = Callable[[str], None]
 
+WORKER_SEMANTIC_BOUNDARIES = (
+    "report-staged", "memory-applied", "proposals-enqueued", "model-call",
+    "report-projection", "worker-completion", "semantic-events", "commit-marker",
+    "semantic-complete",
+)
+
+
+class WorkerSemanticInterruption(BaseException):
+    """Test-only process crash signal that bypasses queue error conversion."""
+
+
+WorkerSemanticFaultInjector = Callable[[str], None]
+
 
 def enforce_model_profile_concurrency(profile: ModelProfile, requested: int) -> None:
     """Reject worker fan-out above ``profile`` without disclosing private config."""
@@ -206,11 +220,13 @@ class InvestigationController:
                  knowledge_roots: Iterable[KnowledgeRoot | str | Path] = (),
                  safety_policies: SafetyPolicyCatalog | None = None,
                  terminal_fault_injector: TerminalFaultInjector | None = None,
-                 creation_fault_injector: Callable[[str], None] | None = None):
+                 creation_fault_injector: Callable[[str], None] | None = None,
+                 worker_semantic_fault_injector: WorkerSemanticFaultInjector | None = None):
         self.storage_root = Path(storage_root).expanduser().resolve()
         self.rekit = rekit
         self.terminal_fault_injector = terminal_fault_injector
         self.creation_fault_injector = creation_fault_injector
+        self.worker_semantic_fault_injector = worker_semantic_fault_injector
         configured_knowledge = tuple(knowledge_roots)
         self.knowledge = KnowledgeCatalog(configured_knowledge) if configured_knowledge else None
         if isinstance(workers, dict):
@@ -237,6 +253,12 @@ class InvestigationController:
     def _creation_checkpoint(self, boundary: str) -> None:
         if self.creation_fault_injector is not None:
             self.creation_fault_injector(boundary)
+
+    def _worker_semantic_checkpoint(self, boundary: str) -> None:
+        if boundary not in WORKER_SEMANTIC_BOUNDARIES:
+            raise ValueError(f"unknown worker semantic boundary {boundary!r}")
+        if self.worker_semantic_fault_injector is not None:
+            self.worker_semantic_fault_injector(boundary)
 
     @property
     def workers(self) -> WorkerBackend:
@@ -1386,6 +1408,13 @@ class InvestigationController:
         payload = json.loads(item["payload_json"])
         worker_id = payload["workerId"]
         role = payload["role"]
+        staged_semantic = ledger.worker_semantic_commit(item["id"])
+        if staged_semantic is not None:
+            self._reconcile_worker_semantic_commit(
+                ctx, item, payload, staged_semantic,
+                self.worker_backend(payload.get("modelProfile")).profile.name,
+            )
+            return
         hypothesis_id = payload.get("hypothesisId")
         hypothesis_test_id = payload.get("hypothesisTestId")
         if hypothesis_id and hypothesis_test_id:
@@ -1459,14 +1488,6 @@ class InvestigationController:
             if isinstance(turn, tuple):
                 report, usage = turn
                 turn = WorkerTurn(report=report, usage=usage, messages_json="[]")
-            ledger.record_model_call(
-                ctx.state.run_id,
-                worker_id,
-                provider=worker_backend.profile.provider,
-                model=worker_backend.profile.model,
-                purpose=role,
-                usage=turn.usage,
-            )
             knowledge_calls = [call for call in turn.deferred_calls
                                if call.capability == "knowledge"]
             if len(knowledge_calls) > 1:
@@ -1501,6 +1522,11 @@ class InvestigationController:
                 pending_calls=pending_calls,
             )
             if turn.deferred_calls:
+                ledger.record_model_call(
+                    ctx.state.run_id, worker_id,
+                    provider=worker_backend.profile.provider,
+                    model=worker_backend.profile.model, purpose=role, usage=turn.usage,
+                )
                 for call in turn.deferred_calls:
                     if call.capability == "knowledge":
                         operation = call.tool_id.removeprefix("knowledge.")
@@ -1568,97 +1594,21 @@ class InvestigationController:
             report = turn.report
             if report is None:
                 raise RuntimeError("model worker returned neither report nor tool requests")
-            accepted, rejected = self._append_memory_proposals(
-                ctx.deps.paths,
-                getattr(report, "proposed_memory_actions", ()),
+            commit_key = ledger.stage_worker_semantic_commit(
+                ctx.state.run_id, item["id"], worker_id,
+                report=report.model_dump(mode="json"), usage=turn.usage,
+                provider=worker_backend.profile.provider,
+                model=worker_backend.profile.model, purpose=role,
             )
-            hypothesis_updates = self._apply_hypothesis_updates(
-                ctx.deps.paths, getattr(report, "hypothesis_updates", ()),
-                expected_hypothesis_id=hypothesis_id,
-                expected_test_id=hypothesis_test_id,
+            self._worker_semantic_checkpoint("report-staged")
+            staged_semantic = ledger.worker_semantic_commit(item["id"])
+            if staged_semantic is None or staged_semantic["commit_key"] != commit_key:
+                raise RuntimeError("staged worker semantic report became unavailable")
+            self._reconcile_worker_semantic_commit(
+                ctx, item, payload, staged_semantic, worker_backend.profile.name,
             )
-            reproduction_results = self._apply_reproduction_results(
-                ctx.deps.paths, payload, worker_backend.profile.name,
-                getattr(report, "reproduction_results", ()),
-            )
-            if payload.get("findingId") and reproduction_results == 0:
-                event_id = ledger.event_log(
-                    ctx.state.run_id, "finding.validation_inconclusive",
-                    "Validator completed without a matching structured reproduction result",
-                    worker_id=worker_id,
-                    payload={"findingId": payload["findingId"],
-                             "attemptId": payload.get("reproductionAttemptId")},
-                )
-                self._record_inconclusive_reproduction(
-                    ctx.deps.paths, payload, worker_backend.profile.name,
-                    "No matching structured reproduction result was returned",
-                    EvidenceRef("run-event", event_id),
-                )
-            hypotheses_scheduled, hypotheses_rejected = self._schedule_hypotheses(
-                ledger, ctx.deps.paths, ctx.state.run_id, item,
-                worker_backend.profile.name, payload.get("availableTools", ()),
-                getattr(report, "proposed_hypotheses", ()),
-            )
-            findings_scheduled, findings_rejected = self._schedule_findings(
-                ledger, ctx.deps.paths, ctx.state.run_id, item,
-                worker_backend.profile.name, payload.get("availableTools", ()),
-                getattr(report, "proposed_findings", ()),
-            )
-            if payload.get("findingId") and reproduction_results:
-                self._schedule_remaining_reproduction(
-                    ledger, ctx.deps.paths, ctx.state.run_id, item,
-                    worker_backend.profile.name, payload.get("availableTools", ()),
-                    payload["findingId"],
-                )
-            if hypothesis_id and hypothesis_test_id and hypothesis_updates == 0:
-                current = HypothesisMemory(_project_memory_log(ctx.deps.paths)).log.replay().hypotheses[
-                    hypothesis_id
-                ]
-                HypothesisMemory(_project_memory_log(ctx.deps.paths)).transition(HypothesisUpdate(
-                    hypothesis_id=hypothesis_id, test_id=hypothesis_test_id,
-                    status="blocked", confidence=float(current["confidence"]),
-                    reason="Test completed without a valid explicit hypothesis outcome",
-                ))
-                HypothesisMemory(_project_memory_log(ctx.deps.paths)).update_test(
-                    hypothesis_test_id, "blocked", outcome="missing-explicit-outcome"
-                )
-            ledger.resolve(
-                item["id"],
-                result=report.model_dump(mode="json"),
-                evidence="Bounded model review over target snapshot and ledgered tool output",
-                state_label="completed",
-            )
-            ledger.update_worker(worker_id, status="done", current_step=report.status_update)
-            ledger.event_log(
-                ctx.state.run_id,
-                "worker.completed",
-                report.status_update,
-                worker_id=worker_id,
-                payload={"observationCount": len(report.observations),
-                         "nextActionCount": len(report.next_actions),
-                         "memoryActionCount": accepted,
-                         "memoryActionRejectedCount": rejected},
-            )
-            if hypotheses_scheduled or hypotheses_rejected or hypothesis_updates:
-                ledger.event_log(
-                    ctx.state.run_id, "hypothesis.activity",
-                    "Processed structured hypothesis actions", worker_id=worker_id,
-                    payload={"scheduled": hypotheses_scheduled,
-                             "rejected": hypotheses_rejected,
-                             "updates": hypothesis_updates},
-                )
-            if findings_scheduled or findings_rejected or reproduction_results:
-                ledger.event_log(
-                    ctx.state.run_id, "finding.activity",
-                    "Processed structured proof-gated finding actions", worker_id=worker_id,
-                    payload={"scheduled": findings_scheduled,
-                             "rejected": findings_rejected,
-                             "reproductionResults": reproduction_results},
-                )
-            self._enqueue_follow_ups(
-                ledger, ctx.state.run_id, item, payload, report.next_actions,
-                ctx.deps.paths, worker_backend.profile.name,
-            )
+        except WorkerSemanticInterruption:
+            raise
         except Exception as exc:
             retry_ceiling = int(payload.get("retryCeiling", 1))
             if item["attempts"] <= retry_ceiling:
@@ -1705,6 +1655,106 @@ class InvestigationController:
                         hypothesis_test_id, "blocked", outcome="stop-condition-exhausted"
                     )
             raise
+
+    def _reconcile_worker_semantic_commit(
+            self, ctx: Any, item: dict[str, Any], payload: dict[str, Any],
+            staged: dict[str, Any], model_profile: str) -> None:
+        """Replay idempotent cross-store actions, then atomically publish completion."""
+        ledger: FactoryLedger = ctx.deps.ledger
+        report = WorkerReport.model_validate(staged["report"])
+        worker_id = payload["workerId"]
+        hypothesis_id = payload.get("hypothesisId")
+        hypothesis_test_id = payload.get("hypothesisTestId")
+        accepted, rejected = self._append_memory_proposals(
+            ctx.deps.paths, report.proposed_memory_actions,
+        )
+        hypothesis_updates = self._apply_hypothesis_updates(
+            ctx.deps.paths, report.hypothesis_updates,
+            expected_hypothesis_id=hypothesis_id,
+            expected_test_id=hypothesis_test_id,
+        )
+        reproduction_results = self._apply_reproduction_results(
+            ctx.deps.paths, payload, model_profile, report.reproduction_results,
+        )
+        if payload.get("findingId") and reproduction_results == 0:
+            event_id = ledger.event_log_once(
+                ctx.state.run_id,
+                f"finding-inconclusive:{staged['commit_key']}",
+                "finding.validation_inconclusive",
+                "Validator completed without a matching structured reproduction result",
+                worker_id=worker_id,
+                payload={"findingId": payload["findingId"],
+                         "attemptId": payload.get("reproductionAttemptId")},
+            )
+            self._record_inconclusive_reproduction(
+                ctx.deps.paths, payload, model_profile,
+                "No matching structured reproduction result was returned",
+                EvidenceRef("run-event", event_id),
+            )
+        if hypothesis_id and hypothesis_test_id and hypothesis_updates == 0:
+            hypothesis_memory = HypothesisMemory(_project_memory_log(ctx.deps.paths))
+            current = hypothesis_memory.log.replay().hypotheses[hypothesis_id]
+            if current["status"] in {"queued", "testing"}:
+                hypothesis_memory.transition(HypothesisUpdate(
+                    hypothesis_id=hypothesis_id, test_id=hypothesis_test_id,
+                    status="blocked", confidence=float(current["confidence"]),
+                    reason="Test completed without a valid explicit hypothesis outcome",
+                ))
+                hypothesis_memory.update_test(
+                    hypothesis_test_id, "blocked", outcome="missing-explicit-outcome"
+                )
+        self._worker_semantic_checkpoint("memory-applied")
+
+        hypotheses_scheduled, hypotheses_rejected = self._schedule_hypotheses(
+            ledger, ctx.deps.paths, ctx.state.run_id, item, model_profile,
+            payload.get("availableTools", ()), report.proposed_hypotheses,
+        )
+        findings_scheduled, findings_rejected = self._schedule_findings(
+            ledger, ctx.deps.paths, ctx.state.run_id, item, model_profile,
+            payload.get("availableTools", ()), report.proposed_findings,
+        )
+        if payload.get("findingId") and reproduction_results:
+            self._schedule_remaining_reproduction(
+                ledger, ctx.deps.paths, ctx.state.run_id, item, model_profile,
+                payload.get("availableTools", ()), payload["findingId"],
+            )
+        self._enqueue_follow_ups(
+            ledger, ctx.state.run_id, item, payload, report.next_actions,
+            ctx.deps.paths, model_profile,
+        )
+        self._worker_semantic_checkpoint("proposals-enqueued")
+
+        activity_events = []
+        if (report.proposed_hypotheses or report.hypothesis_updates
+                or hypotheses_scheduled or hypotheses_rejected or hypothesis_updates):
+            activity_events.append({
+                "kind": "hypothesis.activity",
+                "message": "Processed structured hypothesis actions",
+                "payload": {"scheduled": hypotheses_scheduled,
+                            "rejected": hypotheses_rejected,
+                            "updates": hypothesis_updates},
+            })
+        if (report.proposed_findings or report.reproduction_results
+                or findings_scheduled or findings_rejected or reproduction_results):
+            activity_events.append({
+                "kind": "finding.activity",
+                "message": "Processed structured proof-gated finding actions",
+                "payload": {"scheduled": findings_scheduled,
+                            "rejected": findings_rejected,
+                            "reproductionResults": reproduction_results},
+            })
+        ledger.complete_worker_semantic_commit(
+            staged["commit_key"],
+            completion_payload={
+                "observationCount": len(report.observations),
+                "nextActionCount": len(report.next_actions),
+                "memoryActionCount": accepted,
+                "memoryActionRejectedCount": rejected,
+            },
+            activity_events=activity_events,
+            failure_injector=self._worker_semantic_checkpoint,
+        )
+        self._worker_semantic_checkpoint("semantic-complete")
 
     def _append_memory_proposals(self, paths: RunPaths,
                                  proposals: Any) -> tuple[int, int]:
@@ -2069,8 +2119,9 @@ class InvestigationController:
                 [dependency_rows[value] for value in planned.depends_on],
             )
             existing.append(planned)
-            ledger.event_log(
-                run_id, "strategy.follow_up_enqueued",
+            ledger.event_log_once(
+                run_id, f"follow-up-enqueued:{planned.id}",
+                "strategy.follow_up_enqueued",
                 f"{planned.role} follow-up enqueued", worker_id=payload["workerId"],
                 payload={"workItemId": work_item_id, "planId": planned.id,
                          "evidenceIds": list(planned.evidence_ids)},
