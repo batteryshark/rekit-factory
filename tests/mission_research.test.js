@@ -4,6 +4,7 @@ const MissionResearch = require("../src/rekit_factory/ui/mission-research.js");
 
 function snapshot() {
   return {
+    meta: {projectId: "project-a"},
     hypothesisState: {
       hypotheses: [{id: "hyp-a", claim: "Parser length controls allocation", status: "testing", confidence: .72, expectedObservation: "allocation follows length", falsifier: "allocation is constant", stopCondition: {max_attempts: 2, max_cost_units: 30}, references: [{kind: "evidence", id: "artifact-a"}]}],
       tests: [{id: "test-a", hypothesisId: "hyp-a", objective: "Vary length", status: "testing", priority: 410, attempts: 1, expected_observation: "allocation changes", falsifying_observation: "no change"}],
@@ -67,4 +68,55 @@ test("large proof histories are bounded before rendering", () => {
   const model = MissionResearch.model(value);
   assert.equal(model.findings[0].attempts.length, 32);
   assert.equal(model.findings[0].proofEvidence.length, 32);
+});
+
+test("reconnect renders are deterministic, non-mutating, and retain native keyboard controls", () => {
+  const value = snapshot(), before = JSON.stringify(value);
+  const first = MissionResearch.render(value), second = MissionResearch.render(value);
+  assert.equal(first, second);
+  assert.equal(JSON.stringify(value), before);
+  assert.match(first, /<details class="research-proof-detail"><summary>/);
+  assert.match(first, /aria-label="operator accepted"/);
+  for (const button of first.matchAll(/<button\b[^>]*>/g)) assert.match(button[0], /type="button"/);
+});
+
+test("large multi-finding histories remain per-finding bounded and omit private evidence fields", () => {
+  const value = snapshot();
+  value.findingState.findings = Array.from({length: 256}, (_, index) => ({
+    ...value.findingState.findings[0], id: `finding-${index}`,
+    references: Array.from({length: 64}, (__, ref) => ({kind: "evidence", id: `artifact-${ref}`})),
+  }));
+  value.findingState.attempts = Array.from({length: 512}, (_, index) => ({
+    id: `attempt-${index}`, findingId: `finding-${index % 256}`, outcome: "negative",
+    references: [{kind: "evidence", id: `artifact-${index % 64}`}],
+  }));
+  value.evidenceRecords = Array.from({length: 512}, (_, index) => ({
+    artifactId: `artifact-${index}`, kind: "output", state: "active",
+    originalSha256: "a".repeat(64), displaySha256: "b".repeat(64),
+    rawPath: `/secret/raw/${index}`, displayPath: `/secret/display/${index}`, rawBytes: "PRIVATE_BYTES",
+  }));
+  const model = MissionResearch.model(value), html = MissionResearch.render(value);
+  assert.equal(model.findings.length, 256);
+  assert.ok(model.findings.every(finding => finding.attempts.length <= 32 && finding.proofEvidence.length <= 32));
+  assert.doesNotMatch(html, /\/secret\/|PRIVATE_BYTES|rawPath|displayPath/);
+});
+
+test("renders only exact server-published finding authority", () => {
+  const value = snapshot();
+  value.memoryAuthority = {schemaVersion: 1, projectId: "project-a", revision: 12, degraded: false, operations: [
+    {action: "finding-accept", entityType: "finding", entityId: "finding-a", expectedEntitySha256: "a".repeat(64)},
+    {action: "finding-reject", entityType: "finding", entityId: "finding-a", expectedEntitySha256: "a".repeat(64)},
+    {action: "finding-accept", entityType: "finding", entityId: "other", expectedEntitySha256: "b".repeat(64)},
+  ]};
+  const html = MissionResearch.render(value);
+  assert.match(html, /data-memory-operation="finding-accept"/);
+  assert.match(html, /data-memory-operation="finding-reject"/);
+  assert.match(html, /data-memory-revision="12"/);
+  assert.match(html, /data-memory-project="project-a"/);
+  assert.match(html, new RegExp(`data-memory-digest="${"a".repeat(64)}"`));
+  value.memoryAuthority.operations[0].expectedEntitySha256 = "forged";
+  value.memoryAuthority.operations[1].entityType = "workstream";
+  assert.doesNotMatch(MissionResearch.render(value), /data-memory-operation=/);
+  value.memoryAuthority.degraded = true;
+  assert.equal(MissionResearch.authorityOperations(value).length, 0);
 });

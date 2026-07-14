@@ -136,6 +136,10 @@ def test_webhook_request_has_exact_idempotency_and_no_credential_material():
     body = json.loads(request.body)
     assert body["idempotencyKey"] == record["payload"]["dedupeKey"]
     assert body["message"] == "Operator decision is waiting in Mission Control."
+    assert body["deepLinkUrl"] == (
+        "rekit-factory://mission-control/?mc=mc-v1&tab=decisions&"
+        "type=operator-decision&entity=question-1&run=run-1"
+    )
     serialized = repr(request) + request.body.decode()
     assert "credential:" not in serialized
     assert "super-secret" not in serialized
@@ -283,6 +287,10 @@ def test_campaign_delivery_preview_and_webhook_are_exact_redacted_and_linked(kin
     }
     assert {key: body[key] for key in preview} == preview
     assert body["notificationId"] == record["id"]
+    assert body["deepLinkUrl"] == (
+        "rekit-factory://mission-control/?mc=mc-v1&tab=campaigns&"
+        "type=campaign&entity=campaign-1"
+    )
     serialized = json.dumps({"preview": preview, "body": body})
     assert "transitionMarker" not in serialized
     assert "credential:" not in serialized
@@ -313,7 +321,7 @@ def test_test_webhook_body_matches_preview_and_uses_stable_test_idempotency():
     assert {key: body[key] for key in preview} == preview
 
 
-def test_desktop_delivery_is_best_effort_and_never_forwards_entity_identifiers():
+def test_desktop_delivery_is_best_effort_and_forwards_only_the_exact_route():
     channel = DesktopChannel("desktop-local")
     transport = FakeDesktopTransport()
     record = _record()
@@ -323,7 +331,8 @@ def test_desktop_delivery_is_best_effort_and_never_forwards_entity_identifiers()
     assert transport.calls == [{
         "title": "Rekit Factory needs you",
         "message": "Operator decision is waiting in Mission Control.",
-        "deep_link": "rekit-factory://mission-control",
+        "deep_link": ("rekit-factory://mission-control/?mc=mc-v1&tab=decisions&"
+                      "type=operator-decision&entity=question-1&run=run-1"),
         "idempotency_key": record["payload"]["dedupeKey"],
     }]
     error = RuntimeError("/Users/private/key token=secret")

@@ -166,6 +166,10 @@ def test_configured_finding_stage_reaches_provider_once_with_exact_proof_link(tm
         "view": "mission-control", "runId": "run-1", "tab": "dossiers",
         "entityType": "proof-bundle", "entityId": "dossier-1",
     }
+    assert transport.bodies[0]["deepLinkUrl"] == (
+        "rekit-factory://mission-control/?mc=mc-v1&tab=dossiers&"
+        "type=proof-bundle&entity=dossier-1&run=run-1"
+    )
 
     # Reconnect/restart observes the same canonical state and cannot create a second
     # provider call for the already delivered configured-stage transition.

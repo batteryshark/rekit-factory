@@ -38,6 +38,8 @@ from rekit_factory.notification_supervisor import NotificationDeliverySupervisor
 from rekit_factory.scope import AuthorizedScope
 from rekit_factory.store import FactoryLedger
 from rekit_factory.automation import AutomationGateway
+from rekit_factory.mission_routes import public_route_contract
+from rekit_factory.memory import MemoryOperationConflict
 
 
 MAX_BODY = 1_000_000
@@ -299,6 +301,7 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {
                     "serviceInstance": self.server.instance_id,
                     "restartAvailable": self.server.allow_restart,
+                    "navigationRoute": public_route_contract(),
                     "storageRoot": str(self.server.storage_root),
                     "modelProfile": self.server.controller.workers.profile.public_dict(),
                     "modelProfiles": [backend.profile.public_dict()
@@ -643,6 +646,24 @@ class FactoryHandler(BaseHTTPRequestHandler):
                     "pendingQuestions": result["pendingQuestions"],
                 })
                 return
+            if (len(parts) == 4 and parts[:2] == ["api", "runs"]
+                    and parts[3] == "memory-operations"):
+                expected = {"action", "entityId", "expectedProjectId", "expectedRevision",
+                            "expectedEntitySha256", "rationale"}
+                if set(payload) != expected:
+                    raise ValueError(
+                        "project-memory operation body must contain only exact authority fields"
+                    )
+                run_dir = _find_run(self.server.storage_root, parts[2])
+                result = self.server.controller.mutate_project_memory(
+                    run_dir, action=payload["action"], entity_id=payload["entityId"],
+                    expected_revision=payload["expectedRevision"],
+                    expected_entity_sha256=payload["expectedEntitySha256"],
+                    expected_project_id=payload["expectedProjectId"],
+                    rationale=payload["rationale"],
+                )
+                self._json(HTTPStatus.OK, {"runId": parts[2], **result})
+                return
             if (len(parts) == 6 and parts[:2] == ["api", "runs"]
                     and parts[3] == "notifications" and parts[5] == "acknowledge"):
                 if set(payload) != {"expectedRevision"}:
@@ -692,7 +713,8 @@ class FactoryHandler(BaseHTTPRequestHandler):
             status = (HTTPStatus.NOT_FOUND if "does not exist" in str(exc)
                       else HTTPStatus.CONFLICT)
             self._json(status, {"error": str(exc)})
-        except (NotificationStateConflict, NotificationConfigurationConflict) as exc:
+        except (NotificationStateConflict, NotificationConfigurationConflict,
+                MemoryOperationConflict) as exc:
             self._json(HTTPStatus.CONFLICT, {"error": str(exc)})
         except NotificationNotFound as exc:
             self._json(HTTPStatus.NOT_FOUND, {

@@ -46,6 +46,7 @@ from rekit_factory.evidence import (
     render_tool_output,
 )
 from rekit_factory.memory import EvidenceRef, MemoryAction, ProjectMemoryLog, memory_context
+from rekit_factory.memory_authority import apply_memory_operation, public_memory_authority
 from rekit_factory.knowledge import KnowledgeCatalog, KnowledgeConcept, KnowledgeRoot
 from rekit_factory.hypotheses import (
     HypothesisMemory,
@@ -737,6 +738,19 @@ class InvestigationController:
             return asyncio.run(self.drive(paths.run_dir))
         return self.snapshot(paths.run_dir)
 
+    def mutate_project_memory(
+        self, run_dir: str | Path, *, action: str, entity_id: str,
+        expected_revision: int, expected_entity_sha256: str,
+        expected_project_id: str, rationale: str,
+    ) -> dict[str, Any]:
+        paths = resolve_run_dir(run_dir)
+        return apply_memory_operation(
+            _project_memory_log(paths), action=action, entity_id=entity_id,
+            expected_revision=expected_revision,
+            expected_entity_sha256=expected_entity_sha256,
+            expected_project_id=expected_project_id, rationale=rationale,
+        )
+
     def snapshot(self, run_dir: str | Path, *, admit_notifications: bool = True) -> dict[str, Any]:
         paths = resolve_run_dir(run_dir)
         with FactoryLedger(paths.db_path) as ledger:
@@ -862,6 +876,7 @@ class InvestigationController:
             "toolCalls": tool_calls,
             "artifacts": artifacts,
             "memory": memory_projection,
+            "memoryAuthority": public_memory_authority(project_memory, meta["projectId"]),
             "memoryContext": memory_context(project_memory),
             "hypothesisState": hypothesis_snapshot(project_memory),
             "findingState": finding_snapshot(project_memory),

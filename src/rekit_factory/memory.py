@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Callable, Literal
 
 from muster import utcnow
@@ -26,13 +27,18 @@ KNOWN_TYPES = frozenset({
     "hypothesis_upserted", "hypothesis_test_upserted", "hypothesis_observation_recorded",
     "finding_upserted", "finding_attempt_recorded", "finding_transition_recorded",
     "finding_operator_decision_recorded",
+    "operator_mutation_applied",
 })
-ENTITY_TYPES = KNOWN_TYPES - {"session_compacted"}
+ENTITY_TYPES = KNOWN_TYPES - {"session_compacted", "operator_mutation_applied"}
 REFERENCE_KINDS = frozenset({
     "memory-event", "ledger-event", "artifact", "run-event", "question",
     "capability-lead", "external",
 })
 MAX_EVENT_BYTES = 32_768
+
+
+class MemoryOperationConflict(ValueError):
+    """An exact operator mutation conflicts with durable project-memory state."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,7 @@ class MemoryAction:
         "hypothesis_observation_recorded",
         "finding_upserted", "finding_attempt_recorded", "finding_transition_recorded",
         "finding_operator_decision_recorded",
+        "operator_mutation_applied",
     ]
     payload: dict[str, Any]
     action_id: str | None = None
@@ -119,24 +126,85 @@ class ProjectMemoryLog:
         with self.lock_path.open("a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             events, _ = _read_events(self.path)
+            return self._append_locked(events, action.type, payload, action_id)
+
+    def apply_operation(
+        self, *, operation_id: str, expected_revision: int, request: dict[str, Any],
+        build_actions: Callable[[ProjectMemory], list[MemoryAction]],
+    ) -> MemoryEvent:
+        """Validate and append one atomic operator mutation at an exact project revision.
+
+        The resulting domain actions live inside one fsynced memory event. Exact replay returns
+        that event even after the project revision advances; conflicting operation reuse and
+        partial multi-event effects are impossible.
+        """
+        if not isinstance(operation_id, str) or re.fullmatch(
+                r"memory-operation-[0-9a-f]{64}", operation_id) is None:
+            raise ValueError("memory operation identity is invalid")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected memory revision must be a non-negative integer")
+        normalized_request = json.loads(json.dumps(request, sort_keys=True))
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            events, diagnostics = _read_events(self.path)
             for event in events:
-                if event.action_id == action_id:
-                    if event.type != action.type or event.payload != payload:
-                        raise ValueError(f"action id {action_id!r} already has different content")
-                    return event
-            seq = events[-1].seq + 1 if events else 1
-            event = MemoryEvent(
-                version=SCHEMA_VERSION, seq=seq, id=f"mem-{seq:08d}",
-                action_id=action_id, type=action.type, ts=utcnow(), payload=payload,
+                if event.action_id != operation_id:
+                    continue
+                if (event.type != "operator_mutation_applied"
+                        or event.payload.get("expectedRevision") != expected_revision
+                        or event.payload.get("request") != normalized_request):
+                    raise MemoryOperationConflict(
+                        "memory operation identity already has different content"
+                    )
+                return event
+            if diagnostics:
+                raise MemoryOperationConflict(
+                    "degraded project memory cannot accept operator mutations"
+                )
+            memory = fold_memory(events)
+            if memory.degraded:
+                raise MemoryOperationConflict(
+                    "degraded project memory cannot accept operator mutations"
+                )
+            if memory.last_seq != expected_revision:
+                raise MemoryOperationConflict("project memory revision is stale")
+            actions = build_actions(memory)
+            if not isinstance(actions, list) or not 1 <= len(actions) <= 4:
+                raise ValueError("memory operation must produce one to four bounded actions")
+            encoded_actions = []
+            for action in actions:
+                if not isinstance(action, MemoryAction) or action.type == "operator_mutation_applied":
+                    raise ValueError("memory operation produced an invalid nested action")
+                encoded_actions.append({"type": action.type, "payload": _validate_action(action)})
+            payload = _validate_action(MemoryAction("operator_mutation_applied", {
+                "operationId": operation_id, "expectedRevision": expected_revision,
+                "request": normalized_request, "actions": encoded_actions,
+            }))
+            return self._append_locked(
+                events, "operator_mutation_applied", payload, operation_id,
             )
-            encoded = json.dumps(asdict(event), sort_keys=True, separators=(",", ":"))
-            if len(encoded.encode("utf-8")) > MAX_EVENT_BYTES:
-                raise ValueError("memory event is too large; store bulky evidence as an artifact reference")
-            with self.path.open("ab") as stream:
-                stream.write(encoded.encode("utf-8") + b"\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            return event
+
+    def _append_locked(self, events: list[MemoryEvent], event_type: str,
+                       payload: dict[str, Any], action_id: str) -> MemoryEvent:
+        for event in events:
+            if event.action_id == action_id:
+                if event.type != event_type or event.payload != payload:
+                    raise ValueError(f"action id {action_id!r} already has different content")
+                return event
+        seq = events[-1].seq + 1 if events else 1
+        event = MemoryEvent(
+            version=SCHEMA_VERSION, seq=seq, id=f"mem-{seq:08d}",
+            action_id=action_id, type=event_type, ts=utcnow(), payload=payload,
+        )
+        encoded = json.dumps(asdict(event), sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_EVENT_BYTES:
+            raise ValueError("memory event is too large; store bulky evidence as an artifact reference")
+        with self.path.open("ab") as stream:
+            stream.write(encoded.encode("utf-8") + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        return event
 
     def replay(self, *, reference_exists: Callable[[EvidenceRef], bool] | None = None
                ) -> ProjectMemory:
@@ -176,13 +244,30 @@ def fold_memory(events: list[MemoryEvent], *, diagnostics: list[str] | None = No
                 f"unknown event skipped at sequence {event.seq}: v{event.version} {event.type}"
             )
             continue
-        item = {**event.payload, "_eventSeq": event.seq, "_eventId": event.id}
-        if event.type == "goal_set":
-            memory.goals.append(item)
-        elif event.type == "session_compacted":
-            memory.compaction = item
+        if event.type == "operator_mutation_applied":
+            try:
+                operation_payload = _validate_action(MemoryAction(event.type, event.payload))
+            except (KeyError, TypeError, ValueError) as exc:
+                memory.degraded = True
+                memory.diagnostics.append(
+                    f"invalid operator mutation at sequence {event.seq}: {type(exc).__name__}"
+                )
+                continue
+            actions = operation_payload["actions"]
         else:
-            collection = {
+            actions = [{"type": event.type, "payload": event.payload}]
+        for operation_index, action in enumerate(actions):
+            action_type, action_payload = action["type"], action["payload"]
+            item = {**action_payload, "_eventSeq": event.seq, "_eventId": event.id}
+            if event.type == "operator_mutation_applied":
+                item["_operationId"] = event.action_id
+                item["_operationIndex"] = operation_index
+            if action_type == "goal_set":
+                memory.goals.append(item)
+            elif action_type == "session_compacted":
+                memory.compaction = item
+            else:
+                collection = {
                 "workstream_upserted": memory.workstreams,
                 "attempt_recorded": memory.attempts,
                 "decision_recorded": memory.decisions,
@@ -196,10 +281,14 @@ def fold_memory(events: list[MemoryEvent], *, diagnostics: list[str] | None = No
                 "finding_attempt_recorded": memory.finding_attempts,
                 "finding_transition_recorded": memory.finding_transitions,
                 "finding_operator_decision_recorded": memory.finding_operator_decisions,
-            }[event.type]
-            collection[item["id"]] = item
+                }[action_type]
+                collection[item["id"]] = item
         if reference_exists:
-            for reference in _references(event.payload):
+            reference_payloads = ([action["payload"] for action in actions]
+                                  if event.type == "operator_mutation_applied"
+                                  else [event.payload])
+            for reference in (reference for payload in reference_payloads
+                              for reference in _references(payload)):
                 if not reference_exists(reference):
                     missing = asdict(reference)
                     if missing not in memory.missing_references:
@@ -349,6 +438,24 @@ def _validate_action(action: MemoryAction) -> dict[str, Any]:
     if not isinstance(action.payload, dict):
         raise ValueError("memory action payload must be an object")
     payload = json.loads(json.dumps(action.payload, sort_keys=True))
+    if action.type == "operator_mutation_applied":
+        if set(payload) != {"operationId", "expectedRevision", "request", "actions"}:
+            raise ValueError("operator mutation must contain only exact operation fields")
+        if (not isinstance(payload["operationId"], str)
+                or re.fullmatch(r"memory-operation-[0-9a-f]{64}", payload["operationId"]) is None
+                or type(payload["expectedRevision"]) is not int
+                or payload["expectedRevision"] < 0
+                or type(payload["request"]) is not dict
+                or type(payload["actions"]) is not list
+                or not 1 <= len(payload["actions"]) <= 4):
+            raise ValueError("operator mutation fields are invalid")
+        for nested in payload["actions"]:
+            if type(nested) is not dict or set(nested) != {"type", "payload"}:
+                raise ValueError("operator mutation nested action is invalid")
+            if nested["type"] == "operator_mutation_applied":
+                raise ValueError("operator mutations cannot nest")
+            _validate_action(MemoryAction(nested["type"], nested["payload"]))
+        return payload
     required = {
         "goal_set": ("text",), "workstream_upserted": ("id", "title", "status", "goal"),
         "attempt_recorded": ("id", "intent", "method", "status", "result"),

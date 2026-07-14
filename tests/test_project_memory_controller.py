@@ -83,6 +83,11 @@ def test_completed_worker_actions_feed_later_worker_and_snapshot_projection():
         # The identical action proposed by both workers is one event.
         assert len(result["memory"]["attempts"]) == 1
         assert result["memory"]["last_seq"] == 2  # run goal + failed attempt
+        assert result["memoryAuthority"] == {
+            "schemaVersion": 1, "projectId": result["meta"]["projectId"],
+            "revision": 2, "degraded": False,
+            "operations": [], "totalCount": 0, "truncated": False,
+        }
 
 
 def test_new_controller_and_run_resume_project_memory_without_transcript():

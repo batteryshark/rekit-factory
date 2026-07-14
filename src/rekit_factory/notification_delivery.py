@@ -19,6 +19,7 @@ from typing import Any, Literal, Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from rekit_factory.campaign_notification_policy import POLICY_VERSION as CAMPAIGN_POLICY_VERSION
+from rekit_factory.mission_routes import mission_control_deep_link
 from rekit_factory.notification_policy import (
     POLICY_VERSION,
     STALE_DECISION_POLICY_VERSION,
@@ -179,6 +180,10 @@ def _delivery(record: Mapping[str, Any]) -> dict[str, Any]:
     if outbox_id != expected_notification_id:
         raise InvalidDeliveryConfiguration("notification id conflicts with idempotency identity")
     value["notificationId"] = outbox_id
+    try:
+        value["deepLinkUrl"] = mission_control_deep_link(value["deepLink"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidDeliveryConfiguration("delivery deep link route is invalid") from exc
     return value
 
 
@@ -434,7 +439,12 @@ def deliver_test_desktop(channel: DesktopChannel, test_id: str,
 def _deliver_desktop(channel: DesktopChannel, value: Mapping[str, Any],
                      transport: DesktopTransport) -> DeliveryAttempt:
     del channel  # The stable channel identity is used only to construct test idempotency keys.
-    deep_link = "rekit-factory://mission-control"
+    if value.get("kind") == "channel.test":
+        deep_link = "rekit-factory://mission-control"
+    else:
+        deep_link = value.get("deepLinkUrl")
+        if not isinstance(deep_link, str):
+            return DeliveryAttempt(False, "request-invalid")
     try:
         transport.notify(
             title=value["title"], message=value["message"], deep_link=deep_link,

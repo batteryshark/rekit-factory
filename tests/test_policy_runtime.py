@@ -269,6 +269,15 @@ def test_api_projects_policy_catalog_and_rejects_stale_identity(tmp_path):
         assert config["defaultSafetyPolicyId"] == controller.safety_policies.default_policy_id
         assert config["safetyPolicies"] == controller.public_safety_policies()
         assert config["strategies"] == controller.public_strategy_metadata()
+        assert config["navigationRoute"] == {
+            "schemaVersion": 1, "queryMarker": "mc-v1", "maxLength": 512,
+            "routes": [
+                {"entityType": "campaign", "surface": "campaigns", "requiresRun": False},
+                {"entityType": "finding", "surface": "outcomes", "requiresRun": True},
+                {"entityType": "operator-decision", "surface": "decisions", "requiresRun": True},
+                {"entityType": "proof-bundle", "surface": "dossiers", "requiresRun": True},
+            ],
+        }
         sequential = next(
             item for item in config["strategies"]
             if item["name"] == "recon-then-analysis"

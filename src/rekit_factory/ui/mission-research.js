@@ -15,6 +15,30 @@
   const refButtons = values => refs(values).map(ref => `<button type="button" data-research-ref-kind="${safe(ref.kind)}" data-research-ref-id="${safe(ref.id)}">${safe(ref.kind)}:${safe(ref.id)}</button>`).join("");
   const hypothesisLane = status => status === "testing" ? "testing" : ["supported", "contradicted"].includes(status) ? "supported" : ["disproved", "retired"].includes(status) ? "disproved" : status === "reproduced" ? "reproduction" : "proposed";
   const findingLane = status => ["operator-accepted", "reproduced", "rejected", "withdrawn", "inconclusive"].includes(status) ? status : status || "candidate";
+  const appendBounded = (index, key, value, ceiling) => {
+    if (!stable(key)) return;
+    const values = index.get(key) || [];
+    if (values.length < ceiling) values.push(value);
+    index.set(key, values);
+  };
+
+  function authorityOperations(snapshot) {
+    const authority = object(snapshot?.memoryAuthority);
+    if (authority.schemaVersion !== 1 || authority.degraded !== false
+        || !stable(authority.projectId)
+        || authority.projectId !== snapshot?.meta?.projectId
+        || !Number.isInteger(authority.revision) || authority.revision < 0) return [];
+    return list(authority.operations).slice(0, 64).flatMap(value => {
+      const item = object(value);
+      if (!stable(item.entityId) || !digest(item.expectedEntitySha256)
+          || !["finding-accept", "finding-reject"].includes(item.action)
+          || item.entityType !== "finding") return [];
+      return [{action: item.action, entityId: item.entityId,
+        expectedEntitySha256: item.expectedEntitySha256,
+        expectedProjectId: authority.projectId,
+        expectedRevision: authority.revision}];
+    });
+  }
 
   function model(snapshot) {
     const hypothesisState = object(snapshot?.hypothesisState), findingState = object(snapshot?.findingState);
@@ -23,19 +47,36 @@
     const evidence = list(snapshot?.evidenceRecords).slice(0, 512).filter(item => stable(item?.artifactId));
     const artifacts = list(snapshot?.artifacts).slice(0, 512).filter(item => stable(item?.id));
     const dossiers = degraded ? [] : list(snapshot?.dossiers).slice(0, 128).filter(item => stable(item?.id) && stable(item?.findingId));
+    const testsByHypothesis = new Map(), observationsByHypothesis = new Map(), attemptsByFinding = new Map(), attemptEvidenceByFinding = new Map(), dossiersByFinding = new Map();
+    tests.forEach(item => appendBounded(testsByHypothesis, item?.hypothesisId, item, 256));
+    observations.forEach(item => appendBounded(observationsByHypothesis, item?.hypothesisId, item, 512));
+    attempts.forEach(item => {
+      appendBounded(attemptsByFinding, item?.findingId, item, 32);
+      if (!stable(item?.findingId)) return;
+      const ids = attemptEvidenceByFinding.get(item.findingId) || new Set();
+      refs(item.references).forEach(ref => ids.add(ref.id));
+      attemptEvidenceByFinding.set(item.findingId, ids);
+    });
+    dossiers.forEach(item => appendBounded(dossiersByFinding, item?.findingId, item, 16));
     const hypotheses = list(hypothesisState.hypotheses).slice(0, 256).map(item => ({...item,
-      lane: hypothesisLane(item.status), tests: tests.filter(test => test.hypothesisId === item.id),
-      observations: observations.filter(observation => observation.hypothesisId === item.id),
+      lane: hypothesisLane(item.status), tests: testsByHypothesis.get(item.id) || [],
+      observations: observationsByHypothesis.get(item.id) || [],
     }));
-    const findings = list(findingState.findings).slice(0, 256).map(item => ({...item,
-      lane: findingLane(item.lifecycleStatus || item.status),
-      attempts: attempts.filter(attempt => attempt.findingId === item.id).slice(0, 32),
-      dossiers: dossiers.filter(dossier => dossier.findingId === item.id).slice(0, 16),
-      proofEvidence: evidence.filter(record => refs(item.references).some(ref => ref.id === record.artifactId)
-        || attempts.some(attempt => attempt.findingId === item.id && refs(attempt.references).some(ref => ref.id === record.artifactId))).slice(0, 32),
-      proofArtifacts: artifacts.filter(artifact => dossiers.some(dossier => dossier.findingId === item.id
-        && Object.values(object(dossier.artifactIds)).includes(artifact.id))).slice(0, 32),
-    }));
+    const operations = authorityOperations(snapshot);
+    const findings = list(findingState.findings).slice(0, 256).map(item => {
+      const findingAttempts = attemptsByFinding.get(item.id) || [], dossiersForFinding = dossiersByFinding.get(item.id) || [];
+      const evidenceIds = new Set(refs(item.references).map(ref => ref.id));
+      (attemptEvidenceByFinding.get(item.id) || []).forEach(id => evidenceIds.add(id));
+      const artifactIds = new Set(dossiersForFinding.flatMap(dossier => Object.values(object(dossier.artifactIds)).filter(stable)));
+      return {...item,
+        lane: findingLane(item.lifecycleStatus || item.status),
+        attempts: findingAttempts,
+        dossiers: dossiersForFinding,
+        proofEvidence: evidence.filter(record => evidenceIds.has(record.artifactId)).slice(0, 32),
+        proofArtifacts: artifacts.filter(artifact => artifactIds.has(artifact.id)).slice(0, 32),
+        authorityOperations: operations.filter(operation => operation.entityId === item.id),
+      };
+    });
     return {hypotheses, findings, degraded};
   }
 
@@ -47,7 +88,8 @@
 
   function findingCard(item) {
     const successes = item.attempts.filter(value => value.outcome === "success").length, policy = object(item.proofPolicy), decision = object(item.operatorDecision);
-    return `<article class="research-card finding ${safe(item.lane)}" data-research-finding="${safe(item.id)}"><header><span>${safe(item.findingType || "finding")} · ${safe(item.consequence || "unknown")}</span><b>${safe(item.lifecycleStatus || item.status)}</b></header><h4>${safe(item.impactClaim || item.id)}</h4><p class="research-uncertainty"><b>Known uncertainty</b>${safe(item.knownUncertainty || "None projected")}</p><div class="research-proof"><span><b>${successes}/${safe(policy.successful_clean_reproductions ?? policy.successfulCleanReproductions ?? "—")}</b> clean reproductions</span><span><b>${item.attempts.length}</b> attempts</span><span><b>${percent(item.confidence)}</b> confidence</span></div>${decision.decision ? `<div class="research-decision"><b>operator ${safe(decision.decision)}</b><span>${safe(decision.rationale || "")}</span></div>` : ""}${proofDetail(item)}<footer>${refButtons(item.references) || "<span>No evidence references projected</span>"}<button type="button" data-research-outcome="${safe(item.id)}">Canonical outcome →</button></footer></article>`;
+    const controls = item.authorityOperations.map(operation => `<button class="btn ${operation.action === "finding-reject" ? "red" : "primary"}" type="button" data-memory-operation="${safe(operation.action)}" data-memory-entity="${safe(item.id)}" data-memory-project="${safe(operation.expectedProjectId)}" data-memory-revision="${operation.expectedRevision}" data-memory-digest="${safe(operation.expectedEntitySha256)}">${operation.action === "finding-accept" ? "Accept reproduced finding" : "Reject finding"}</button>`).join("");
+    return `<article class="research-card finding ${safe(item.lane)}" data-research-finding="${safe(item.id)}"><header><span>${safe(item.findingType || "finding")} · ${safe(item.consequence || "unknown")}</span><b>${safe(item.lifecycleStatus || item.status)}</b></header><h4>${safe(item.impactClaim || item.id)}</h4><p class="research-uncertainty"><b>Known uncertainty</b>${safe(item.knownUncertainty || "None projected")}</p><div class="research-proof"><span><b>${successes}/${safe(policy.successful_clean_reproductions ?? policy.successfulCleanReproductions ?? "—")}</b> clean reproductions</span><span><b>${item.attempts.length}</b> attempts</span><span><b>${percent(item.confidence)}</b> confidence</span></div>${decision.decision ? `<div class="research-decision"><b>operator ${safe(decision.decision)}</b><span>${safe(decision.rationale || "")}</span></div>` : ""}${proofDetail(item)}${controls ? `<div class="research-authority-controls">${controls}</div>` : ""}<footer>${refButtons(item.references) || "<span>No evidence references projected</span>"}<button type="button" data-research-outcome="${safe(item.id)}">Canonical outcome →</button></footer></article>`;
   }
 
   function proofPolicy(policyValue, recipeValue) {
@@ -85,12 +127,12 @@
   }
 
   function lanes(items, names, renderer, empty) {
-    return names.map(name => { const values = items.filter(item => item.lane === name); return `<section class="research-lane ${safe(name)}"><header><span>${safe(name.replaceAll("-", " "))}</span><b>${values.length}</b></header><div>${values.length ? values.map(renderer).join("") : `<p class="research-empty">${safe(empty)}</p>`}</div></section>`; }).join("");
+    return names.map(name => { const values = items.filter(item => item.lane === name); return `<section class="research-lane ${safe(name)}" aria-label="${safe(name.replaceAll("-", " "))}"><header><span>${safe(name.replaceAll("-", " "))}</span><b>${values.length}</b></header><div>${values.length ? values.map(renderer).join("") : `<p class="research-empty">${safe(empty)}</p>`}</div></section>`; }).join("");
   }
 
   function render(snapshot) {
     const value = model(snapshot);
     return `<section class="research-workspace" aria-labelledby="researchWorkspaceHeading"><header class="research-head"><div><span class="eyebrow">EVIDENCE-DRIVEN WORKSPACE</span><h3 id="researchWorkspaceHeading">Research state</h3><p>Canonical hypotheses, discriminating tests, findings, and proof thresholds—not transcript claims.</p></div><div><span><b>${value.hypotheses.length}</b> hypotheses</span><span><b>${value.findings.length}</b> findings</span></div></header>${value.degraded ? `<div class="research-degraded"><b>Canonical outcome projection is degraded</b><span>Proof dossier joins are withheld rather than inferred.</span></div>` : ""}<div class="research-section"><h4>Hypothesis board</h4><div class="research-lanes hypotheses">${lanes(value.hypotheses, ["proposed","testing","supported","disproved","reproduction"], hypothesisCard, "No hypotheses")}</div></div><div class="research-section"><h4>Finding & proof board</h4><div class="research-lanes findings">${lanes(value.findings, ["candidate","demonstrated","reproduction-pending","reproduced","operator-accepted","rejected","withdrawn","inconclusive"], findingCard, "No findings")}</div></div></section>`;
   }
-  return Object.freeze({model, render});
+  return Object.freeze({authorityOperations, model, render});
 });

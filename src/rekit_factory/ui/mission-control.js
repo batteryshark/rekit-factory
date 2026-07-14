@@ -310,6 +310,8 @@ function activate(element) {
   }
   const researchOutcome = element.closest("[data-research-outcome]");
   if (researchOutcome) { openResearchReference("finding", researchOutcome.dataset.researchOutcome); return true; }
+  const memoryOperation = element.closest("[data-memory-operation]");
+  if (memoryOperation) { applyProjectMemoryOperation(memoryOperation); return true; }
   const researchReference = element.closest("[data-research-ref-kind]");
   if (researchReference) { openResearchReference(researchReference.dataset.researchRefKind, researchReference.dataset.researchRefId); return true; }
   if (element.closest("#copyMemoryContext")) { copyMemoryContext(); return true; }
@@ -710,6 +712,20 @@ const memoryStatus = item => String(item.status || "recorded").replaceAll("_", "
 const memoryTone = status => ({active: "live", running: "live", supported: "good", completed: "good", answered: "good", failed: "bad", blocked: "bad", disproven: "bad", rejected: "bad", inconclusive: "warn", paused: "warn", testing: "testing", open: "testing", pending: "testing"})[status] || "neutral";
 const memoryRefs = item => (item.references || []).map(reference => `${reference.kind}:${reference.id}`);
 
+function workstreamStopAuthority(item) {
+  const authority = state.snapshot?.memoryAuthority;
+  if (!authority || authority.schemaVersion !== 1 || authority.degraded !== false
+      || authority.projectId !== state.snapshot?.meta?.projectId
+      || !Number.isInteger(authority.revision) || authority.revision < 0
+      || !Array.isArray(authority.operations)) return null;
+  const operation = authority.operations.find(value => value?.action === "workstream-stop"
+    && value.entityType === "workstream" && value.entityId === item.id
+    && typeof value.expectedEntitySha256 === "string"
+    && /^[0-9a-f]{64}$/.test(value.expectedEntitySha256));
+  return operation ? {...operation, expectedProjectId: authority.projectId,
+    expectedRevision: authority.revision} : null;
+}
+
 function memoryCard(item, group, index) {
   const fields = {
     workstreams: [item.title, item.goal, item.nextAction && `Next: ${item.nextAction}`, item.stopCondition && `Stop when: ${item.stopCondition}`],
@@ -721,7 +737,46 @@ function memoryCard(item, group, index) {
   }[group] || [item.text || item.title || item.id];
   const values = fields.filter(Boolean), title = values.shift() || item.id || "Memory record";
   const refs = memoryRefs(item), status = String(item.status || "recorded");
-  return `<article class="memory-card ${memoryTone(status)}" style="--memory-order:${index}"><header><span>${esc(group.replaceAll("_", " "))}</span><b>${esc(memoryStatus(item))}</b></header><h4>${esc(title)}</h4>${values.map(value => `<p>${esc(value)}</p>`).join("")}${refs.length ? `<footer>${refs.map(reference => `<code>${esc(reference)}</code>`).join("")}</footer>` : ""}<i class="memory-seq">#${esc(item._eventSeq ?? "—")}</i></article>`;
+  const stop = group === "workstreams" ? workstreamStopAuthority(item) : null;
+  const control = stop ? `<div class="memory-authority-controls"><button class="btn red" type="button" data-memory-operation="workstream-stop" data-memory-entity="${esc(item.id)}" data-memory-project="${esc(stop.expectedProjectId)}" data-memory-revision="${stop.expectedRevision}" data-memory-digest="${esc(stop.expectedEntitySha256)}">Stop workstream</button></div>` : "";
+  return `<article class="memory-card ${memoryTone(status)}" style="--memory-order:${index}"><header><span>${esc(group.replaceAll("_", " "))}</span><b>${esc(memoryStatus(item))}</b></header><h4>${esc(title)}</h4>${values.map(value => `<p>${esc(value)}</p>`).join("")}${refs.length ? `<footer>${refs.map(reference => `<code>${esc(reference)}</code>`).join("")}</footer>` : ""}${control}<i class="memory-seq">#${esc(item._eventSeq ?? "—")}</i></article>`;
+}
+
+async function applyProjectMemoryOperation(button) {
+  if (!state.selected || button.disabled) return;
+  const action = button.dataset.memoryOperation, entityId = button.dataset.memoryEntity;
+  const expectedRevision = Number(button.dataset.memoryRevision);
+  const expectedEntitySha256 = button.dataset.memoryDigest;
+  const expectedProjectId = button.dataset.memoryProject;
+  const allowed = state.snapshot?.memoryAuthority?.operations?.some(value =>
+    value.action === action && value.entityId === entityId
+    && value.expectedEntitySha256 === expectedEntitySha256)
+    && state.snapshot.memoryAuthority.revision === expectedRevision
+    && state.snapshot.memoryAuthority.projectId === expectedProjectId
+    && state.snapshot.meta?.projectId === expectedProjectId;
+  if (!allowed) { toast("That exact project-memory authority is stale; refreshing.", true); await openRun(state.selected); return; }
+  const verb = action === "workstream-stop" ? "stop this workstream"
+    : action === "finding-accept" ? "accept this technically reproduced finding"
+      : "reject this finding";
+  const rationale = window.prompt(`Give a durable rationale to ${verb}:`, "");
+  if (rationale === null) return;
+  if (!rationale.trim() || rationale !== rationale.trim() || rationale.length > 2000) {
+    toast("Rationale must be 1–2000 characters without leading or trailing whitespace.", true); return;
+  }
+  button.disabled = true;
+  try {
+    await api(`/api/runs/${encodeURIComponent(state.selected)}/memory-operations`, {
+      method: "POST", body: JSON.stringify({action, entityId, expectedRevision,
+        expectedEntitySha256, expectedProjectId, rationale}),
+    });
+    const runId = state.selected;
+    await openRun(runId);
+    toast("Durable project-memory decision recorded.");
+  } catch (_error) {
+    const runId = state.selected;
+    if (runId) await openRun(runId);
+    toast("Project-memory decision was not accepted; canonical state was refreshed.", true);
+  } finally { if (button.isConnected) button.disabled = false; }
 }
 
 function renderMemoryGroup(key, label, items, startIndex) {
@@ -1221,22 +1276,65 @@ async function openNotificationLink(button) {
   if (button.dataset.run) candidate.runId = button.dataset.run;
   const route = MissionNotifications.exactRoute(candidate);
   if (!route) { toast("The notification route is invalid and was not opened.", true); return; }
+  await navigateExactRoute(route, {persist: true});
+}
+
+function canonicalRouteEntity(route) {
+  return MissionNotifications.canonicalTarget(route, state.snapshot, state.campaigns);
+}
+
+function persistExactRoute(route) {
+  const search = MissionNotifications.urlSearch(route, state.config?.navigationRoute);
+  if (!search) return false;
+  window.history.replaceState(null, "", `${window.location.pathname}${search}`);
+  return true;
+}
+
+function clearExactRoute() {
+  if (window.location.search) window.history.replaceState(
+    null, "", `${window.location.pathname}${window.location.hash}`,
+  );
+}
+
+async function navigateExactRoute(route, {persist = false} = {}) {
   if (route.surface === "campaigns") {
-    show("campaigns"); await openCampaign(route.entityId); return;
+    if (!canonicalRouteEntity(route)) return false;
+    show("campaigns"); await openCampaign(route.entityId);
+    if (state.campaignSelected !== route.entityId) return false;
+    if (persist) persistExactRoute(route);
+    return true;
   }
   await openRun(route.runId);
-  if (state.selected !== route.runId || state.snapshot?.run?.id !== route.runId) return;
-  if (route.surface === "outcomes") openResearchReference(route.entityType, route.entityId);
-  else activateDetailTab($(`tab-button-${route.surface}`), {focus: true});
+  if (state.selected !== route.runId || state.snapshot?.run?.id !== route.runId
+      || !canonicalRouteEntity(route)) return false;
+  if (route.surface === "outcomes") {
+    await renderOutcomes(state.snapshot);
+    state.outcomes.filters = {query: route.entityId, exactId: route.entityId,
+      type: route.entityType, state: "all", owner: "all", terminal: "all"};
+    $("outcomeSearch").value = route.entityId; renderOutcomeProjection();
+  }
+  activateDetailTab($(`tab-button-${route.surface}`), {focus: true});
   const exact = route.surface === "decisions"
     ? document.querySelector(`[data-decision-id="${CSS.escape(route.entityId)}"]`)
     : route.surface === "dossiers"
       ? document.querySelector(`[data-dossier-id="${CSS.escape(route.entityId)}"]`)
       : document.querySelector(`[data-outcome-id="${CSS.escape(route.entityId)}"][data-outcome-type="${CSS.escape(route.entityType)}"]`);
-  if (exact) {
-    exact.classList.add("notification-linked-target");
-    exact.scrollIntoView({block: "center"}); exact.focus({preventScroll: true});
-  } else toast("The exact durable notification target is no longer present in this projection.", true);
+  if (!exact) return false;
+  exact.classList.add("notification-linked-target");
+  exact.scrollIntoView({block: "center"}); exact.focus({preventScroll: true});
+  if (persist) persistExactRoute(route);
+  return true;
+}
+
+async function restoreExactRoute() {
+  if (!window.location.search) return;
+  const route = MissionNotifications.parseUrlRoute(
+    window.location.search, state.config?.navigationRoute,
+  );
+  if (!route || !await navigateExactRoute(route)) {
+    clearExactRoute();
+    toast("The saved Mission Control route is stale or invalid and was not restored.", true);
+  }
 }
 
 $("runForm").onsubmit = async event => {
@@ -1271,6 +1369,7 @@ async function boot() {
     $("campaignDialog").addEventListener("cancel", event => { event.preventDefault(); closeCampaign(); });
     $("fleetSearch").addEventListener("input", event => { state.query = event.target.value; renderFleet(); });
     await Promise.all([refreshFleet(), refreshCampaigns()]);
+    await restoreExactRoute();
     setInterval(() => { refreshFleet(); refreshCampaigns(); }, 1800);
   }
   catch (error) { toast(error.message, true); }
