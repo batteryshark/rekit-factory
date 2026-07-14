@@ -62,6 +62,26 @@ assert.strictEqual(Notifications.canonicalTarget({runId: "run-1", entityType: "p
   entityId: "dossier-1", surface: "dossiers"}, snapshot, []), true);
 assert.strictEqual(Notifications.canonicalTarget({entityType: "campaign", entityId: "campaign-1",
   surface: "campaigns"}, null, [{campaignId: "campaign-1", health: {degraded: false}}]), true);
+
+assert.deepStrictEqual(Notifications.restorationPlan(search, contract, snapshot, []), {
+  runId: "run-1", surface: "outcomes", entityType: "finding", entityId: "finding-1",
+  outcomeFilters: {query: "finding-1", exactId: "finding-1", type: "finding",
+    state: "all", owner: "all", terminal: "all"},
+});
+assert.deepStrictEqual(Notifications.restorationPlan(
+  "?mc=mc-v1&tab=decisions&type=operator-decision&entity=question-1&run=run-1",
+  contract, snapshot, [],
+), {runId: "run-1", surface: "decisions", entityType: "operator-decision",
+  entityId: "question-1"});
+assert.deepStrictEqual(Notifications.restorationPlan(
+  "?mc=mc-v1&tab=dossiers&type=proof-bundle&entity=dossier-1&run=run-1",
+  contract, snapshot, [],
+), {runId: "run-1", surface: "dossiers", entityType: "proof-bundle",
+  entityId: "dossier-1"});
+assert.deepStrictEqual(Notifications.restorationPlan(
+  "?mc=mc-v1&tab=campaigns&type=campaign&entity=campaign-1", contract, null,
+  [{campaignId: "campaign-1", health: {degraded: false}}],
+), {surface: "campaigns", entityType: "campaign", entityId: "campaign-1"});
 for (const [route, context] of [
   [{...findingRoute, runId: "run-other"}, snapshot],
   [{...findingRoute, entityType: "operator-decision"}, snapshot],
@@ -70,5 +90,14 @@ for (const [route, context] of [
   [{runId: "run-1", entityType: "operator-decision", entityId: "question-1", surface: "decisions"}, {...snapshot, pendingQuestions: []}],
   [{runId: "run-1", entityType: "proof-bundle", entityId: "dossier-1", surface: "dossiers"}, {...snapshot, dossiers: []}],
 ]) assert.strictEqual(Notifications.canonicalTarget(route, context, []), false);
+
+for (const [routeSearch, context] of [
+  ["?mc=mc-v1&tab=outcomes&type=finding&entity=finding-stale&run=run-1", snapshot],
+  ["?mc=mc-v1&tab=decisions&type=operator-decision&entity=question-1&run=run-1",
+    {...snapshot, pendingQuestions: []}],
+  ["?mc=mc-v1&tab=dossiers&type=proof-bundle&entity=dossier-1&run=run-1",
+    {...snapshot, dossiers: []}],
+  ["?mc=mc-v1&tab=dossiers&type=proof-bundle&entity=dossier-1&run=run-other", snapshot],
+]) assert.strictEqual(Notifications.restorationPlan(routeSearch, contract, context, []), null);
 
 console.log("mission notification routes adversarial: ok");

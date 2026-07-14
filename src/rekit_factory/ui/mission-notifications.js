@@ -110,5 +110,23 @@
     return true;
   }
 
-  return {canonicalTarget, exactRoute, parseUrlRoute, routeContract, stableId, urlSearch};
+  function focusPlan(route, snapshot, campaigns) {
+    if (!canonicalTarget(route, snapshot, campaigns)) return null;
+    const plan = {surface: route.surface, entityType: route.entityType,
+      entityId: route.entityId};
+    if (route.runId) plan.runId = route.runId;
+    if (route.surface === "outcomes") plan.outcomeFilters = {
+      query: route.entityId, exactId: route.entityId, type: route.entityType,
+      state: "all", owner: "all", terminal: "all",
+    };
+    return plan;
+  }
+
+  function restorationPlan(search, declared, snapshot, campaigns) {
+    const route = parseUrlRoute(search, declared);
+    return route ? focusPlan(route, snapshot, campaigns) : null;
+  }
+
+  return {canonicalTarget, exactRoute, focusPlan, parseUrlRoute, restorationPlan,
+    routeContract, stableId, urlSearch};
 });

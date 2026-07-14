@@ -1279,10 +1279,6 @@ async function openNotificationLink(button) {
   await navigateExactRoute(route, {persist: true});
 }
 
-function canonicalRouteEntity(route) {
-  return MissionNotifications.canonicalTarget(route, state.snapshot, state.campaigns);
-}
-
 function persistExactRoute(route) {
   const search = MissionNotifications.urlSearch(route, state.config?.navigationRoute);
   if (!search) return false;
@@ -1298,27 +1294,28 @@ function clearExactRoute() {
 
 async function navigateExactRoute(route, {persist = false} = {}) {
   if (route.surface === "campaigns") {
-    if (!canonicalRouteEntity(route)) return false;
+    const plan = MissionNotifications.focusPlan(route, state.snapshot, state.campaigns);
+    if (!plan) return false;
     show("campaigns"); await openCampaign(route.entityId);
     if (state.campaignSelected !== route.entityId) return false;
     if (persist) persistExactRoute(route);
     return true;
   }
   await openRun(route.runId);
-  if (state.selected !== route.runId || state.snapshot?.run?.id !== route.runId
-      || !canonicalRouteEntity(route)) return false;
-  if (route.surface === "outcomes") {
+  if (state.selected !== route.runId || state.snapshot?.run?.id !== route.runId) return false;
+  const plan = MissionNotifications.focusPlan(route, state.snapshot, state.campaigns);
+  if (!plan) return false;
+  if (plan.surface === "outcomes") {
     await renderOutcomes(state.snapshot);
-    state.outcomes.filters = {query: route.entityId, exactId: route.entityId,
-      type: route.entityType, state: "all", owner: "all", terminal: "all"};
-    $("outcomeSearch").value = route.entityId; renderOutcomeProjection();
+    state.outcomes.filters = plan.outcomeFilters;
+    $("outcomeSearch").value = plan.entityId; renderOutcomeProjection();
   }
-  activateDetailTab($(`tab-button-${route.surface}`), {focus: true});
-  const exact = route.surface === "decisions"
-    ? document.querySelector(`[data-decision-id="${CSS.escape(route.entityId)}"]`)
-    : route.surface === "dossiers"
-      ? document.querySelector(`[data-dossier-id="${CSS.escape(route.entityId)}"]`)
-      : document.querySelector(`[data-outcome-id="${CSS.escape(route.entityId)}"][data-outcome-type="${CSS.escape(route.entityType)}"]`);
+  activateDetailTab($(`tab-button-${plan.surface}`), {focus: true});
+  const exact = plan.surface === "decisions"
+    ? document.querySelector(`[data-decision-id="${CSS.escape(plan.entityId)}"]`)
+    : plan.surface === "dossiers"
+      ? document.querySelector(`[data-dossier-id="${CSS.escape(plan.entityId)}"]`)
+      : document.querySelector(`[data-outcome-id="${CSS.escape(plan.entityId)}"][data-outcome-type="${CSS.escape(plan.entityType)}"]`);
   if (!exact) return false;
   exact.classList.add("notification-linked-target");
   exact.scrollIntoView({block: "center"}); exact.focus({preventScroll: true});

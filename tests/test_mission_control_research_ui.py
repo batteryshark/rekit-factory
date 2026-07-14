@@ -38,6 +38,7 @@ def test_full_page_routes_are_server_declared_and_canonically_revalidated():
     script = (UI / "mission-control.js").read_text()
     routes = (UI / "mission-notifications.js").read_text()
     for marker in ("restoreExactRoute", "navigateExactRoute", "persistExactRoute",
+                   "MissionNotifications.focusPlan",
                    "canonicalTarget", "parseUrlRoute", "navigationRoute"):
         assert marker in script + routes
     assert "await restoreExactRoute()" in script
