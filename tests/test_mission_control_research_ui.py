@@ -19,5 +19,16 @@ def test_research_workspace_is_bound_to_canonical_snapshot_and_deep_links():
         assert marker in style
 
 
+def test_campaign_watch_contains_one_screen_canonical_synthesis():
+    page = (UI / "index.html").read_text()
+    script = (UI / "mission-control.js").read_text()
+    campaigns = (UI / "mission-campaigns.js").read_text()
+    assert 'id="campaignSynthesis"' in page
+    assert "MissionCampaigns.renderSynthesis(campaigns)" in script
+    for marker in ("strongestReproducedResult", "strongestResult", "renderSynthesis",
+                   "data-campaign-link", "canonical health unavailable"):
+        assert marker in campaigns
+
+
 def test_research_module_is_inside_the_static_asset_boundary():
     assert UI_ASSETS["mission-research.js"] == "text/javascript; charset=utf-8"

@@ -99,9 +99,11 @@ def test_campaign_api_is_bounded_canonical_and_omits_private_goal(tmp_path):
         assert len(listing["campaigns"]) == 1
         public = listing["campaigns"][0]
         detail = _request(base, f"/api/campaigns/{campaign_id}")["campaign"]
-        links = detail.pop("typedLinks")
-        assert links == {"schemaVersion": 1, "references": [], "totalCount": 0,
-                         "truncated": False, "sourceTruncated": False}
+        assert public["typedLinks"] == {
+            "schemaVersion": 1, "references": [], "totalCount": 0,
+            "truncated": False, "sourceTruncated": False,
+            "strongestReproducedResult": None,
+        }
         assert public == detail
         assert public["campaignId"] == campaign_id
         assert public["allowedActions"] == ["pause", "stop"]

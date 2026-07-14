@@ -109,6 +109,24 @@ or claim that an adapter enforces console isolation. A real adapter must persist
 before opening its separately scoped observer session and prove that session cannot bypass
 tool, scope, or evidence policy.
 
+## Proof, comparison, and Mission Control metadata
+
+`rekit_factory.range_metadata` binds the adapter ID/version, exact template and topology,
+spec and scope, lease generation, per-node image/environment identities, and bounded tool
+versions/artifact digests into one content-addressed `RangeExecutionIdentityV1`. The proof
+metadata block and benchmark comparison key both derive from that same identity, so changing
+an environment, image, tool, topology, scope, adapter, or generation changes the comparison
+boundary instead of silently pooling unlike results.
+
+The Mission Control health projection consumes only exact range contracts, that execution
+identity, and at most 32 attachment audits from the current lease generation. It exposes
+status/revision/generation, expiry, content identities, bounded node facts, bounded machine
+failure codes, and read-only attachment decisions. Provider handles, failure prose,
+credentials, endpoints, and host paths are omitted. `mission-ranges.js` independently
+validates and bounds the public record before rendering; malformed identities and audit rows
+fail closed. This is a provider-neutral read model and renderer, not a live-provider health
+claim. A real adapter/controller still owns publication through W-0077.
+
 ## Cleanup supervision
 
 `rekit_factory.range_supervisor` adds a provider-neutral reconciliation boundary above an

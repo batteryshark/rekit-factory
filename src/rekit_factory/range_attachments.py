@@ -47,7 +47,8 @@ def _version(value: Any) -> int:
 
 
 def _identifier(value: Any, name: str) -> str:
-    if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
+    if type(value) is not str or _IDENTIFIER.fullmatch(value) is None \
+            or value.lower().startswith("credential:"):
         raise ValueError(f"{name} must be a bounded stable identifier")
     return value
 

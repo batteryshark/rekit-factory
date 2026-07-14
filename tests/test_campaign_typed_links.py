@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from rekit_factory.api import MAX_CAMPAIGN_TYPED_LINK_SCAN, _campaign_typed_links
+from rekit_factory.outcomes import project_outcomes
 from rekit_factory.scope import ScopeEnvelope, TargetGrant
 
 
@@ -69,6 +70,7 @@ def test_typed_links_use_real_public_scope_shape_and_only_supported_stable_ids(t
              "surface": "dossiers"},
         ],
         "totalCount": 4, "truncated": False, "sourceTruncated": False,
+        "strongestReproducedResult": None,
     }
 
     campaign["scope"]["digest"] = "b" * 64
@@ -87,3 +89,25 @@ def test_typed_link_scan_and_output_are_independently_bounded(tmp_path):
     assert result["references"][0]["entityId"] == "finding-0505"
     assert result["truncated"] is True
     assert result["sourceTruncated"] is True
+
+
+def test_strongest_result_prefers_exact_published_proof_for_accepted_finding(tmp_path):
+    controller, campaign = _fixture(tmp_path, [])
+    controller._snapshot["outcomeProjection"] = project_outcomes(
+        run={"id": "run-safe", "status": "running"}, workers=(), work_items=(),
+        memory={
+            "findings": {"finding-a": {"id": "finding-a", "status": "reproduced"}},
+            "finding_operator_decisions": {
+                "decision-a": {"id": "decision-a", "findingId": "finding-a",
+                               "decision": "accepted", "_eventSeq": 1},
+            },
+        },
+        dossiers=[{"id": "dossier-a", "findingId": "finding-a",
+                   "verificationStatus": "published"}], pending_questions=(),
+    )
+    result = _campaign_typed_links(controller, campaign, limit=128)
+    assert result["strongestReproducedResult"] == {
+        "kind": "proof-bundle", "entityId": "dossier-a", "runId": "run-safe",
+        "surface": "dossiers", "findingId": "finding-a",
+        "basis": "operator-accepted-published-proof",
+    }

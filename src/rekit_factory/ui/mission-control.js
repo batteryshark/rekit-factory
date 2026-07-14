@@ -418,6 +418,7 @@ function renderCampaigns() {
   const needs = campaigns.filter(MissionCampaigns.needsAction).length;
   const active = campaigns.filter(campaign => ["running", "waiting", "suspended"].includes(campaign.status)).length;
   const degraded = campaigns.filter(campaign => campaign.health?.degraded === true).length;
+  $("campaignSynthesis").innerHTML = MissionCampaigns.renderSynthesis(campaigns);
   $("campaignFleet").innerHTML = campaigns.length ? campaigns.map(MissionCampaigns.renderCard).join("") : `<div class="empty compact"><b>No bounded campaigns</b>Campaign health will appear when a multi-epoch controller publishes canonical state.</div>`;
   $("campaignBoardHealth").innerHTML = `<span class="live"><i></i>${active} active</span><span class="${needs ? "attention" : ""}"><b>${needs}</b> need you</span><span class="${degraded ? "attention" : ""}"><b>${degraded}</b> degraded</span><span><b>${campaigns.length}</b> total</span>`;
 }
@@ -437,6 +438,7 @@ async function refreshCampaigns() {
   } catch (error) {
     if (generation !== state.campaignListRequest) return;
     $("campaignBoardHealth").innerHTML = `<span class="attention"><b>!</b> projection unavailable</span>`;
+    $("campaignSynthesis").innerHTML = MissionCampaigns.renderSynthesis([]);
     $("campaignFleet").innerHTML = `<div class="empty compact"><b>Campaign projection unavailable</b>Mission Control will retry the bounded read model automatically.</div>`;
   }
 }

@@ -153,7 +153,7 @@ def test_campaign_api_public_projection_is_bounded_private_and_campaign_local(tm
 
         status, detail = _request(f"{base}/api/campaigns/{first.campaign_id}")
         detail_campaign = dict(detail["campaign"])
-        typed_links = detail_campaign.pop("typedLinks")
+        typed_links = detail_campaign["typedLinks"]
         assert status == 200 and detail_campaign == first_public
         assert typed_links["references"] == []
         status, missing = _request(f"{base}/api/campaigns/campaign-missing")

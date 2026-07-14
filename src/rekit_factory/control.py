@@ -341,7 +341,10 @@ class InvestigationController:
             )
 
     def create(self, request: RunRequest, *,
-               _reconcile_run_dir: str | Path | None = None) -> Path:
+               _reconcile_run_dir: str | Path | None = None,
+               _preallocated_paths: RunPaths | None = None) -> Path:
+        if _reconcile_run_dir is not None and _preallocated_paths is not None:
+            raise ValueError("run creation cannot reconcile and preallocate simultaneously")
         request = request.validate()
         policy = self.safety_policies.resolve(request.safety_policy_id)
         worker_backend = self._worker_backend_with_concurrency(
@@ -418,7 +421,12 @@ class InvestigationController:
         config_json = json.dumps(public_config, sort_keys=True)
         config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
         project_id, project_meta = compute_project_id(request.target)
-        if _reconcile_run_dir is None:
+        if _preallocated_paths is not None:
+            paths = _preallocated_paths.ensure()
+            if paths.storage_root != self.storage_root or paths.project_id != project_id:
+                raise ValueError("preallocated run identity crosses storage or project authority")
+            run_id = paths.run_id
+        elif _reconcile_run_dir is None:
             run_id, run_hash = compute_run_id(project_id, request.target, config_hash)
             paths = new_run_paths(self.storage_root, project_id, run_id, run_hash)
         else:
@@ -544,6 +552,22 @@ class InvestigationController:
         self._creation_checkpoint("creation-complete")
         return paths.run_dir
 
+    def create_automation_run(self, request: RunRequest, *, operation_id: str) -> Path:
+        """Create one restart-stable run for an authenticated automation operation."""
+        if not isinstance(operation_id, str) or not re.fullmatch(
+                r"automation-[0-9a-f]{64}", operation_id):
+            raise ValueError("automation operation identity is invalid")
+        request = request.validate()
+        project_id, _ = compute_project_id(request.target)
+        digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+        run_id = "run_automation_" + digest[:24]
+        paths = RunPaths(
+            self.storage_root, project_id, run_id,
+            self.storage_root / "projects" / project_id / "runs" /
+            ("automation-" + digest[:20]),
+        )
+        return self.create(request, _preallocated_paths=paths)
+
     def reconcile_run_creation(self, run_dir: str | Path, request: RunRequest) -> Path:
         """Idempotently finish one interrupted creation using the exact original authority."""
         return self.create(request, _reconcile_run_dir=run_dir)
@@ -563,6 +587,13 @@ class InvestigationController:
 
         with FactoryLedger(paths.db_path) as ledger:
             ledger.requeue_stale_leases(paths.run_id)
+            cancellation = ledger.apply_run_cancellation(paths.run_id)
+            if cancellation is not None and cancellation["status"] == "applied":
+                reconcile_terminal_publications(paths.run_dir, ledger=ledger)
+                _write_status(paths, "canceled")
+                return self._snapshot_open(ledger, paths)
+            if cancellation is not None and cancellation["status"] == "superseded":
+                return self._snapshot_open(ledger, paths)
             ledger.set_run_status(paths.run_id, "running")
             _write_status(paths, "running")
             ledger.event(paths.run_id, "Drain", "enter", {"concurrency": concurrency})
@@ -605,6 +636,13 @@ class InvestigationController:
                 if not batch:
                     break
                 await asyncio.gather(*(dispatcher.dispatch(ctx, item) for item in batch))
+                cancellation = ledger.apply_run_cancellation(paths.run_id)
+                if cancellation is not None and cancellation["status"] == "applied":
+                    reconcile_terminal_publications(paths.run_dir, ledger=ledger)
+                    _write_status(paths, "canceled")
+                    return self._snapshot_open(ledger, paths)
+                if cancellation is not None and cancellation["status"] == "superseded":
+                    return self._snapshot_open(ledger, paths)
 
             termination = ledger.assess(paths.run_id)
             coverage = ledger.coverage(paths.run_id)
@@ -637,6 +675,25 @@ class InvestigationController:
                     fault_injector=self.terminal_fault_injector,
                 )
             return self._snapshot_open(ledger, paths)
+
+    def request_cancel(self, run_dir: str | Path, *, operation_id: str,
+                       reason_code: str) -> dict[str, Any]:
+        """Request cooperative cancellation; active effects finish at their safe boundary."""
+        if not isinstance(operation_id, str) or not re.fullmatch(
+                r"automation-[0-9a-f]{64}", operation_id):
+            raise ValueError("automation cancellation operation identity is invalid")
+        if not isinstance(reason_code, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", reason_code):
+            raise ValueError("automation cancellation reason is invalid")
+        paths = resolve_run_dir(run_dir)
+        with FactoryLedger(paths.db_path) as ledger:
+            cancellation = ledger.request_run_cancellation(
+                paths.run_id, operation_id=operation_id, reason_code=reason_code,
+            )
+            run = dict(ledger.get_run(paths.run_id))
+        return {"operationId": cancellation["operation_id"],
+                "runId": paths.run_id, "status": cancellation["status"],
+                "runStatus": run["status"]}
 
     def answer(self, run_dir: str | Path, question_id: str, answer: str,
                *, resume: bool = True) -> dict[str, Any]:

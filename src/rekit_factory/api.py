@@ -48,6 +48,7 @@ UI_ASSETS = {
     "mission-control.css": "text/css; charset=utf-8",
     "mission-attention.js": "text/javascript; charset=utf-8",
     "mission-campaigns.js": "text/javascript; charset=utf-8",
+    "mission-ranges.js": "text/javascript; charset=utf-8",
     "mission-outcomes.js": "text/javascript; charset=utf-8",
     "mission-research.js": "text/javascript; charset=utf-8",
     "mission-control.js": "text/javascript; charset=utf-8",
@@ -727,8 +728,10 @@ class FactoryHandler(BaseHTTPRequestHandler):
         if controller is None:
             return []
         with self.server.campaign_lock:
-            return [controller.public_state(campaign_id)
-                    for campaign_id in controller.campaign_ids()]
+            campaign_ids = controller.campaign_ids()
+        # Listing carries the same exact bounded links as detail so the one-screen operator
+        # synthesis never guesses a finding or sends the browser to an unqualified record.
+        return [self._campaign(campaign_id) for campaign_id in campaign_ids]
 
     def _json(self, status: HTTPStatus, payload: Any) -> None:
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -900,6 +903,7 @@ def _campaign_typed_links(controller: InvestigationController,
     supported = {"hypothesis", "finding", "operator-decision", "proof-bundle"}
     scanned = 0
     source_truncated = False
+    strongest_candidates: list[tuple[int, int, str, dict[str, str]]] = []
 
     def admit(kind: str, entity_id: object, run_id: str, surface: str) -> None:
         if not isinstance(entity_id, str) or _PUBLIC_RECORD_ID.fullmatch(entity_id) is None:
@@ -957,6 +961,51 @@ def _campaign_typed_links(controller: InvestigationController,
         entities = projection.get("entities", []) if isinstance(projection, dict) else []
         if not isinstance(entities, list):
             continue
+        if projection.get("degraded") is False:
+            entity_map = {
+                (item.get("entityType"), item.get("entityId")): item
+                for item in entities if isinstance(item, dict)
+            }
+            for (entity_type, finding_id), finding in entity_map.items():
+                if entity_type != "finding" or not isinstance(finding_id, str):
+                    continue
+                facets = finding.get("facets")
+                facets = facets if isinstance(facets, dict) else {}
+                validation = facets.get("validation")
+                acceptance = facets.get("acceptance")
+                reproduced = (isinstance(validation, dict)
+                              and validation.get("known") is True
+                              and validation.get("state") == "reproduced")
+                accepted = (isinstance(acceptance, dict)
+                            and acceptance.get("known") is True
+                            and acceptance.get("state") == "accepted")
+                if not reproduced:
+                    continue
+                proofs = []
+                for (proof_type, proof_id), proof in entity_map.items():
+                    if proof_type != "proof-bundle" or not isinstance(proof_id, str):
+                        continue
+                    publication = (proof.get("facets") or {}).get("publication") \
+                        if isinstance(proof.get("facets"), dict) else None
+                    if (proof.get("parent") == {"entityType": "finding", "entityId": finding_id}
+                            and isinstance(publication, dict)
+                            and publication.get("known") is True
+                            and publication.get("state") == "published"):
+                        proofs.append(proof_id)
+                if len(proofs) == 1:
+                    result = {"kind": "proof-bundle", "entityId": proofs[0],
+                              "runId": run_id, "surface": "dossiers",
+                              "findingId": finding_id,
+                              "basis": ("operator-accepted-published-proof" if accepted
+                                        else "reproduced-published-proof")}
+                    rank = 4 if accepted else 3
+                else:
+                    result = {"kind": "finding", "entityId": finding_id,
+                              "runId": run_id, "surface": "outcomes",
+                              "findingId": finding_id,
+                              "basis": ("operator-accepted" if accepted else "reproduced")}
+                    rank = 2 if accepted else 1
+                strongest_candidates.append((rank, run_index, finding_id, result))
         remaining_scan = MAX_CAMPAIGN_TYPED_LINK_SCAN - scanned
         if len(entities) > remaining_scan:
             source_truncated = True
@@ -975,12 +1024,15 @@ def _campaign_typed_links(controller: InvestigationController,
     ))
     total = len(references)
     bounded = references[-limit:] if isinstance(limit, int) and limit > 0 else []
+    strongest = (max(strongest_candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+                 if strongest_candidates else None)
     return {
         "schemaVersion": 1,
         "references": bounded,
         "totalCount": total,
         "truncated": source_truncated or total > len(bounded),
         "sourceTruncated": source_truncated,
+        "strongestReproducedResult": strongest,
     }
 
 

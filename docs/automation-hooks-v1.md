@@ -65,7 +65,8 @@ curl --fail-with-body http://127.0.0.1:8769/api/automation/v1/launch \
   --data-binary @launch.json
 ```
 
-The response supplies stable run/campaign IDs and a Mission Control deep link. Poll
+The response supplies a stable run ID, its canonical project ID, and a Mission Control deep link.
+An owner may add a campaign ID only when a canonical CampaignController campaign actually exists. Poll
 the redacted feed with a signed `GET`:
 
 ```text

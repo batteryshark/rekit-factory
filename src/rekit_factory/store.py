@@ -59,6 +59,25 @@ create table if not exists factory_events (
 );
 create index if not exists idx_factory_events_run on factory_events(run_id, created_at);
 
+create table if not exists factory_run_cancellations (
+    operation_id text primary key,
+    run_id text not null,
+    reason_code text not null,
+    status text not null,
+    created_at text not null,
+    applied_at text
+);
+create index if not exists idx_factory_run_cancellations_run
+    on factory_run_cancellations(run_id,status,created_at);
+
+create table if not exists factory_run_handoff_acknowledgements (
+    operation_id text primary key,
+    run_id text not null,
+    handoff_id text not null,
+    created_at text not null,
+    unique(run_id,handoff_id)
+);
+
 create table if not exists factory_event_dedupe (
     run_id       text not null,
     dedupe_key   text not null,
@@ -627,6 +646,119 @@ class FactoryLedger(Ledger):
                  json.dumps(payload or {}, sort_keys=True), now),
             )
         return event_id
+
+    def request_run_cancellation(self, run_id: str, *, operation_id: str,
+                                 reason_code: str) -> dict[str, Any]:
+        """Record one exact cooperative cancellation without racing active handlers."""
+        existing = self.conn.execute(
+            "select * from factory_run_cancellations where operation_id=?", (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["run_id"] != run_id or existing["reason_code"] != reason_code:
+                raise ValueError("cancellation operation identity conflicts with durable content")
+            return dict(existing)
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if run["status"] in {"completed", "failed", "blocked", "canceled", "cancelled"}:
+            raise ValueError("terminal run cannot accept a new cancellation request")
+        now = utcnow()
+        with self.conn:
+            self.conn.execute(
+                "insert into factory_run_cancellations values (?,?,?,'requested',?,null)",
+                (operation_id, run_id, reason_code, now),
+            )
+        self.event_log_once(
+            run_id, f"automation-cancel:{operation_id}", "run.cancel-requested",
+            "External scheduler requested cooperative cancellation",
+            payload={"operationId": operation_id, "reasonCode": reason_code},
+        )
+        return dict(self.conn.execute(
+            "select * from factory_run_cancellations where operation_id=?", (operation_id,),
+        ).fetchone())
+
+    def apply_run_cancellation(self, run_id: str) -> dict[str, Any] | None:
+        """Apply the oldest requested cancellation at a controller-owned safe boundary."""
+        request = self.conn.execute(
+            "select * from factory_run_cancellations where run_id=? and status='requested' "
+            "order by created_at,operation_id limit 1", (run_id,),
+        ).fetchone()
+        if request is None:
+            return None
+        run = self.get_run(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if run["status"] in {"completed", "failed", "blocked"}:
+            with self.conn:
+                self.conn.execute(
+                    "update factory_run_cancellations set status='superseded',applied_at=? "
+                    "where operation_id=?", (utcnow(), request["operation_id"]),
+                )
+            return dict(self.conn.execute(
+                "select * from factory_run_cancellations where operation_id=?",
+                (request["operation_id"],),
+            ).fetchone())
+        if run["status"] in {"canceled", "cancelled"}:
+            with self.conn:
+                self.conn.execute(
+                    "update factory_run_cancellations set status='applied',applied_at=? "
+                    "where operation_id=?", (utcnow(), request["operation_id"]),
+                )
+            return dict(self.conn.execute(
+                "select * from factory_run_cancellations where operation_id=?",
+                (request["operation_id"],),
+            ).fetchone())
+        if run["status"] not in {"canceled", "cancelled"}:
+            now = utcnow()
+            with self.conn:
+                self.conn.execute(
+                    "update work_items set status='deferred',state_label='cancelled',"
+                    "error=?,updated_at=?,terminal_at=? where run_id=? and status not in "
+                    "('done','failed','needs_review','deferred','blocked')",
+                    ("Cancelled by approved external scheduler", now, now, run_id),
+                )
+                coverage = self.coverage(run_id)
+                self.conn.execute(
+                    "update runs set status='canceled',updated_at=?,completed_at=?,"
+                    "coverage_json=?,summary_json=?,error=? where id=?",
+                    (now, now, json.dumps(coverage, sort_keys=True),
+                     json.dumps({"workers": len(self.workers(run_id))}, sort_keys=True),
+                     f"automation-cancel:{request['reason_code']}", run_id),
+                )
+                self.conn.execute(
+                    "update factory_run_cancellations set status='applied',applied_at=? "
+                    "where operation_id=?", (now, request["operation_id"]),
+                )
+        return dict(self.conn.execute(
+            "select * from factory_run_cancellations where operation_id=?",
+            (request["operation_id"],),
+        ).fetchone())
+
+    def acknowledge_run_handoff(self, run_id: str, handoff_id: str, *,
+                                operation_id: str) -> dict[str, Any]:
+        existing = self.conn.execute(
+            "select * from factory_run_handoff_acknowledgements where operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["run_id"] != run_id or existing["handoff_id"] != handoff_id:
+                raise ValueError("handoff operation identity conflicts with durable content")
+            return dict(existing)
+        acknowledged = self.conn.execute(
+            "select * from factory_run_handoff_acknowledgements "
+            "where run_id=? and handoff_id=?", (run_id, handoff_id),
+        ).fetchone()
+        if acknowledged is not None:
+            return dict(acknowledged)
+        with self.conn:
+            self.conn.execute(
+                "insert into factory_run_handoff_acknowledgements values (?,?,?,?)",
+                (operation_id, run_id, handoff_id, utcnow()),
+            )
+        return dict(self.conn.execute(
+            "select * from factory_run_handoff_acknowledgements where operation_id=?",
+            (operation_id,),
+        ).fetchone())
 
     def record_model_call(self, run_id: str, worker_id: str, *, provider: str,
                           model: str, purpose: str, usage: dict[str, Any]) -> str:
