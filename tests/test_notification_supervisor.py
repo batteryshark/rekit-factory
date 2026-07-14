@@ -131,6 +131,13 @@ def test_configured_finding_stage_reaches_provider_once_with_exact_proof_link(tm
         "run-1", accepted, finding_policy=policy,
     )
 
+    # Projection admission uses the ledger's production clock. Align the injected
+    # delivery clock with that durable timestamp so this boundary test does not
+    # become date- or wall-clock-dependent.
+    admitted = NotificationOutbox(ledger.conn).get(notification_id)
+    assert admitted is not None
+    clock.value = datetime.fromisoformat(admitted["createdAt"].replace("Z", "+00:00"))
+
     supervisor = NotificationDeliverySupervisor(ledger.conn, clock=clock)
     supervisor.schedule(
         notification_id, _preferences(), project_id="project-1", campaign_id="campaign-1",

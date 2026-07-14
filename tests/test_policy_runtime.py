@@ -204,7 +204,10 @@ def test_resume_rejects_incompatible_persisted_strategy_before_mutation(tmp_path
     assert after["events"] == before["events"]
 
 
-def test_controller_rejects_gated_tool_under_automatic_only_before_creation(tmp_path):
+def test_controller_rejects_gated_tool_under_automatic_only_before_creation(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr("rekit_factory.control.utcnow", lambda: "2026-07-13T12:30:00Z")
     storage = tmp_path / "runs"
     rekit = GatedRekit()
     controller = InvestigationController(

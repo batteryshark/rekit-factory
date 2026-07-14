@@ -116,6 +116,25 @@ def test_strict_decoders_reject_unknown_fields_and_non_arrays():
         IsolationProbePlanV1.from_dict(value)
 
 
+def test_strict_decoders_reject_boolean_versions_and_unhashable_literals():
+    value = _plan().to_dict()
+    value["schema_version"] = True
+    with pytest.raises(ValueError, match="schema_version"):
+        IsolationProbePlanV1.from_dict(value)
+    value = _plan().to_dict()
+    value["canaries"][0]["kind"] = []
+    with pytest.raises(ValueError, match="canary kind"):
+        IsolationProbePlanV1.from_dict(value)
+    value = _plan().to_dict()
+    value["probes"][0]["channel"] = []
+    with pytest.raises(ValueError, match="probe channel"):
+        IsolationProbePlanV1.from_dict(value)
+    value = _plan().to_dict()
+    value["probes"][0]["expectation"] = []
+    with pytest.raises(ValueError, match="probe expectation"):
+        IsolationProbePlanV1.from_dict(value)
+
+
 def test_hostile_collection_sizes_are_rejected_before_nested_decode():
     plan = _plan()
     package = plan.package.to_dict()

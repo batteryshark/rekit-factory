@@ -87,7 +87,7 @@ def _relative(value: str, name: str) -> str:
 def _strict(value: Any, cls: type, fields: set[str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError(f"{cls.__name__} must contain exactly {sorted(fields)}")
-    if value.get("schema_version") != 1:
+    if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
         raise ValueError("schema_version must be 1")
     return {key: item for key, item in value.items() if key != "schema_version"}
 
@@ -167,7 +167,7 @@ class CanaryRefV1(IsolationContract):
 
     def __post_init__(self) -> None:
         _identifier(self.canary_id, "canary_id")
-        if self.kind not in {
+        if not isinstance(self.kind, str) or self.kind not in {
             "source", "truth", "private-test", "dossier", "credential", "sibling", "residue",
         }:
             raise ValueError("unsupported canary kind")
@@ -235,9 +235,9 @@ class ProbeSpecV1(IsolationContract):
     def __post_init__(self) -> None:
         _identifier(self.probe_id, "probe_id")
         _identifier(self.trial_id, "trial_id")
-        if self.channel not in REQUIRED_DENIAL_CHANNELS | {"post-reset"}:
+        if not isinstance(self.channel, str) or self.channel not in REQUIRED_DENIAL_CHANNELS | {"post-reset"}:
             raise ValueError("unsupported probe channel")
-        if self.expectation not in {"public-readable", "unreachable", "empty"}:
+        if not isinstance(self.expectation, str) or self.expectation not in {"public-readable", "unreachable", "empty"}:
             raise ValueError("unsupported probe expectation")
         values = tuple(self.canary_ids)
         if len(values) > MAX_CANARIES:
@@ -280,6 +280,10 @@ class IsolationProbePlanV1(IsolationContract):
             raise ValueError(
                 f"plan permits at most {MAX_CANARIES} canaries and {MAX_PROBES} probes"
             )
+        if any(type(item) is not CanaryRefV1 for item in canaries) or any(
+            type(item) is not ProbeSpecV1 for item in probes
+        ):
+            raise ValueError("plan requires exact canary and probe records")
         canary_ids = {item.canary_id for item in canaries}
         if len(canary_ids) != len(canaries) or any(
             not set(probe.canary_ids) <= canary_ids for probe in probes
@@ -321,7 +325,7 @@ class ProbeResultV1(IsolationContract):
     def __post_init__(self) -> None:
         _digest(self.plan_sha256, "plan_sha256")
         _identifier(self.probe_id, "probe_id")
-        if self.outcome not in {"passed", "failed", "not-run"}:
+        if not isinstance(self.outcome, str) or self.outcome not in {"passed", "failed", "not-run"}:
             raise ValueError("unsupported probe outcome")
         if (self.outcome == "not-run") != (self.evidence_sha256 is None):
             raise ValueError("run probes require evidence and not-run probes forbid it")
