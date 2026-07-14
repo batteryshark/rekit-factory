@@ -37,6 +37,7 @@ from rekit_factory.notification_delivery import (
 from rekit_factory.notification_supervisor import NotificationDeliverySupervisor
 from rekit_factory.scope import AuthorizedScope
 from rekit_factory.store import FactoryLedger
+from rekit_factory.automation import AutomationGateway
 
 
 MAX_BODY = 1_000_000
@@ -48,6 +49,7 @@ UI_ASSETS = {
     "mission-attention.js": "text/javascript; charset=utf-8",
     "mission-campaigns.js": "text/javascript; charset=utf-8",
     "mission-outcomes.js": "text/javascript; charset=utf-8",
+    "mission-research.js": "text/javascript; charset=utf-8",
     "mission-control.js": "text/javascript; charset=utf-8",
 }
 
@@ -215,7 +217,8 @@ class FactoryServer(ThreadingHTTPServer):
                  notification_desktop_transport: DesktopTransport | None = None,
                  notification_webhook_transport: WebhookTransport | None = None,
                  notification_credential_resolver: CredentialResolver | None = None,
-                 notification_worker_autostart: bool = True):
+                 notification_worker_autostart: bool = True,
+                 automation_gateway: AutomationGateway | None = None):
         host = address[0]
         if host not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("Factory API must bind to a loopback address")
@@ -235,6 +238,7 @@ class FactoryServer(ThreadingHTTPServer):
         self.notification_desktop_transport = notification_desktop_transport
         self.notification_webhook_transport = notification_webhook_transport
         self.notification_credential_resolver = notification_credential_resolver
+        self.automation_gateway = automation_gateway
         self.instance_id = uuid.uuid4().hex
         self.restart_requested = threading.Event()
         self.notification_worker = NotificationDeliveryWorker(
@@ -270,6 +274,15 @@ class FactoryHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         parts = [part for part in parsed.path.split("/") if part]
         try:
+            if parts[:3] == ["api", "automation", "v1"]:
+                if self.server.automation_gateway is None:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "automation-unavailable"})
+                    return
+                status, response = self.server.automation_gateway.handle(
+                    "GET", self.path, self.headers, {},
+                )
+                self._json(HTTPStatus(status), response)
+                return
             if parts in ([], ["mission-control"]):
                 self._html((Path(__file__).with_name("ui") / "index.html").read_bytes())
                 return
@@ -456,6 +469,15 @@ class FactoryHandler(BaseHTTPRequestHandler):
         parts = [part for part in parsed.path.split("/") if part]
         try:
             payload = self._body()
+            if parts[:3] == ["api", "automation", "v1"]:
+                if self.server.automation_gateway is None:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "automation-unavailable"})
+                    return
+                status, response = self.server.automation_gateway.handle(
+                    "POST", self.path, self.headers, payload,
+                )
+                self._json(HTTPStatus(status), response)
+                return
             if parts == ["api", "restart"]:
                 if not self.server.allow_restart:
                     self._json(HTTPStatus.CONFLICT, {

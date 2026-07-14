@@ -93,6 +93,22 @@ materialized range history or exact evidence record, and evidence must resolve b
 successful execute request with matching node, handle, inputs, path, generation, and bytes. Exact
 retries after restart return or re-raise the recorded outcome without duplicating a lease.
 
+## Read-only attachment authorization
+
+`rekit_factory.range_attachments` defines the provider-neutral authorization and audit
+boundary for an optional observer attachment. The server-owned policy binds the exact range
+scope digest, evidence-policy digest, node allowlist, two read-only actions, and a session
+ceiling. A request binds one committed lease, opaque node handle, policy digest, actor, and
+timestamp. The pure decision checks the exact spec and lease revision and emits a deterministic
+allowed or denied audit record. Destroyed, expired, cross-lease, stale-policy, wrong-scope,
+wrong-node, and unapproved-action requests fail closed.
+
+The v1 surface intentionally has no keyboard input, command, provider endpoint, credential,
+or host-path field. It authorizes observation only; it does not implement a provider console
+or claim that an adapter enforces console isolation. A real adapter must persist the audit
+before opening its separately scoped observer session and prove that session cannot bypass
+tool, scope, or evidence policy.
+
 ## Cleanup supervision
 
 `rekit_factory.range_supervisor` adds a provider-neutral reconciliation boundary above an

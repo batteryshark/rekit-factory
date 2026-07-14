@@ -308,6 +308,10 @@ function activate(element) {
     $("outcomeSearch").focus({preventScroll: true});
     return true;
   }
+  const researchOutcome = element.closest("[data-research-outcome]");
+  if (researchOutcome) { openResearchReference("finding", researchOutcome.dataset.researchOutcome); return true; }
+  const researchReference = element.closest("[data-research-ref-kind]");
+  if (researchReference) { openResearchReference(researchReference.dataset.researchRefKind, researchReference.dataset.researchRefId); return true; }
   if (element.closest("#copyMemoryContext")) { copyMemoryContext(); return true; }
   const evidenceAction = element.closest("[data-evidence-action]");
   if (evidenceAction) { updateEvidence(evidenceAction.dataset.evidenceId, evidenceAction.dataset.evidenceAction); return true; }
@@ -759,6 +763,7 @@ function renderMemory(snapshot) {
   const degraded = memory.degraded ? `<div class="memory-alert"><b>Memory projection is degraded</b><span>${diagnostics.map(esc).join(" · ") || "Canonical replay reported a degraded state."}</span>${missing.length ? `<small>${missing.length} optional references are unavailable.</small>` : ""}</div>` : "";
   const unresolved = unknowns.length ? `<div class="memory-unresolved"><b>Unresolved at last compaction</b><span>${unknowns.map(esc).join(" · ")}</span></div>` : "";
   $("memoryDegraded").innerHTML = degraded + unresolved;
+  $("researchWorkspace").innerHTML = MissionResearch.render(snapshot);
   let index = 0;
   const rendered = collections.map(([key, label, items]) => {
     const result = renderMemoryGroup(key, label, items, index);
@@ -766,6 +771,21 @@ function renderMemory(snapshot) {
     return result;
   }).join("");
   $("memoryGroups").innerHTML = rendered || `<div class="empty compact"><b>No reasoning records yet</b>Durable workstreams, attempts, decisions, theories, questions, and next actions will appear here.</div>`;
+}
+
+function openResearchReference(kind, entityId) {
+  if (!entityId) return;
+  if (["evidence", "artifact"].includes(kind)) {
+    activateDetailTab($("tab-button-artifacts"), {focus: true});
+    const target = document.querySelector(`[data-evidence-record="${CSS.escape(entityId)}"]`);
+    if (target) { target.scrollIntoView({block: "center"}); target.focus({preventScroll: true}); }
+    else toast("The exact evidence record is not retained in this run.", true);
+    return;
+  }
+  state.outcomes.filters = {query: entityId, exactId: entityId, type: ["hypothesis", "finding", "proof-bundle", "operator-decision"].includes(kind) ? kind : "all", state: "all", owner: "all", terminal: "all"};
+  $("outcomeSearch").value = entityId;
+  renderOutcomeProjection();
+  activateDetailTab($("tab-button-outcomes"), {focus: true});
 }
 
 async function copyMemoryContext() {

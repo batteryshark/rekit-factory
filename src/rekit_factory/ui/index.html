@@ -87,7 +87,7 @@
                 <div class="outcome-results" id="outcomeResults" aria-busy="false"></div>
               </section>
             </div>
-            <div class="tabpane" role="tabpanel" id="tab-memory"><div class="memory-board"><div class="memory-primary"><div class="memory-board-head"><div><span class="eyebrow">DURABLE REASONING</span><h2>Project memory</h2></div><button class="btn" id="copyMemoryContext" type="button">Copy resume context</button></div><div id="memoryDegraded"></div><div class="memory-groups" id="memoryGroups"></div></div><aside class="memory-context-panel"><div><span class="eyebrow">BOUNDED PROJECTION</span><b>Worker resume context</b></div><pre id="memoryContext"></pre></aside></div></div>
+            <div class="tabpane" role="tabpanel" id="tab-memory"><div class="memory-board"><div class="memory-primary"><div class="memory-board-head"><div><span class="eyebrow">DURABLE REASONING</span><h2>Project memory</h2></div><button class="btn" id="copyMemoryContext" type="button">Copy resume context</button></div><div id="memoryDegraded"></div><div id="researchWorkspace"></div><div class="memory-groups" id="memoryGroups"></div></div><aside class="memory-context-panel"><div><span class="eyebrow">BOUNDED PROJECTION</span><b>Worker resume context</b></div><pre id="memoryContext"></pre></aside></div></div>
             <div class="tabpane" role="tabpanel" aria-labelledby="tab-button-knowledge" id="tab-knowledge"><div class="knowledge-console"><section class="knowledge-main"><div class="knowledge-head"><div><span class="eyebrow">PROGRESSIVE DISCLOSURE</span><h2>Knowledge relay</h2><p>Workers search a small ranked set, open one concept, then follow only disclosed links.</p><div class="knowledge-run-roots" id="knowledgeRunRoots" aria-label="Named knowledge roots for this run"></div></div><div class="knowledge-posture"><i aria-hidden="true">◇</i><span><b>Read only</b>Root paths and concept bodies are never retained here.</span></div></div><div class="knowledge-flow" id="knowledgeFlow" aria-live="polite"></div></section><aside class="knowledge-ledger"><div class="knowledge-ledger-head"><span class="eyebrow">DURABLE REFERENCES</span><b>Selected concepts</b></div><div class="knowledgeReferences" id="knowledgeReferences"></div></aside></div></div>
             <div class="tabpane" role="tabpanel" id="tab-reports"><div class="report-grid" id="reports"></div></div>
             <div class="tabpane" role="tabpanel" aria-labelledby="tab-button-dossiers" id="tab-dossiers"><div class="dossier-stage"><div class="dossier-stage-head"><div><span class="eyebrow">VERIFIED HANDOFF</span><h2>Proof dossiers</h2><p>Canonical finding state, replay steps, retained evidence, and an anchored verification report.</p></div><div class="dossier-seal" aria-hidden="true"><i></i><span>SEALED</span></div></div><div class="dossier-grid" id="dossiers" aria-live="polite"></div></div></div>
@@ -114,6 +114,7 @@
 <script src="/ui/mission-attention.js" defer></script>
 <script src="/ui/mission-outcomes.js" defer></script>
 <script src="/ui/mission-campaigns.js" defer></script>
+<script src="/ui/mission-research.js" defer></script>
 <script src="/ui/mission-control.js" defer></script>
 </body>
 </html>

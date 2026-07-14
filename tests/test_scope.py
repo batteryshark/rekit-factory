@@ -28,7 +28,7 @@ from rekit_factory.scope import (
 NOW = "2026-07-13T12:00:00Z"
 
 
-def authorize(envelope: ScopeEnvelope, *, expires_at="2026-07-14T00:00:00Z") -> AuthorizedScope:
+def authorize(envelope: ScopeEnvelope, *, expires_at="2999-01-01T00:00:00Z") -> AuthorizedScope:
     return AuthorizedScope(envelope, ScopeApproval(
         scope_id=envelope.scope_id,
         revision=envelope.revision,
@@ -50,7 +50,7 @@ def envelope(target: TargetGrant, *, actions=(ActionAuthority.READ_LOCAL_TARGET,
         scope_id="scope-test",
         revision=1,
         valid_from="2026-07-12T10:00:00Z",
-        valid_until="2026-07-15T00:00:00Z",
+        valid_until="2999-01-01T00:00:00Z",
         targets=(target,),
         actions=actions,
         endpoints=endpoints,
