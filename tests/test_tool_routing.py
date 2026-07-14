@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import asyncio
 from dataclasses import asdict, replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import tempfile
@@ -24,6 +25,17 @@ from rekit_factory.store import FactoryLedger
 from rekit_factory.tool_routing import (
     RemoteWorkerBinding, ToolRoute, ToolWorkerRouter, WorkerRequirements,
 )
+
+
+def _active_scope_window() -> dict[str, str]:
+    """Keep tests about active authority independent of the wall-clock date."""
+    approved = datetime.now(timezone.utc) - timedelta(minutes=1)
+    expires = approved + timedelta(days=1)
+    return {
+        "approved_at": approved.isoformat(),
+        "valid_until": expires.isoformat(),
+        "expires_at": expires.isoformat(),
+    }
 
 
 class FakeTransport:
@@ -304,9 +316,7 @@ class ToolRoutingTests(unittest.TestCase):
                 endpoints=(endpoint,),
                 account_refs=("account:lab",), credential_use=True,
                 approved_by="operator:route", rationale="Exact staged lab fixture",
-                approved_at="2026-07-13T05:00:00Z",
-                valid_until="2026-07-14T05:00:00Z",
-                expires_at="2026-07-14T05:00:00Z",
+                **_active_scope_window(),
             )
             transport = FakeTransport("remote")
             route = ToolRoute(
@@ -393,9 +403,7 @@ class ToolRoutingTests(unittest.TestCase):
                 target, scope_id="local-boundary", revision=1,
                 actions=(ActionAuthority.READ_LOCAL_TARGET,),
                 approved_by="operator:local", rationale="exact local fixture",
-                approved_at="2026-07-13T05:00:00Z",
-                valid_until="2026-07-14T05:00:00Z",
-                expires_at="2026-07-14T05:00:00Z",
+                **_active_scope_window(),
             )
             request = InvocationRequest(
                 run_id="run-local", work_item_id="work-local", tool_id="scan",
@@ -578,9 +586,7 @@ class ToolRoutingTests(unittest.TestCase):
                 target, scope_id="immutable", revision=1,
                 actions=(ActionAuthority.READ_LOCAL_TARGET,),
                 approved_by="operator:scope", rationale="original revision",
-                approved_at="2026-07-13T05:00:00Z",
-                valid_until="2026-07-14T05:00:00Z",
-                expires_at="2026-07-14T05:00:00Z",
+                **_active_scope_window(),
             )
             controller = InvestigationController(
                 storage_root=Path(tmp) / "runs", rekit=FakeRekit(), workers=FakeBackend(),
@@ -592,9 +598,7 @@ class ToolRoutingTests(unittest.TestCase):
                 target, scope_id="immutable", revision=2,
                 actions=(ActionAuthority.READ_LOCAL_TARGET,),
                 approved_by="operator:scope", rationale="different valid revision",
-                approved_at="2026-07-13T05:00:00Z",
-                valid_until="2026-07-14T05:00:00Z",
-                expires_at="2026-07-14T05:00:00Z",
+                **_active_scope_window(),
             )
             (Path(run_dir) / "scope.json").write_text(
                 json.dumps(replacement.to_dict(), sort_keys=True), encoding="utf-8",
