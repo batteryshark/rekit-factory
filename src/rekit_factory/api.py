@@ -50,6 +50,7 @@ UI_ASSETS = {
     "mission-campaigns.js": "text/javascript; charset=utf-8",
     "mission-ranges.js": "text/javascript; charset=utf-8",
     "mission-outcomes.js": "text/javascript; charset=utf-8",
+    "mission-notifications.js": "text/javascript; charset=utf-8",
     "mission-research.js": "text/javascript; charset=utf-8",
     "mission-control.js": "text/javascript; charset=utf-8",
 }
@@ -569,6 +570,13 @@ class FactoryHandler(BaseHTTPRequestHandler):
                 return
             if (len(parts) == 4 and parts[:2] == ["api", "campaigns"]
                     and parts[3] in {"pause", "resume", "stop"}):
+                expected_fields = ({"operationId", "expectedRevision", "reasonCode", "evidenceIds"}
+                                   if parts[3] == "stop"
+                                   else {"operationId", "expectedRevision"})
+                if set(payload) != expected_fields:
+                    raise ValueError(
+                        f"campaign {parts[3]} body must contain only exact transition fields"
+                    )
                 controller = self._campaign_controller()
                 operation_id = payload["operationId"]
                 expected_revision = payload["expectedRevision"]
@@ -904,6 +912,7 @@ def _campaign_typed_links(controller: InvestigationController,
     scanned = 0
     source_truncated = False
     strongest_candidates: list[tuple[int, int, str, dict[str, str]]] = []
+    focus_candidates: dict[tuple[str, str, str], dict[str, object]] = {}
 
     def admit(kind: str, entity_id: object, run_id: str, surface: str) -> None:
         if not isinstance(entity_id, str) or _PUBLIC_RECORD_ID.fullmatch(entity_id) is None:
@@ -1006,6 +1015,49 @@ def _campaign_typed_links(controller: InvestigationController,
                               "basis": ("operator-accepted" if accepted else "reproduced")}
                     rank = 2 if accepted else 1
                 strongest_candidates.append((rank, run_index, finding_id, result))
+            hypothesis_state = snapshot.get("hypothesisState")
+            hypothesis_state = hypothesis_state if isinstance(hypothesis_state, dict) else {}
+            hypotheses = hypothesis_state.get("hypotheses")
+            tests = hypothesis_state.get("tests")
+            if isinstance(hypotheses, list) and isinstance(tests, list):
+                current_hypotheses = [item for item in hypotheses
+                                      if isinstance(item, dict)
+                                      and item.get("status") == "testing"
+                                      and isinstance(item.get("id"), str)
+                                      and _PUBLIC_RECORD_ID.fullmatch(item["id"])]
+                for hypothesis in current_hypotheses:
+                    hypothesis_id = hypothesis["id"]
+                    outcome = entity_map.get(("hypothesis", hypothesis_id))
+                    validation = ((outcome.get("facets") or {}).get("validation")
+                                  if isinstance(outcome, dict)
+                                  and isinstance(outcome.get("facets"), dict) else None)
+                    if not (isinstance(validation, dict)
+                            and validation.get("known") is True
+                            and validation.get("rawState") == "testing"):
+                        continue
+                    matching_tests = [item for item in tests if isinstance(item, dict)
+                                      and item.get("hypothesisId") == hypothesis_id
+                                      and item.get("status") == "testing"
+                                      and isinstance(item.get("id"), str)
+                                      and _PUBLIC_RECORD_ID.fullmatch(item["id"])]
+                    if len(matching_tests) != 1:
+                        continue
+                    test_id = matching_tests[0]["id"]
+                    claim = hypothesis.get("claim")
+                    objective = matching_tests[0].get("objective")
+                    if (not isinstance(claim, str) or not claim.strip()
+                            or not isinstance(objective, str) or not objective.strip()
+                            or any(ord(character) < 32 and character not in "\t\n\r"
+                                   for character in claim + objective)):
+                        continue
+                    claim, objective = claim.strip(), objective.strip()
+                    identity = (run_id, hypothesis_id, test_id)
+                    focus_candidates[identity] = {
+                        "runId": run_id, "hypothesisId": hypothesis_id, "testId": test_id,
+                        "surface": "outcomes", "phase": "testing",
+                        "hypothesisClaim": claim[:400], "objective": objective[:280],
+                        "textTruncated": len(claim) > 400 or len(objective) > 280,
+                    }
         remaining_scan = MAX_CAMPAIGN_TYPED_LINK_SCAN - scanned
         if len(entities) > remaining_scan:
             source_truncated = True
@@ -1026,6 +1078,8 @@ def _campaign_typed_links(controller: InvestigationController,
     bounded = references[-limit:] if isinstance(limit, int) and limit > 0 else []
     strongest = (max(strongest_candidates, key=lambda item: (item[0], item[1], item[2]))[3]
                  if strongest_candidates else None)
+    current_focus = (next(iter(focus_candidates.values()))
+                     if len(focus_candidates) == 1 else None)
     return {
         "schemaVersion": 1,
         "references": bounded,
@@ -1033,6 +1087,7 @@ def _campaign_typed_links(controller: InvestigationController,
         "truncated": source_truncated or total > len(bounded),
         "sourceTruncated": source_truncated,
         "strongestReproducedResult": strongest,
+        "currentResearchFocus": current_focus,
     }
 
 

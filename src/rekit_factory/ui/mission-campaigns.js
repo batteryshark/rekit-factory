@@ -109,6 +109,23 @@
       findingId: value.findingId, runId: value.runId, basis: value.basis} : null;
   }
 
+  function currentResearchFocus(campaign) {
+    const value = object(object(campaign.typedLinks).currentResearchFocus);
+    if (value.surface !== "outcomes" || value.phase !== "testing"
+        || !stableId(value.runId) || !stableId(value.hypothesisId) || !stableId(value.testId)
+        || typeof value.hypothesisClaim !== "string" || !value.hypothesisClaim.trim()
+        || value.hypothesisClaim.length > 400 || typeof value.objective !== "string"
+        || !value.objective.trim() || value.objective.length > 280
+        || typeof value.textTruncated !== "boolean" || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value.hypothesisClaim + value.objective)) return null;
+    const linked = typedLinks(campaign).some(link => link.kind === "hypothesis"
+      && link.surface === "outcomes" && link.entityId === value.hypothesisId
+      && link.runId === value.runId);
+    return linked ? {runId: value.runId, hypothesisId: value.hypothesisId,
+      testId: value.testId, surface: "outcomes", phase: "testing",
+      hypothesisClaim: value.hypothesisClaim, objective: value.objective,
+      textTruncated: value.textTruncated} : null;
+  }
+
   function synthesis(campaigns) {
     return list(campaigns).flatMap(campaign => {
       if (!stableId(campaign?.campaignId)) return [];
@@ -118,7 +135,8 @@
       return [{campaignId: campaign.campaignId, status: String(campaign.status || "unknown"),
         degraded, needsAction: !degraded && needsAction(campaign), reason: reason(campaign),
         progress: Object.fromEntries(facts.map(item => [item.name, item.value])), budgets,
-        strongest: degraded ? null : strongestResult(campaign)}];
+        strongest: degraded ? null : strongestResult(campaign),
+        focus: degraded ? null : currentResearchFocus(campaign)}];
     }).sort((left, right) => Number(right.needsAction) - Number(left.needsAction)
       || Number(right.degraded) - Number(left.degraded)
       || left.campaignId.localeCompare(right.campaignId));
@@ -128,10 +146,11 @@
     const rows = synthesis(campaigns);
     if (!rows.length) return `<div class="campaign-synthesis-empty"><b>No campaign synthesis yet</b><span>Canonical campaign projections will appear here.</span></div>`;
     return `<div class="campaign-synthesis-head"><span>operator scan</span><b>${rows.filter(row => row.needsAction).length} need action</b></div><div class="campaign-synthesis-list">${rows.map(row => {
+      const focus = row.focus ? `<button type="button" class="campaign-synthesis-focus" data-campaign-link="outcomes" data-campaign-kind="hypothesis" data-campaign-ref="${safe(row.focus.hypothesisId)}" data-campaign-run="${safe(row.focus.runId)}"><span>testing now · ${safe(row.focus.hypothesisId)}</span><b>${safe(row.focus.objective)}</b><small>${safe(row.focus.hypothesisClaim)}${row.focus.textTruncated ? "…" : ""} · ${safe(row.focus.testId)} →</small></button>` : `<div class="campaign-synthesis-focus empty"><span>testing now</span><b>not singular</b><small>no exact current focus</small></div>`;
       const progress = row.degraded ? `<span class="degraded">canonical health unavailable</span>` : `<span><b>${safe(row.progress.coverage || "—")}</b> coverage</span><span><b>${safe(row.progress["novel / total"] || "—")}</b> novel / total</span>`;
       const budgets = row.budgets.length ? row.budgets.map(item => `<span><b>${safe(item.remaining)}</b> ${safe(item.name.replace(/([A-Z])/g, " $1"))} left</span>`).join("") : `<span><b>—</b> bounded budget unavailable</span>`;
       const result = row.strongest ? `<button type="button" class="campaign-synthesis-result" data-campaign-link="${safe(row.strongest.surface)}" data-campaign-kind="${safe(row.strongest.kind)}" data-campaign-ref="${safe(row.strongest.entityId)}" data-campaign-run="${safe(row.strongest.runId)}"><span>strongest reproduced</span><b>${safe(row.strongest.findingId)}</b><small>${safe(label(row.strongest.basis))} →</small></button>` : `<div class="campaign-synthesis-result empty"><span>strongest reproduced</span><b>none qualified</b><small>waiting for canonical proof</small></div>`;
-      return `<article class="campaign-synthesis-row${row.needsAction ? " needs-action" : ""}${row.degraded ? " degraded" : ""}"><button type="button" class="campaign-synthesis-identity" data-campaign="${safe(row.campaignId)}"><span>${safe(short(row.campaignId))}</span><b>${row.needsAction ? "NEEDS YOU" : safe(label(row.status))}</b><small>${safe(row.reason)}</small></button><div class="campaign-synthesis-progress">${progress}</div><div class="campaign-synthesis-budget">${budgets}</div>${result}</article>`;
+      return `<article class="campaign-synthesis-row${row.needsAction ? " needs-action" : ""}${row.degraded ? " degraded" : ""}"><button type="button" class="campaign-synthesis-identity" data-campaign="${safe(row.campaignId)}"><span>${safe(short(row.campaignId))}</span><b>${row.needsAction ? "NEEDS YOU" : safe(label(row.status))}</b><small>${safe(row.reason)}</small></button>${focus}<div class="campaign-synthesis-progress">${progress}</div><div class="campaign-synthesis-budget">${budgets}</div>${result}</article>`;
     }).join("")}</div>`;
   }
 
@@ -185,5 +204,5 @@
       <div class="campaign-actions" data-campaign-actions>${actions.map(action => `<button class="btn ${action === "stop" ? "red" : action === "resume" ? "primary" : ""}" type="button" data-campaign-action="${safe(action)}" data-campaign-id="${safe(id)}">${safe(action[0].toUpperCase() + action.slice(1))}</button>`).join("") || `<span>No operator transition is currently allowed.</span>`}</div>`;
   }
 
-  return {budgetRows, canonicalActions, changeDecisionPayload, healthFacts, needsAction, pendingChanges, renderCard, renderChangeRequest, renderDetail, renderSynthesis, statusTone: tone, strongestResult, synthesis, typedLinks};
+  return {budgetRows, canonicalActions, changeDecisionPayload, currentResearchFocus, healthFacts, needsAction, pendingChanges, renderCard, renderChangeRequest, renderDetail, renderSynthesis, statusTone: tone, strongestResult, synthesis, typedLinks};
 });

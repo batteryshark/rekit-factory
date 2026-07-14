@@ -23,6 +23,12 @@ def test_campaign_ui_adversarial_helper():
     )
     assert links.returncode == 0, links.stdout + links.stderr
     assert "mission campaign links adversarial: ok" in links.stdout
+    notifications = subprocess.run(
+        [node, str(ROOT / "tests" / "mission_notifications_adversarial.test.js")],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    assert notifications.returncode == 0, notifications.stdout + notifications.stderr
+    assert "mission notification routes adversarial: ok" in notifications.stdout
 
 
 def test_campaign_surface_preserves_keyboard_mobile_motion_and_bounded_errors():
@@ -38,6 +44,7 @@ def test_campaign_surface_preserves_keyboard_mobile_motion_and_bounded_errors():
     ):
         assert marker in page
     assert page.index("/ui/mission-campaigns.js") < page.index("/ui/mission-control.js")
+    assert page.index("/ui/mission-notifications.js") < page.index("/ui/mission-control.js")
     assert '"mission-campaigns.js": "text/javascript; charset=utf-8"' in api
 
     for behavior in (

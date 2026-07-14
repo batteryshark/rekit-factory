@@ -71,6 +71,7 @@ def test_typed_links_use_real_public_scope_shape_and_only_supported_stable_ids(t
         ],
         "totalCount": 4, "truncated": False, "sourceTruncated": False,
         "strongestReproducedResult": None,
+        "currentResearchFocus": None,
     }
 
     campaign["scope"]["digest"] = "b" * 64
@@ -111,3 +112,35 @@ def test_strongest_result_prefers_exact_published_proof_for_accepted_finding(tmp
         "surface": "dossiers", "findingId": "finding-a",
         "basis": "operator-accepted-published-proof",
     }
+
+
+def test_current_research_focus_requires_one_exact_testing_hypothesis_and_test(tmp_path):
+    controller, campaign = _fixture(tmp_path, [])
+    projection = project_outcomes(
+        run={"id": "run-safe", "status": "running"}, workers=(), work_items=(),
+        memory={"hypotheses": {"hypothesis-a": {
+            "id": "hypothesis-a", "status": "testing",
+        }}}, dossiers=(), pending_questions=(),
+    )
+    controller._snapshot["outcomeProjection"] = projection
+    controller._snapshot["hypothesisState"] = {
+        "hypotheses": [{"id": "hypothesis-a", "status": "testing",
+                         "claim": "The parser length field controls allocation size."}],
+        "tests": [{"id": "test-a", "hypothesisId": "hypothesis-a",
+                   "status": "testing", "objective": "Vary only the length field."}],
+        "observations": [],
+    }
+    result = _campaign_typed_links(controller, campaign, limit=128)
+    assert result["currentResearchFocus"] == {
+        "runId": "run-safe", "hypothesisId": "hypothesis-a", "testId": "test-a",
+        "surface": "outcomes", "phase": "testing",
+        "hypothesisClaim": "The parser length field controls allocation size.",
+        "objective": "Vary only the length field.", "textTruncated": False,
+    }
+
+    controller._snapshot["hypothesisState"]["tests"].append({
+        "id": "test-b", "hypothesisId": "hypothesis-a", "status": "testing",
+    })
+    assert _campaign_typed_links(
+        controller, campaign, limit=128,
+    )["currentResearchFocus"] is None

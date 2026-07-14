@@ -12,7 +12,7 @@ def test_research_workspace_is_bound_to_canonical_snapshot_and_deep_links():
     style = (UI / "mission-control.css").read_text()
     assert 'id="researchWorkspace"' in page
     assert 'src="/ui/mission-research.js"' in page
-    assert "MissionResearch.render(snapshot)" in script
+    assert "MissionResearch.render({...snapshot, evidenceRecords: state.evidence})" in script
     assert "data-research-ref-kind" in script
     assert "openResearchReference" in script
     for marker in (".research-lanes", ".research-card", ".research-proof", ".research-decision"):

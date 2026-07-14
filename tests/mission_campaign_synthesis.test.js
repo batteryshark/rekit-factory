@@ -14,7 +14,10 @@ function campaign(overrides = {}) {
       cumulative: {workItems: {value: 10, unit: "items"}, costUnits: {value: 40, unit: "units"}, wallSeconds: {value: 120, unit: "seconds"}}},
     cumulativeUsage: {workItems: 7, costUnits: 28, wallSeconds: 91},
     changeRequests: [],
-    typedLinks: {references: [{kind: "proof-bundle", entityId: "dossier-a", runId: "run-a", surface: "dossiers"}], strongestReproducedResult: {kind: "proof-bundle", entityId: "dossier-a", findingId: "finding-a", runId: "run-a", surface: "dossiers", basis: "operator-accepted-published-proof"}},
+    typedLinks: {references: [
+      {kind: "proof-bundle", entityId: "dossier-a", runId: "run-a", surface: "dossiers"},
+      {kind: "hypothesis", entityId: "hypothesis-a", runId: "run-a", surface: "outcomes"},
+    ], strongestReproducedResult: {kind: "proof-bundle", entityId: "dossier-a", findingId: "finding-a", runId: "run-a", surface: "dossiers", basis: "operator-accepted-published-proof"}, currentResearchFocus: {runId: "run-a", hypothesisId: "hypothesis-a", testId: "test-a", surface: "outcomes", phase: "testing", hypothesisClaim: "The parser length field controls allocation size.", objective: "Vary only the length field.", textTruncated: false}},
     ...overrides,
   };
 }
@@ -26,16 +29,19 @@ test("one-screen synthesis prioritizes needs-action and preserves exact proof de
   assert.equal(value[0].needsAction, true);
   assert.equal(value[0].progress.coverage, "62.50%");
   assert.equal(value[0].strongest.entityId, "dossier-a");
+  assert.equal(value[0].focus.objective, "Vary only the length field.");
   const html = Campaigns.renderSynthesis([quiet, campaign()]);
-  for (const marker of ["NEEDS YOU", "62.50%", "dossier-a", 'data-campaign-link="dossiers"', 'data-campaign-run="run-a"']) assert.match(html, new RegExp(marker));
+  for (const marker of ["NEEDS YOU", "62.50%", "dossier-a", "Vary only the length field", "parser length field", 'data-campaign-link="dossiers"', 'data-campaign-ref="hypothesis-a"', 'data-campaign-run="run-a"']) assert.match(html, new RegExp(marker));
 });
 
 test("forged strongest result fails closed and hostile fields are escaped", () => {
-  const hostile = campaign({campaignId: "campaign-safe", recommendation: {action: "ask-operator", reasonCode: '<img src=x onerror="bad">'}, typedLinks: {references: [], strongestReproducedResult: {kind: "proof-bundle", entityId: "forged", findingId: "finding", runId: "run", surface: "dossiers", basis: "operator-accepted-published-proof"}}});
+  const hostile = campaign({campaignId: "campaign-safe", recommendation: {action: "ask-operator", reasonCode: '<img src=x onerror="bad">'}, typedLinks: {references: [{kind: "hypothesis", entityId: "hypothesis-a", runId: "run-a", surface: "outcomes"}], strongestReproducedResult: {kind: "proof-bundle", entityId: "forged", findingId: "finding", runId: "run", surface: "dossiers", basis: "operator-accepted-published-proof"}, currentResearchFocus: {runId: "run-a", hypothesisId: "hypothesis-a", testId: "test-a", surface: "outcomes", phase: "testing", hypothesisClaim: '<svg onload="bad">', objective: "Probe <script> behavior", textTruncated: false}}});
   const html = Campaigns.renderSynthesis([hostile]);
   assert.match(html, /none qualified/);
   assert.doesNotMatch(html, /<img/);
   assert.match(html, /&lt;img/);
+  assert.match(html, /&lt;svg/);
+  assert.match(html, /Probe &lt;script&gt; behavior/);
 });
 
 test("empty and degraded projections never invent progress, budget, action, or proof", () => {
@@ -45,5 +51,6 @@ test("empty and degraded projections never invent progress, budget, action, or p
   assert.deepEqual(degraded.progress, {});
   assert.deepEqual(degraded.budgets, []);
   assert.equal(degraded.strongest, null);
+  assert.equal(degraded.focus, null);
   assert.match(Campaigns.renderSynthesis([campaign({health: {degraded: true}})]), /canonical health unavailable/);
 });

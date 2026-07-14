@@ -87,6 +87,7 @@ def test_typed_links_require_exact_campaign_run_scope_and_stable_public_ids(tmp_
         "truncated": False,
         "sourceTruncated": False,
         "strongestReproducedResult": None,
+        "currentResearchFocus": None,
     }
     encoded = json.dumps(links)
     assert "/Users/" not in encoded and "<script>" not in encoded

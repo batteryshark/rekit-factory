@@ -8,23 +8,35 @@
   const object = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const safe = value => String(value ?? "").replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[char]);
   const percent = value => Number.isFinite(Number(value)) ? `${Math.round(Number(value) * 100)}%` : "—";
-  const refs = values => list(values).filter(value => value && typeof value.kind === "string" && typeof value.id === "string");
+  const stable = value => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+  const digest = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  const refKinds = new Set(["evidence", "artifact", "hypothesis", "finding", "proof-bundle", "operator-decision"]);
+  const refs = values => list(values).slice(0, 64).filter(value => value && refKinds.has(value.kind) && stable(value.id));
   const refButtons = values => refs(values).map(ref => `<button type="button" data-research-ref-kind="${safe(ref.kind)}" data-research-ref-id="${safe(ref.id)}">${safe(ref.kind)}:${safe(ref.id)}</button>`).join("");
   const hypothesisLane = status => status === "testing" ? "testing" : ["supported", "contradicted"].includes(status) ? "supported" : ["disproved", "retired"].includes(status) ? "disproved" : status === "reproduced" ? "reproduction" : "proposed";
   const findingLane = status => ["operator-accepted", "reproduced", "rejected", "withdrawn", "inconclusive"].includes(status) ? status : status || "candidate";
 
   function model(snapshot) {
     const hypothesisState = object(snapshot?.hypothesisState), findingState = object(snapshot?.findingState);
-    const tests = list(hypothesisState.tests), observations = list(hypothesisState.observations), attempts = list(findingState.attempts);
-    const hypotheses = list(hypothesisState.hypotheses).map(item => ({...item,
+    const degraded = snapshot?.outcomeProjection?.degraded === true;
+    const tests = list(hypothesisState.tests).slice(0, 256), observations = list(hypothesisState.observations).slice(0, 512), attempts = list(findingState.attempts).slice(0, 512);
+    const evidence = list(snapshot?.evidenceRecords).slice(0, 512).filter(item => stable(item?.artifactId));
+    const artifacts = list(snapshot?.artifacts).slice(0, 512).filter(item => stable(item?.id));
+    const dossiers = degraded ? [] : list(snapshot?.dossiers).slice(0, 128).filter(item => stable(item?.id) && stable(item?.findingId));
+    const hypotheses = list(hypothesisState.hypotheses).slice(0, 256).map(item => ({...item,
       lane: hypothesisLane(item.status), tests: tests.filter(test => test.hypothesisId === item.id),
       observations: observations.filter(observation => observation.hypothesisId === item.id),
     }));
-    const findings = list(findingState.findings).map(item => ({...item,
+    const findings = list(findingState.findings).slice(0, 256).map(item => ({...item,
       lane: findingLane(item.lifecycleStatus || item.status),
-      attempts: attempts.filter(attempt => attempt.findingId === item.id),
+      attempts: attempts.filter(attempt => attempt.findingId === item.id).slice(0, 32),
+      dossiers: dossiers.filter(dossier => dossier.findingId === item.id).slice(0, 16),
+      proofEvidence: evidence.filter(record => refs(item.references).some(ref => ref.id === record.artifactId)
+        || attempts.some(attempt => attempt.findingId === item.id && refs(attempt.references).some(ref => ref.id === record.artifactId))).slice(0, 32),
+      proofArtifacts: artifacts.filter(artifact => dossiers.some(dossier => dossier.findingId === item.id
+        && Object.values(object(dossier.artifactIds)).includes(artifact.id))).slice(0, 32),
     }));
-    return {hypotheses, findings};
+    return {hypotheses, findings, degraded};
   }
 
   function hypothesisCard(item) {
@@ -35,7 +47,41 @@
 
   function findingCard(item) {
     const successes = item.attempts.filter(value => value.outcome === "success").length, policy = object(item.proofPolicy), decision = object(item.operatorDecision);
-    return `<article class="research-card finding ${safe(item.lane)}" data-research-finding="${safe(item.id)}"><header><span>${safe(item.findingType || "finding")} · ${safe(item.consequence || "unknown")}</span><b>${safe(item.lifecycleStatus || item.status)}</b></header><h4>${safe(item.impactClaim || item.id)}</h4><p class="research-uncertainty"><b>Known uncertainty</b>${safe(item.knownUncertainty || "None projected")}</p><div class="research-proof"><span><b>${successes}/${safe(policy.successful_clean_reproductions ?? policy.successfulCleanReproductions ?? "—")}</b> clean reproductions</span><span><b>${item.attempts.length}</b> attempts</span><span><b>${percent(item.confidence)}</b> confidence</span></div>${decision.decision ? `<div class="research-decision"><b>operator ${safe(decision.decision)}</b><span>${safe(decision.rationale || "")}</span></div>` : ""}<footer>${refButtons(item.references) || "<span>No evidence references projected</span>"}<button type="button" data-research-outcome="${safe(item.id)}">Canonical outcome →</button></footer></article>`;
+    return `<article class="research-card finding ${safe(item.lane)}" data-research-finding="${safe(item.id)}"><header><span>${safe(item.findingType || "finding")} · ${safe(item.consequence || "unknown")}</span><b>${safe(item.lifecycleStatus || item.status)}</b></header><h4>${safe(item.impactClaim || item.id)}</h4><p class="research-uncertainty"><b>Known uncertainty</b>${safe(item.knownUncertainty || "None projected")}</p><div class="research-proof"><span><b>${successes}/${safe(policy.successful_clean_reproductions ?? policy.successfulCleanReproductions ?? "—")}</b> clean reproductions</span><span><b>${item.attempts.length}</b> attempts</span><span><b>${percent(item.confidence)}</b> confidence</span></div>${decision.decision ? `<div class="research-decision"><b>operator ${safe(decision.decision)}</b><span>${safe(decision.rationale || "")}</span></div>` : ""}${proofDetail(item)}<footer>${refButtons(item.references) || "<span>No evidence references projected</span>"}<button type="button" data-research-outcome="${safe(item.id)}">Canonical outcome →</button></footer></article>`;
+  }
+
+  function proofPolicy(policyValue, recipeValue) {
+    const policy = object(policyValue), recipe = object(recipeValue), requirements = list(recipe.clean_environment_requirements ?? recipe.cleanEnvironmentRequirements).slice(0, 20);
+    const rules = [
+      ["clean reproductions", policy.successful_clean_reproductions ?? policy.successfulCleanReproductions],
+      ["independent worker", policy.require_independent_worker ?? policy.requireIndependentWorker],
+      ["independent session", policy.require_independent_session ?? policy.requireIndependentSession],
+      ["clean environment", policy.require_clean_environment ?? policy.requireCleanEnvironment],
+      ["distinct model profile", policy.require_distinct_model_profile ?? policy.requireDistinctModelProfile],
+    ].filter(([, value]) => value !== undefined && value !== null);
+    return `<div class="research-prerequisites"><h5>Proof prerequisites</h5><div>${rules.map(([name, value]) => `<span><b>${safe(name)}</b>${safe(value)}</span>`).join("") || "<span>No proof policy projected</span>"}</div>${requirements.length ? `<ul>${requirements.map(value => `<li>${safe(value)}</li>`).join("")}</ul>` : ""}</div>`;
+  }
+
+  function attemptDetail(attempt) {
+    const environment = object(attempt.environment), references = refs(attempt.references), observations = list(attempt.observations).slice(0, 16), differences = list(attempt.environmentalDifferences).slice(0, 16);
+    return `<li class="research-attempt ${safe(attempt.outcome || "unknown")}"><header><b>${safe(attempt.id || "attempt")}</b><span>${safe(attempt.outcome || "unknown")}</span></header><div><span>${safe(attempt.workerId || "worker unknown")}</span><span>${safe(attempt.sessionId || "session unknown")}</span><span>${safe(attempt.modelProfile || "profile unknown")}</span></div><dl><div><dt>environment</dt><dd>${safe(environment.id || "—")} · ${environment.clean === true ? "clean" : environment.clean === false ? "not clean" : "unknown"}</dd></div><div><dt>platform</dt><dd>${safe(environment.platform || "—")} / ${safe(environment.architecture || "—")}</dd></div><div><dt>isolation</dt><dd>${safe(environment.isolation || "—")}</dd></div></dl>${observations.length ? `<p>${observations.map(safe).join(" · ")}</p>` : ""}${differences.length ? `<p class="research-differences"><b>environment differences</b>${differences.map(safe).join(" · ")}</p>` : ""}${references.length ? `<footer>${refButtons(references)}</footer>` : ""}</li>`;
+  }
+
+  function dossierDetail(dossier, artifacts) {
+    const verification = dossier.verified === true && dossier.verificationStatus === "verified" ? "hash verified" : dossier.verificationStatus === "stale-or-invalid" ? "stale or invalid" : "published · byte verification pending";
+    const ids = Object.entries(object(dossier.artifactIds)).slice(0, 16).filter(([kind, id]) => stable(kind) && stable(id));
+    const artifactIndex = new Map(artifacts.map(item => [item.id, item]));
+    return `<article class="research-dossier ${safe(dossier.verificationStatus || "unknown")}"><header><button type="button" data-research-ref-kind="proof-bundle" data-research-ref-id="${safe(dossier.id)}">${safe(dossier.id)}</button><b>${safe(verification)}</b></header><div class="research-hashes"><code>manifest ${digest(dossier.manifestSha256) ? safe(dossier.manifestSha256) : "unverified"}</code><code>finding state ${digest(dossier.findingStateSha256) ? safe(dossier.findingStateSha256) : "unverified"}</code></div><div class="research-verdict"><span>${safe(dossier.verdict || "verdict unknown")}</span><span>${safe(dossier.findingStatus || "finding state unknown")}</span></div><ul>${ids.map(([kind, id]) => { const artifact = object(artifactIndex.get(id)); return `<li><button type="button" data-research-ref-kind="artifact" data-research-ref-id="${safe(id)}">${safe(kind)}</button><code>${digest(artifact.sha256) ? safe(artifact.sha256) : "hash unavailable"}</code><span>${Number.isInteger(artifact.size_bytes) ? artifact.size_bytes : Number.isInteger(artifact.sizeBytes) ? artifact.sizeBytes : "—"} bytes</span></li>`; }).join("") || "<li>No bounded dossier artifacts projected</li>"}</ul></article>`;
+  }
+
+  function evidenceDetail(record) {
+    const original = digest(record.originalSha256) ? record.originalSha256 : null, display = digest(record.displaySha256) ? record.displaySha256 : null;
+    return `<li class="research-evidence ${safe(record.state || "unknown")}"><button type="button" data-research-ref-kind="evidence" data-research-ref-id="${safe(record.artifactId)}">${safe(record.kind || "evidence")}</button><span>${record.redacted === true ? "redacted display projection" : "display projection"}${record.truncated === true ? " · truncated" : ""}</span><code>original ${safe(original || "hash unavailable")}</code><code>display ${safe(display || "hash unavailable")}</code>${list(record.quarantineLabels).length ? `<small>restricted · ${list(record.quarantineLabels).slice(0, 16).map(safe).join(" · ")}</small>` : ""}</li>`;
+  }
+
+  function proofDetail(item) {
+    const attempts = item.attempts.map(attemptDetail).join(""), dossiers = item.dossiers.map(dossier => dossierDetail(dossier, item.proofArtifacts)).join(""), evidence = item.proofEvidence.map(evidenceDetail).join("");
+    return `<details class="research-proof-detail"><summary>Unified proof detail <span>${item.dossiers.length} dossier · ${item.attempts.length} attempt · ${item.proofEvidence.length} evidence</span></summary>${proofPolicy(item.proofPolicy, item.recipe)}<section><h5>Reproduction & validation attempts</h5><ol>${attempts || "<li>No canonical attempts projected</li>"}</ol></section><section><h5>Proof manifests & dossiers</h5>${dossiers || "<p>No published proof dossier projected.</p>"}</section><section><h5>Artifact redaction & hashes</h5><ul>${evidence || "<li>No exact evidence projection is linked.</li>"}</ul></section></details>`;
   }
 
   function lanes(items, names, renderer, empty) {
@@ -44,7 +90,7 @@
 
   function render(snapshot) {
     const value = model(snapshot);
-    return `<section class="research-workspace" aria-labelledby="researchWorkspaceHeading"><header class="research-head"><div><span class="eyebrow">EVIDENCE-DRIVEN WORKSPACE</span><h3 id="researchWorkspaceHeading">Research state</h3><p>Canonical hypotheses, discriminating tests, findings, and proof thresholds—not transcript claims.</p></div><div><span><b>${value.hypotheses.length}</b> hypotheses</span><span><b>${value.findings.length}</b> findings</span></div></header><div class="research-section"><h4>Hypothesis board</h4><div class="research-lanes hypotheses">${lanes(value.hypotheses, ["proposed","testing","supported","disproved","reproduction"], hypothesisCard, "No hypotheses")}</div></div><div class="research-section"><h4>Finding & proof board</h4><div class="research-lanes findings">${lanes(value.findings, ["candidate","demonstrated","reproduction-pending","reproduced","operator-accepted","rejected","withdrawn","inconclusive"], findingCard, "No findings")}</div></div></section>`;
+    return `<section class="research-workspace" aria-labelledby="researchWorkspaceHeading"><header class="research-head"><div><span class="eyebrow">EVIDENCE-DRIVEN WORKSPACE</span><h3 id="researchWorkspaceHeading">Research state</h3><p>Canonical hypotheses, discriminating tests, findings, and proof thresholds—not transcript claims.</p></div><div><span><b>${value.hypotheses.length}</b> hypotheses</span><span><b>${value.findings.length}</b> findings</span></div></header>${value.degraded ? `<div class="research-degraded"><b>Canonical outcome projection is degraded</b><span>Proof dossier joins are withheld rather than inferred.</span></div>` : ""}<div class="research-section"><h4>Hypothesis board</h4><div class="research-lanes hypotheses">${lanes(value.hypotheses, ["proposed","testing","supported","disproved","reproduction"], hypothesisCard, "No hypotheses")}</div></div><div class="research-section"><h4>Finding & proof board</h4><div class="research-lanes findings">${lanes(value.findings, ["candidate","demonstrated","reproduction-pending","reproduced","operator-accepted","rejected","withdrawn","inconclusive"], findingCard, "No findings")}</div></div></section>`;
   }
   return Object.freeze({model, render});
 });

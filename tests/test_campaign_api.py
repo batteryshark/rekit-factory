@@ -103,6 +103,7 @@ def test_campaign_api_is_bounded_canonical_and_omits_private_goal(tmp_path):
             "schemaVersion": 1, "references": [], "totalCount": 0,
             "truncated": False, "sourceTruncated": False,
             "strongestReproducedResult": None,
+            "currentResearchFocus": None,
         }
         assert public == detail
         assert public["campaignId"] == campaign_id

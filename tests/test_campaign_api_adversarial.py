@@ -181,6 +181,8 @@ def test_campaign_stop_exact_content_cannot_be_forged_or_replayed_differently(tm
         retry = _request(url, exact)
         assert first[0] == retry[0] == 200
         assert first[1]["campaign"]["revision"] == retry[1]["campaign"]["revision"] == 3
+        # Browser-owned prose or authority fields are never silently ignored.
+        assert _request(url, {**exact, "approved": True})[0] == 400
         forged = {**exact, "reasonCode": "changed-after-signing"}
         assert _request(url, forged)[0] == 409
         assert persistence.campaign(campaign.campaign_id).terminal.reason_code \

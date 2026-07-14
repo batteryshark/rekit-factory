@@ -57,7 +57,7 @@ const MissionObservability = (() => {
     const rawOptions = Array.isArray(question.options) ? question.options : Array.isArray(question.choices) ? question.choices : [], options = rawOptions.map(optionParts).filter(option => option.value !== undefined && option.value !== null);
     const context = [["tool", first(question, "toolId", "tool_id")], ["safety", first(question, "safetyTier", "safety_tier")], ["reason", first(question, "reason", "description")]].filter(([, value]) => value !== undefined && value !== null);
     const choices = options.length ? options.map((option, index) => `<button class="btn ${String(option.value).toLowerCase() === "allow" ? "primary" : index === 0 && variant === "direction" ? "primary" : String(option.value).toLowerCase() === "deny" ? "red" : ""}" data-answer="${safe(option.value)}" data-run="${safe(runId)}" data-question="${safe(question.id)}">${safe(option.label)}</button>`).join("") : variant === "direction" || variant === "decision" ? `<div class="direction-response"><label><span>Your direction</span><textarea data-direction-input maxlength="8000" placeholder="Give the investigation concrete direction…"></textarea></label><button class="btn primary" data-direction-submit data-run="${safe(runId)}" data-question="${safe(question.id)}">Send direction</button></div>` : `<span class="decision-unavailable">No response options supplied by this question.</span>`;
-    return `<article class="decision decision-${variant}"><div class="decision-head"><div class="decision-icon" aria-hidden="true">${variant === "permission" ? "!" : variant === "missing-tool" ? "?" : variant === "direction" ? "↗" : "◇"}</div><div><b>${safe(String(kind).replaceAll("_", " "))}</b><span>${safe(runId)}</span></div></div><div class="decision-body"><div class="question">${safe(prompt)}</div>${context.length ? `<div class="decision-context">${context.map(([label, value]) => `<span><b>${safe(label)}</b>${safe(value)}</span>`).join("")}</div>` : ""}<div class="choices">${choices}</div></div></article>`;
+    return `<article class="decision decision-${variant}" data-decision-id="${safe(question.id)}" tabindex="-1"><div class="decision-head"><div class="decision-icon" aria-hidden="true">${variant === "permission" ? "!" : variant === "missing-tool" ? "?" : variant === "direction" ? "↗" : "◇"}</div><div><b>${safe(String(kind).replaceAll("_", " "))}</b><span>${safe(runId)}</span></div></div><div class="decision-body"><div class="question">${safe(prompt)}</div>${context.length ? `<div class="decision-context">${context.map(([label, value]) => `<span><b>${safe(label)}</b>${safe(value)}</span>`).join("")}</div>` : ""}<div class="choices">${choices}</div></div></article>`;
   }
   return {activitySummary, renderDecision, renderEvent, renderReports, renderUsage, reportCount: snapshot => reports(snapshot).length};
 })();
@@ -765,7 +765,7 @@ function renderMemory(snapshot) {
   const degraded = memory.degraded ? `<div class="memory-alert"><b>Memory projection is degraded</b><span>${diagnostics.map(esc).join(" · ") || "Canonical replay reported a degraded state."}</span>${missing.length ? `<small>${missing.length} optional references are unavailable.</small>` : ""}</div>` : "";
   const unresolved = unknowns.length ? `<div class="memory-unresolved"><b>Unresolved at last compaction</b><span>${unknowns.map(esc).join(" · ")}</span></div>` : "";
   $("memoryDegraded").innerHTML = degraded + unresolved;
-  $("researchWorkspace").innerHTML = MissionResearch.render(snapshot);
+  $("researchWorkspace").innerHTML = MissionResearch.render({...snapshot, evidenceRecords: state.evidence});
   let index = 0;
   const rendered = collections.map(([key, label, items]) => {
     const result = renderMemoryGroup(key, label, items, index);
@@ -779,7 +779,7 @@ function openResearchReference(kind, entityId) {
   if (!entityId) return;
   if (["evidence", "artifact"].includes(kind)) {
     activateDetailTab($("tab-button-artifacts"), {focus: true});
-    const target = document.querySelector(`[data-evidence-record="${CSS.escape(entityId)}"]`);
+    const target = document.querySelector(`[data-evidence-record="${CSS.escape(entityId)}"], [data-artifact-record="${CSS.escape(entityId)}"]`);
     if (target) { target.scrollIntoView({block: "center"}); target.focus({preventScroll: true}); }
     else toast("The exact evidence record is not retained in this run.", true);
     return;
@@ -975,7 +975,7 @@ function renderDetail() {
   renderKnowledge(snapshot);
   renderDossiers(snapshot);
   renderOutcomes(snapshot);
-  $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
+  $("artifacts").innerHTML = artifacts.map(artifact => `<div class="artifact" data-artifact-record="${esc(artifact.id)}" tabindex="-1"><b>${esc(artifact.kind)}</b><span>${esc(artifact.logical_path)}</span><a class="btn artifact-action" href="/api/runs/${encodeURIComponent(run.id)}/artifacts/${encodeURIComponent(artifact.id)}" download>Download</a></div>`).join("") || `<div class="empty compact"><b>No artifacts yet</b>Durable outputs will appear here.</div>`;
   renderEvidence();
   $("detailDecisions").innerHTML = questions.length ? questions.map(question => decisionHTML(run.id, question)).join("") : `<div class="empty compact"><b>No pending decisions</b>This run is not waiting on you.</div>`;
   $("activityCount").textContent = events.length;
@@ -1143,8 +1143,9 @@ function renderNotifications() {
   }
   list.innerHTML = state.notifications.length ? state.notifications.map(notification => {
     const payload = notification.payload, link = payload.deepLink;
+    const route = MissionNotifications.exactRoute(link);
     const canAcknowledge = notification.status === "sent";
-    return `<article class="notification-row notification-${esc(notification.status)}"><div class="notification-signal" aria-hidden="true"></div><div><span>${esc(payload.kind.replaceAll(".", " / "))}</span><b>${esc(payload.message)}</b><small>${esc(notification.status)} · ${esc(new Date(notification.updatedAt).toLocaleString())}</small>${notification.lastErrorCode ? `<code>${esc(notification.lastErrorCode)}</code>` : ""}</div><div class="notification-actions"><button class="btn" type="button" data-notification-preview data-notification-id="${esc(notification.id)}">Preview</button><button class="btn" type="button" data-notification-link data-run="${esc(link.runId)}" data-tab="${esc(link.tab)}">Open ${esc(link.entityType)}</button>${canAcknowledge ? `<button class="btn primary" type="button" data-notification-ack data-notification-id="${esc(notification.id)}" data-notification-revision="${esc(notification.revision)}">Acknowledge</button>` : ""}</div></article>`;
+    return `<article class="notification-row notification-${esc(notification.status)}"><div class="notification-signal" aria-hidden="true"></div><div><span>${esc(payload.kind.replaceAll(".", " / "))}</span><b>${esc(payload.message)}</b><small>${esc(notification.status)} · ${esc(new Date(notification.updatedAt).toLocaleString())}</small>${notification.lastErrorCode ? `<code>${esc(notification.lastErrorCode)}</code>` : ""}</div><div class="notification-actions"><button class="btn" type="button" data-notification-preview data-notification-id="${esc(notification.id)}">Preview</button>${route ? `<button class="btn" type="button" data-notification-link${route.runId ? ` data-run="${esc(route.runId)}"` : ""} data-surface="${esc(route.surface)}" data-entity-type="${esc(route.entityType)}" data-entity-id="${esc(route.entityId)}">Open ${esc(route.entityType)}</button>` : `<button class="btn" type="button" disabled title="Exact notification route is unavailable">Route unavailable</button>`}${canAcknowledge ? `<button class="btn primary" type="button" data-notification-ack data-notification-id="${esc(notification.id)}" data-notification-revision="${esc(notification.revision)}">Acknowledge</button>` : ""}</div></article>`;
   }).join("") : `<div class="empty compact"><b>No delivery records</b>This run has no consequential notifications in its durable outbox.</div>`;
 }
 
@@ -1214,9 +1215,28 @@ async function acknowledgeNotification(button) {
 }
 
 async function openNotificationLink(button) {
-  await openRun(button.dataset.run);
-  const tab = document.querySelector(`[role="tab"][data-tab="${CSS.escape(button.dataset.tab)}"]`);
-  if (tab) activateDetailTab(tab, {focus: true});
+  const candidate = {view: "mission-control",
+    tab: ({campaigns: "campaigns", decisions: "decisions", outcomes: "findings", dossiers: "dossiers"})[button.dataset.surface],
+    entityType: button.dataset.entityType, entityId: button.dataset.entityId};
+  if (button.dataset.run) candidate.runId = button.dataset.run;
+  const route = MissionNotifications.exactRoute(candidate);
+  if (!route) { toast("The notification route is invalid and was not opened.", true); return; }
+  if (route.surface === "campaigns") {
+    show("campaigns"); await openCampaign(route.entityId); return;
+  }
+  await openRun(route.runId);
+  if (state.selected !== route.runId || state.snapshot?.run?.id !== route.runId) return;
+  if (route.surface === "outcomes") openResearchReference(route.entityType, route.entityId);
+  else activateDetailTab($(`tab-button-${route.surface}`), {focus: true});
+  const exact = route.surface === "decisions"
+    ? document.querySelector(`[data-decision-id="${CSS.escape(route.entityId)}"]`)
+    : route.surface === "dossiers"
+      ? document.querySelector(`[data-dossier-id="${CSS.escape(route.entityId)}"]`)
+      : document.querySelector(`[data-outcome-id="${CSS.escape(route.entityId)}"][data-outcome-type="${CSS.escape(route.entityType)}"]`);
+  if (exact) {
+    exact.classList.add("notification-linked-target");
+    exact.scrollIntoView({block: "center"}); exact.focus({preventScroll: true});
+  } else toast("The exact durable notification target is no longer present in this projection.", true);
 }
 
 $("runForm").onsubmit = async event => {
