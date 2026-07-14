@@ -336,6 +336,12 @@ function activate(element) {
 
 document.addEventListener("click", event => activate(event.target));
 document.addEventListener("keydown", event => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    $("topbarSearch").focus();
+    $("topbarSearch").select();
+    return;
+  }
   if (event.key === "Escape" && $("campaignDialog").open) { event.preventDefault(); closeCampaign(); return; }
   if (event.key === "Escape" && !$("operatorAttention").hidden) { event.preventDefault(); dismissAttention(); }
   if ((event.key === "Enter" || event.key === " ") && event.target.matches("[data-run]")) {
@@ -615,12 +621,19 @@ function renderFleet() {
   const terminal = runs.reduce((total, run) => total + numeric(run.coverage.terminal), 0);
   const workItems = runs.reduce((total, run) => total + numeric(run.coverage.workItemsTotal), 0);
   const models = new Set(runs.map(run => run.modelProfile?.model).filter(Boolean));
+  const completed = runs.filter(run => run.status === "completed").length;
   $("fleetHealth").innerHTML = `<span class="live"><i></i>${running} active</span><span><b>${terminal}/${workItems}</b> work terminal</span><span><b>${models.size}</b> models</span><span class="${needs ? "attention" : ""}"><b>${needs}</b> decisions waiting</span><span class="fleet-health-spacer"></span><span>${shown.length} shown</span>`;
   $("fleetSub").textContent = `${runs.length} investigations · ${running} running · ${needs} awaiting your call`;
   $("stats").innerHTML = `<span class="stat"><b>${runs.length}</b> runs</span><span class="stat"><b>${runs.reduce((total, run) => total + run.workers.length, 0)}</b> workers</span>`;
   $("healthText").textContent = `${running} active · local`;
+  $("topHealthRun").textContent = running;
+  $("topHealthNeed").textContent = needs;
+  $("topHealthDone").textContent = completed;
+  $("topbarHealth").style.setProperty("--health-progress", `${runs.length ? Math.round(completed / runs.length * 360) : 0}deg`);
   $("inboxBadge").textContent = needs;
   $("inboxBadge").style.display = needs ? "grid" : "none";
+  $("topInboxBadge").textContent = needs;
+  $("topInboxBadge").style.display = needs ? "grid" : "none";
 }
 
 async function refreshFleet() {
@@ -1364,7 +1377,17 @@ async function boot() {
   try {
     state.config = await api("/api/config"); renderConfig();
     $("campaignDialog").addEventListener("cancel", event => { event.preventDefault(); closeCampaign(); });
-    $("fleetSearch").addEventListener("input", event => { state.query = event.target.value; renderFleet(); });
+    $("fleetSearch").addEventListener("input", event => {
+      state.query = event.target.value;
+      $("topbarSearch").value = state.query;
+      renderFleet();
+    });
+    $("topbarSearch").addEventListener("input", event => {
+      state.query = event.target.value;
+      $("fleetSearch").value = state.query;
+      show("fleet");
+      renderFleet();
+    });
     await Promise.all([refreshFleet(), refreshCampaigns()]);
     await restoreExactRoute();
     setInterval(() => { refreshFleet(); refreshCampaigns(); }, 1800);

@@ -31,6 +31,31 @@ def test_v3_grid_and_theme_contracts_are_visible() -> None:
     assert "localStorage.setItem(THEME_KEY, resolved)" in script
 
 
+def test_v3_topbar_restores_real_jump_health_and_attention_controls() -> None:
+    page = (UI / "index.html").read_text(encoding="utf-8")
+    style = (UI / "mission-control.css").read_text(encoding="utf-8")
+    script = (UI / "mission-control.js").read_text(encoding="utf-8")
+
+    for marker in (
+        'class="topbar-wordmark"', 'id="topbarSearch"', 'id="topbarHealth"',
+        'id="topHealthRun"', 'id="topHealthNeed"', 'id="topHealthDone"',
+        'id="topInboxBadge"', 'class="operator-mark"',
+    ):
+        assert marker in page
+    for behavior in (
+        '$("topHealthRun").textContent = running',
+        '$("topHealthNeed").textContent = needs',
+        '$("topHealthDone").textContent = completed',
+        '$("topInboxBadge").textContent = needs',
+        'event.key.toLowerCase() === "k"',
+        '$("topbarSearch").addEventListener("input"',
+    ):
+        assert behavior in script
+    assert ".topbar-search" in style
+    assert ".topbar-health" in style
+    assert "conic-gradient(var(--green)" in style
+
+
 def test_target_kind_icons_use_trusted_svg_vocabulary() -> None:
     script = (UI / "mission-control.js").read_text(encoding="utf-8")
 

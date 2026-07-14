@@ -20,12 +20,16 @@
   </aside>
   <main class="main">
     <header class="topbar">
-      <div class="crumb"><span>REKIT</span><b>/</b><span>FACTORY</span><b>/</b><strong id="crumb">MISSION CONTROL</strong></div>
+      <div class="topbar-wordmark" aria-label="Rekit Mission Control"><b>RE<span>KIT</span></b><small>MISSION CONTROL</small></div>
+      <div class="crumb"><span>load · analyze · understand · adapt</span><b>/</b><strong id="crumb">MISSION CONTROL</strong></div>
       <div class="top-spacer"></div>
-      <div class="health"><i></i><span id="healthText">connecting</span></div>
+      <label class="topbar-search" for="topbarSearch"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input id="topbarSearch" type="search" placeholder="Jump to investigation…" autocomplete="off"><kbd>⌘K</kbd></label>
+      <div class="topbar-health" id="topbarHealth" title="Fleet health"><span class="health-ring" aria-hidden="true"><i></i></span><div class="health-legend"><span><i class="run"></i><b id="topHealthRun">0</b> run</span><span><i class="wait"></i><b id="topHealthNeed">0</b> wait</span><span><i class="done"></i><b id="topHealthDone">0</b> done</span></div><span class="sr-only" id="healthText">connecting</span></div>
       <button class="iconbtn theme-toggle" id="themeToggle" data-icon="theme" type="button" aria-label="Switch to light theme" title="Switch to light theme"><span class="theme-sun" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.4 1.4M17.6 17.6L19 19M19 5l-1.4 1.4M6.4 17.6L5 19"/></svg></span><span class="theme-moon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2z"/></svg></span></button>
+      <button class="iconbtn topbar-inbox" data-view="inbox" type="button" aria-label="Decision Inbox" title="Decision Inbox"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M10 21h4"/></svg><span class="badge" id="topInboxBadge"></span></button>
       <button class="btn restart-btn" id="restartService" data-icon="refresh" type="button" title="Restart the local Factory service and reload this page"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg></span> Restart UI</button>
       <button class="btn primary" data-view="newrun" data-icon="plus"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>New Run</button>
+      <div class="operator-mark" title="Local operator" aria-label="Local operator">OP</div>
     </header>
     <div class="content">
       <section class="view active" id="view-fleet">

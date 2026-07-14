@@ -797,7 +797,7 @@ class ControlPlaneTests(unittest.TestCase):
                          "event.target.matches('[role=\"tab\"]')"):
             self.assertIn(behavior, script)
         for responsive in (".target-kind", ".card-foot", ".attention-cue", ".fleet-search",
-                           "@media(max-width:560px)", ".health{display:none}"):
+                           "@media(max-width:560px)", ".topbar-health{display:none}"):
             self.assertIn(responsive, style)
         self.assertIn("@media(prefers-reduced-motion:reduce)", style)
 
@@ -850,6 +850,9 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b'id="retriesPerWorker"', page)
                     self.assertIn(b'value="automatic-only"', page)
                     self.assertIn(b'id="restartService"', page)
+                    self.assertIn(b'id="topbarSearch"', page)
+                    self.assertIn(b'id="topbarHealth"', page)
+                    self.assertIn(b'id="topInboxBadge"', page)
                     self.assertIn(b'data-tab="memory"', page)
                     self.assertIn(b'id="scopeSummary"', page)
                 with urlopen(base + "/ui/mission-control.css", timeout=5) as response:
@@ -865,6 +868,8 @@ class ControlPlaneTests(unittest.TestCase):
                     self.assertIn(b"cacheReadTokens", script)
                     self.assertIn(b"retriesPerWorker", script)
                     self.assertIn(b"costUnits", script)
+                    self.assertIn(b"topHealthRun", script)
+                    self.assertIn(b"topbarSearch", script)
                 with urlopen(base + "/ui/mission-outcomes.js", timeout=5) as response:
                     self.assertEqual(
                         "text/javascript; charset=utf-8", response.headers["Content-Type"]
